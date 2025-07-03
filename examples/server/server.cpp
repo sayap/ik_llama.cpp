@@ -1301,26 +1301,7 @@ struct server_context {
         }
 
         // check if there is incomplete UTF-8 character at the end
-        bool incomplete = false;
-        for (unsigned i = 1; i < 5 && i <= slot.generated_text.size(); ++i) {
-            unsigned char c = slot.generated_text[slot.generated_text.size() - i];
-            if ((c & 0xC0) == 0x80) {
-                // continuation byte: 10xxxxxx
-                continue;
-            }
-            if ((c & 0xE0) == 0xC0) {
-                // 2-byte character: 110xxxxx ...
-                incomplete = i < 2;
-            } else if ((c & 0xF0) == 0xE0) {
-                // 3-byte character: 1110xxxx ...
-                incomplete = i < 3;
-            } else if ((c & 0xF8) == 0xF0) {
-                // 4-byte character: 11110xxx ...
-                incomplete = i < 4;
-            }
-            // else 1-byte character or invalid byte
-            break;
-        }
+        bool incomplete = validate_utf8(slot.generated_text) < slot.generated_text.size();
 
         if (!incomplete) {
             size_t pos = std::min(slot.n_sent_text, slot.generated_text.size());
@@ -1416,6 +1397,33 @@ struct server_context {
         return slot.has_next_token; // continue
     }
 
+    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool special, int idx) {
+        size_t n_probs = slot.sparams.n_probs;
+        size_t n_vocab = llama_n_vocab(llama_get_model(ctx));
+
+        // TODO: optimize this with min-p optimization
+        std::vector<llama_token_data> cur = get_token_probabilities(ctx, idx);
+
+        // set probability for sampled token
+        for (size_t i = 0; i < n_vocab; i++) {
+            // set probability for sampled token
+            if (cur[i].id == result.tok) {
+                result.prob = cur[i].p;
+                break;
+            }
+        }
+
+        // set probability for top n_probs tokens
+        result.probs.reserve(n_probs);
+        for (size_t i = 0; i < std::min(n_vocab, n_probs); i++) {
+            result.probs.push_back({
+                cur[i].id,
+                llama_detokenize(ctx, {cur[i].id}, special),
+                cur[i].p
+            });
+        }
+    }
+
     json get_formated_generation(const server_slot & slot) const {
         const auto eos_bias   =             slot.sparams.logit_bias.find(llama_token_eos(model));
         const bool ignore_eos = eos_bias != slot.sparams.logit_bias.end() && eos_bias->second < 0.0f && std::isinf(eos_bias->second);
@@ -1507,19 +1515,7 @@ struct server_context {
         };
 
         if (slot.sparams.n_probs > 0) {
-            const std::vector<llama_token> to_send_toks = llama_tokenize(ctx, tkn.text_to_send, false);
-            const size_t probs_pos      = std::min(slot.n_sent_token_probs,                       slot.generated_token_probs.size());
-            const size_t probs_stop_pos = std::min(slot.n_sent_token_probs + to_send_toks.size(), slot.generated_token_probs.size());
-
-            std::vector<completion_token_output> probs_output;
-            if (probs_pos < probs_stop_pos) {
-                probs_output = std::vector<completion_token_output>(
-                        slot.generated_token_probs.begin() + probs_pos,
-                        slot.generated_token_probs.begin() + probs_stop_pos);
-            }
-            slot.n_sent_token_probs = probs_stop_pos;
-
-            res.data["completion_probabilities"] = probs_vector_to_json(ctx, probs_output);
+            res.data["completion_probabilities"] = probs_vector_to_json(ctx, {tkn});
         }
 
         if (slot.oaicompat) {
@@ -1559,7 +1555,7 @@ struct server_context {
             {"timings",             slot.get_formated_timings()}
         };
 
-        if (slot.sparams.n_probs > 0) {
+        if (!slot.params.stream && slot.sparams.n_probs > 0) {
             std::vector<completion_token_output> probs;
             if (!slot.params.stream && slot.stopped_word) {
                 const std::vector<llama_token> stop_word_toks = llama_tokenize(ctx, slot.stopping_word, false);
@@ -2513,7 +2509,8 @@ struct server_context {
                 }
 
                 completion_token_output result;
-                const llama_token id = llama_sampling_sample(slot.ctx_sampling, ctx, NULL, slot.i_batch - i);
+                const int tok_idx = slot.i_batch - i;
+                const llama_token id = llama_sampling_sample(slot.ctx_sampling, ctx, NULL, tok_idx);
 
                 llama_sampling_accept(slot.ctx_sampling, ctx, id, true);
 
@@ -2526,32 +2523,10 @@ struct server_context {
 
                 llama_token_data_array cur_p = { slot.ctx_sampling->cur.data(), slot.ctx_sampling->cur.size(), false };
                 result.tok = id;
+                result.prob = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
-                const size_t n_probs = std::min(cur_p.size, (size_t) slot.sparams.n_probs);
-                if (n_probs > 0) {
-                    const size_t n_valid = slot.ctx_sampling->n_valid;
-
-                    // Make sure at least n_probs top tokens are at the front of the vector:
-                    if (slot.sparams.temp == 0.0f && n_probs > n_valid) {
-                        llama_sample_top_k(ctx, &cur_p, n_probs, 0);
-                    }
-
-                    if (slot.sparams.temp == 0.0f) {
-                        // With greedy sampling the probabilities have possibly not been calculated.
-                        for (size_t i = 0; i < n_probs; ++i) {
-                            result.probs.push_back({
-                                cur_p.data[i].id,
-                                i == 0 ? 1.0f : 0.0f
-                            });
-                        }
-                    } else {
-                        for (size_t i = 0; i < n_probs; ++i) {
-                            result.probs.push_back({
-                                cur_p.data[i].id,
-                                i >= n_valid ? 0.0f : cur_p.data[i].p // Tokens filtered out due to e.g. top_k have 0 probability.
-                            });
-                        }
-                    }
+                if (slot.sparams.n_probs > 0) {
+                    populate_token_probs(slot, result, params.special, tok_idx);
                 }
 
                 if (!process_token(result, slot)) {
@@ -2601,6 +2576,12 @@ static json format_final_response_oaicompat(const json& request, json result, co
                               {"message", json{{"content", content},
                                                {"role", "assistant"}}}} });
 
+    if (result.contains("completion_probabilities")) {
+        choices[0]["logprobs"] = json{
+            {"content", json_value(result, "completion_probabilities", json::array())},
+        };
+    }
+
     std::time_t t = std::time(0);
 
     json res = json{
@@ -2619,10 +2600,6 @@ static json format_final_response_oaicompat(const json& request, json result, co
 
     if (server_verbose) {
         res["__verbose"] = result;
-    }
-
-    if (result.contains("completion_probabilities")) {
-        res["completion_probabilities"] = json_value(result, "completion_probabilities", json::array());
     }
 
     return res;
@@ -2710,6 +2687,12 @@ static std::vector<json> format_partial_response_oaicompat(server_task_result ta
                 }},
             } });
         }
+    }
+
+    if (result.contains("completion_probabilities")) {
+        choices[0]["logprobs"] = json{
+            {"content", json_value(result, "completion_probabilities", json::array())},
+        };
     }
 
     json ret = json{
