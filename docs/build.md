@@ -465,6 +465,10 @@ The following compilation options are also available to tweak performance (yes, 
 
 ### Vulkan
 
+See [docs/Vulkan.md](./Vulkan.md) for the current state of the Vulkan backend, including
+performance notes and known gaps (e.g. use `-no-fug` / `-no-fmoe` for fully-on-GPU
+execution, and supported quant types).
+
 **Windows**
 
 #### w64devkit
