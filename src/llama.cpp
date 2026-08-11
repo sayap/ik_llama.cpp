@@ -7763,11 +7763,16 @@ bool llama_supports_mlock(void) {
 
 bool llama_supports_gpu_offload(void) {
 #if defined(GGML_USE_CUDA) || defined(GGML_USE_METAL)   || defined(GGML_USE_VULKAN) || \
-    defined(GGML_USE_SYCL) || defined(GGML_USE_RPC)
+    defined(GGML_USE_SYCL) || defined(GGML_USE_RPC) || defined(GGML_USE_CANN)
     // Defined when llama.cpp is compiled with support for offloading model layers to GPU.
     return true;
 #else
-    return false;
+    // otherwise, check if a backend was loaded at runtime via ggml_backend_load_all()
+    if (ggml_backend_reg_get_count() <= 1) {
+        ggml_backend_load_all();
+    }
+    // the CPU backend is always registered, so more than one registered backend means a GPU backend is available
+    return ggml_backend_reg_get_count() > 1;
 #endif
 }
 
@@ -7780,6 +7785,9 @@ void llama_backend_init(void) {
         struct ggml_context * ctx = ggml_init(params);
         ggml_free(ctx);
     }
+
+    // load dynamically loadable backends (e.g. libggml-cuda.so, libggml-vulkan.so)
+    ggml_backend_load_all();
 }
 
 void llama_numa_init(enum ggml_numa_strategy numa) {

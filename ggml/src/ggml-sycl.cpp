@@ -5384,3 +5384,12 @@ int ggml_backend_sycl_reg_devices() {
     }
     return ggml_sycl_info().device_count;
 }
+
+#ifdef GGML_BACKEND_DL
+static int ggml_backend_sycl_score() {
+    return ggml_sycl_info().device_count > 0 ? 100 : 0;
+}
+#endif
+
+GGML_BACKEND_DL_SCORE_IMPL(ggml_backend_sycl_score)
+GGML_BACKEND_DL_IMPL(ggml_backend_sycl_reg_devices)

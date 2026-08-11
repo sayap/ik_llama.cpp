@@ -58,6 +58,15 @@ option(GGML_NATIVE "ggml: enable -march=native flag"     ${GGML_NATIVE_DEFAULT})
 option(GGML_LTO    "ggml: enable link time optimization" OFF)
 option(GGML_CCACHE "ggml: use ccache if available"       ON)
 
+# build backends (cuda, vulkan, ...) as separate shared libraries (e.g. libggml-cuda.so)
+# that are loaded at runtime via ggml_backend_load_all() instead of being compiled
+# into the ggml library.
+#
+# note: with GGML_BACKEND_DL the ggml/llama libraries are compiled without GGML_USE_*,
+# so GPU offload in the llama library (which uses compile-time backend APIs) requires
+# the classic build with GGML_BACKEND_DL=OFF
+option(GGML_BACKEND_DL "ggml: build backends as dynamically loadable libraries" OFF)
+
 # debug
 option(GGML_ALL_WARNINGS           "ggml: enable all compiler warnings"                   ON)
 option(GGML_ALL_WARNINGS_3RD_PARTY "ggml: enable all compiler warnings in 3rd party libs" OFF)

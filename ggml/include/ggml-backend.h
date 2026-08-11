@@ -128,6 +128,17 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t ggml_backend_reg_get_default_buffer_type(size_t i);
     GGML_API ggml_backend_buffer_t      ggml_backend_reg_alloc_buffer(size_t i, size_t size);
 
+    // Dynamic loading of backends
+    //
+    // Backends built as separate shared libraries (e.g. libggml-cuda.so, libggml-vulkan.so) can be
+    // loaded at runtime. A backend library is expected to export ggml_backend_init() which registers
+    // the backend via ggml_backend_register(), and optionally ggml_backend_score() which returns 0
+    // if the backend is not usable on the current system.
+    //
+    GGML_API bool ggml_backend_load(const char * path);
+    GGML_API void ggml_backend_load_all(void);
+    GGML_API void ggml_backend_load_all_from_path(const char * dir_path);
+
     //
     // Backend scheduler
     //

@@ -999,6 +999,8 @@ GGML_CALL int ggml_backend_rpc_reg_devices() {
     return device_count;
 }
 
+GGML_BACKEND_DL_IMPL(ggml_backend_rpc_reg_devices)
+
 GGML_CALL ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
     std::string dev_name = create_rpc_name(endpoint, device);
     ggml_backend_rpc_context * ctx = new ggml_backend_rpc_context {

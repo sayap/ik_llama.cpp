@@ -4610,3 +4610,17 @@ GGML_CALL ggml_backend_t ggml_backend_reg_metal_init(const char * params, void *
     GGML_UNUSED(params);
     GGML_UNUSED(user_data);
 }
+
+GGML_CALL int ggml_backend_metal_reg_devices(void) {
+    ggml_backend_register("Metal", ggml_backend_reg_metal_init, ggml_backend_metal_buffer_type(), NULL);
+    return 1;
+}
+
+#ifdef GGML_BACKEND_DL
+static int ggml_backend_metal_score(void) {
+    return 1;
+}
+#endif
+
+GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg_devices)
+GGML_BACKEND_DL_SCORE_IMPL(ggml_backend_metal_score)

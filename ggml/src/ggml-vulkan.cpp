@@ -2166,7 +2166,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
         uint32_t D_split = std::min(std::min(device->subgroup_size, 8u), D_lsb / 4);
 
         // mask dim1 is padded to 64, we rely on this to avoid clamping mask loads
-        GGML_ASSERT((GGML_KQ_MASK_PAD % rows_cols[0]) == 0);
+        // note: paths with row granularity larger than GGML_KQ_MASK_PAD (e.g. coopmat2)
+        // use clamped tensor layouts in the shaders and handle the padding explicitly
+        GGML_ASSERT(rows_cols[0] > GGML_KQ_MASK_PAD || (GGML_KQ_MASK_PAD % rows_cols[0]) == 0);
         return {wg_size, rows_cols[0], rows_cols[1], hsk, hsv, clamp, D_split};
     };
 
@@ -11566,4 +11568,18 @@ static void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph *
 }
 #endif
 
-//GGML_BACKEND_DL_IMPL(ggml_backend_vk_reg)
+#ifdef GGML_BACKEND_DL
+static int ggml_backend_vk_score() {
+    // probe for a usable Vulkan loader/driver without aborting on failure
+    try {
+        vk::UniqueInstance instance = vk::createInstanceUnique(vk::InstanceCreateInfo{});
+        const auto devices = instance->enumeratePhysicalDevices();
+        return devices.empty() ? 0 : 100;
+    } catch (...) {
+        return 0;
+    }
+}
+#endif
+
+GGML_BACKEND_DL_SCORE_IMPL(ggml_backend_vk_score)
+GGML_BACKEND_DL_IMPL(ggml_backend_vk_reg_devices)

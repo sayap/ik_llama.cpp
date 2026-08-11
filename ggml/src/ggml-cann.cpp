@@ -2019,3 +2019,12 @@ GGML_CALL int ggml_backend_cann_reg_devices() {
     }
     return device_count;
 }
+
+#ifdef GGML_BACKEND_DL
+static int ggml_backend_cann_score() {
+    return ggml_backend_cann_get_device_count() > 0 ? 100 : 0;
+}
+#endif
+
+GGML_BACKEND_DL_SCORE_IMPL(ggml_backend_cann_score)
+GGML_BACKEND_DL_IMPL(ggml_backend_cann_reg_devices)
