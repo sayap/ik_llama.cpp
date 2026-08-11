@@ -1051,6 +1051,8 @@ struct ggml_backend_vk_context {
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k;
     vk::Fence fence, almost_ready_fence;
     bool almost_ready_fence_pending {};
+    // true when compute work has been submitted but not yet synchronized
+    bool submit_pending {};
 
     vk_buffer buffer_pool[MAX_VK_BUFFERS];
 
@@ -9674,11 +9676,6 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
 
     vk_context subctx = ctx->tensor_ctxs[tensor_idx].lock();
 
-    // always wait for the GPU work to be done for the last submit
-    if (tensor_idx == subctx->exit_tensor_idx) {
-        use_fence = true;
-    }
-
     // Only run if ctx hasn't been submitted yet
     if (!subctx->seqs.empty()) {
 #ifdef GGML_VULKAN_CHECK_RESULTS
@@ -9697,9 +9694,11 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
         } else {
             ggml_vk_submit(subctx, use_fence ? ctx->fence : vk::Fence{});
         }
+        ctx->submit_pending = true;
 
         if (use_fence) {
             ggml_vk_wait_for_fence(ctx);
+            ctx->submit_pending = false;
         }
 #ifdef GGML_VULKAN_CHECK_RESULTS
         ggml_vk_check_results_1(ctx, cgraph, tensor_idx);
@@ -10127,26 +10126,40 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend, const ggml_
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    if(ctx->transfer_ctx.expired()) {
-        return;
+
+    // flush pending transfer work
+    if (!ctx->transfer_ctx.expired()) {
+        vk_context transfer_ctx = ctx->transfer_ctx.lock();
+
+        ggml_vk_ctx_end(transfer_ctx);
+
+        for (auto& cpy : transfer_ctx->in_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+
+        ggml_vk_submit(transfer_ctx, ctx->fence);
+        ggml_vk_wait_for_fence(ctx);
+
+        for (auto& cpy : transfer_ctx->out_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+
+        ctx->transfer_ctx.reset();
+        ctx->submit_pending = false;
     }
 
-    vk_context transfer_ctx = ctx->transfer_ctx.lock();
+    if (ctx->submit_pending) {
+        // signal the fence once all previously submitted compute work has completed,
+        // then wait for it and clean up the command pools
+        {
+            std::lock_guard<std::mutex> guard(queue_mutex);
+            ctx->device->compute_queue.queue.submit({}, ctx->fence);
+        }
+        ggml_vk_wait_for_fence(ctx);
 
-    ggml_vk_ctx_end(transfer_ctx);
-
-    for (auto& cpy : transfer_ctx->in_memcpys) {
-        memcpy(cpy.dst, cpy.src, cpy.n);
+        ctx->submit_pending = false;
+        ggml_vk_graph_cleanup(ctx);
     }
-
-    ggml_vk_submit(transfer_ctx, ctx->fence);
-    ggml_vk_wait_for_fence(ctx);
-
-    for (auto& cpy : transfer_ctx->out_memcpys) {
-        memcpy(cpy.dst, cpy.src, cpy.n);
-    }
-
-    ctx->transfer_ctx.reset();
 }
 
 static bool ggml_vk_is_empty(ggml_tensor * node) {
@@ -10337,7 +10350,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         ctx->device->perf_logger->print_timings();
+
+        ctx->submit_pending = false;
     }
+
+    // Wait for the GPU to finish executing the graph before cleaning up the command pools.
+    // The per-batch submissions use no fence (or the almost-ready fence) so that CPU command
+    // recording overlaps with GPU execution within a graph; an empty submission on the same
+    // queue is signaled once all the graph work has completed. This also guarantees that any
+    // host reads or cross-backend copies performed by the scheduler afterwards see the
+    // results, since this backend has no transfer/compute queue synchronization.
+    {
+        std::lock_guard<std::mutex> guard(queue_mutex);
+        ctx->device->compute_queue.queue.submit({}, ctx->fence);
+    }
+    ggml_vk_wait_for_fence(ctx);
+    ctx->submit_pending = false;
 
     ggml_vk_graph_cleanup(ctx);
 
@@ -10708,7 +10736,7 @@ static ggml_backend_i ggml_backend_vk_interface = {
     /* .set_tensor_async        = */ NULL,  // ggml_backend_vk_set_tensor_async,
     /* .get_tensor_async        = */ NULL,  // ggml_backend_vk_get_tensor_async,
     /* .cpy_tensor_async        = */ NULL,  // ggml_backend_vk_cpy_tensor_async,
-    /* .synchronize             = */ NULL,  // ggml_backend_vk_synchronize,
+    /* .synchronize             = */ ggml_backend_vk_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
     /* .graph_plan_update       = */ NULL,
