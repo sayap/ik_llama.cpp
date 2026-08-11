@@ -143,6 +143,11 @@ if (GGML_METAL)
         ${METAL_FRAMEWORK}
         ${METALKIT_FRAMEWORK}
         )
+    set(GGML_EXTRA_LIBS_METAL ${GGML_EXTRA_LIBS_METAL}
+        ${FOUNDATION_LIBRARY}
+        ${METAL_FRAMEWORK}
+        ${METALKIT_FRAMEWORK}
+        )
 endif()
 
 if (GGML_MUSA)
@@ -354,18 +359,23 @@ if (GGML_CUDA)
             if (WIN32)
                 # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
                 set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} CUDA::cudart_static CUDA::cublas CUDA::cublasLt)
+                set(GGML_EXTRA_LIBS_CUDA ${GGML_EXTRA_LIBS_CUDA} CUDA::cudart_static CUDA::cublas CUDA::cublasLt)
             else ()
                 if (GGML_MUSA)
                     set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} MUSA::musart_static MUSA::mublas_static)
+                    set(GGML_EXTRA_LIBS_CUDA ${GGML_EXTRA_LIBS_CUDA} MUSA::musart_static MUSA::mublas_static)
                 else()
                     set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} CUDA::cudart_static CUDA::cublas_static CUDA::cublasLt_static)
+                    set(GGML_EXTRA_LIBS_CUDA ${GGML_EXTRA_LIBS_CUDA} CUDA::cudart_static CUDA::cublas_static CUDA::cublasLt_static)
                 endif()
             endif()
         else()
             if (GGML_MUSA)
                 set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} MUSA::musart MUSA::mublas)
+                set(GGML_EXTRA_LIBS_CUDA ${GGML_EXTRA_LIBS_CUDA} MUSA::musart MUSA::mublas)
             else()
                 set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} CUDA::cudart CUDA::cublas CUDA::cublasLt)
+                set(GGML_EXTRA_LIBS_CUDA ${GGML_EXTRA_LIBS_CUDA} CUDA::cudart CUDA::cublas CUDA::cublasLt)
             endif()
         endif()
 
@@ -374,8 +384,10 @@ if (GGML_CUDA)
         else()
             if (GGML_MUSA)
                 set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} MUSA::musa_driver) # required by muDeviceGetAttribute(), muMemGetAllocationGranularity(...), ...
+                set(GGML_EXTRA_LIBS_CUDA ${GGML_EXTRA_LIBS_CUDA} MUSA::musa_driver)
             else()
                 set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} CUDA::cuda_driver) # required by cuDeviceGetAttribute(), cuMemGetAllocationGranularity(...), ...
+                set(GGML_EXTRA_LIBS_CUDA ${GGML_EXTRA_LIBS_CUDA} CUDA::cuda_driver)
             endif()
         endif()
 
@@ -386,6 +398,7 @@ if (GGML_CUDA)
                 message("NCCL_LIBRARIES = ${NCCL_LIBRARIES}")
                 message("NCCL_INCLUDE_DIRS = ${NCCL_INCLUDE_DIRS}")
                 set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} ${NCCL_LIBRARIES})
+                set(GGML_EXTRA_LIBS_CUDA ${GGML_EXTRA_LIBS_CUDA} ${NCCL_LIBRARIES})
                 set(GGML_EXTRA_INCLUDES ${GGML_EXTRA_INCLUDES} ${NCCL_INCLUDE_DIRS})
                 add_compile_definitions(GGML_USE_NCCL)
             else()
@@ -501,6 +514,7 @@ if (GGML_HIPBLAS)
     if (CXX_IS_HIPCC)
         set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE CXX)
         set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} hip::device)
+        set(GGML_EXTRA_LIBS_ROCM ${GGML_EXTRA_LIBS_ROCM} hip::device)
     else()
         set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE HIP)
     endif()
@@ -510,6 +524,7 @@ if (GGML_HIPBLAS)
     endif()
 
     set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} PUBLIC hip::host roc::rocblas roc::hipblas)
+    set(GGML_EXTRA_LIBS_ROCM ${GGML_EXTRA_LIBS_ROCM} hip::host roc::rocblas roc::hipblas)
 endif()
 
 if (GGML_SYCL)
@@ -558,12 +573,15 @@ if (GGML_SYCL)
         find_package(IntelSYCL REQUIRED)
         find_package(MKL REQUIRED)
         set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} IntelSYCL::SYCL_CXX MKL::MKL MKL::MKL_SYCL)
+        set(GGML_EXTRA_LIBS_SYCL ${GGML_EXTRA_LIBS_SYCL} IntelSYCL::SYCL_CXX MKL::MKL MKL::MKL_SYCL)
     else()
         if (GGML_SYCL_TARGET STREQUAL "INTEL")
             set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} -fsycl OpenCL mkl_core pthread m dl mkl_sycl_blas mkl_intel_ilp64 mkl_tbb_thread)
+            set(GGML_EXTRA_LIBS_SYCL ${GGML_EXTRA_LIBS_SYCL} -fsycl OpenCL mkl_core pthread m dl mkl_sycl_blas mkl_intel_ilp64 mkl_tbb_thread)
         elseif (GGML_SYCL_TARGET STREQUAL "NVIDIA")
             set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsycl-targets=nvptx64-nvidia-cuda")
             set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} -fsycl pthread m dl onemkl)
+            set(GGML_EXTRA_LIBS_SYCL ${GGML_EXTRA_LIBS_SYCL} -fsycl pthread m dl onemkl)
         endif()
     endif()
 endif()
@@ -575,6 +593,7 @@ if (GGML_RPC)
 
     if (WIN32)
         set(GGML_EXTRA_LIBS ${GGML_EXTRA_LIBS} ws2_32)
+        set(GGML_EXTRA_LIBS_RPC ${GGML_EXTRA_LIBS_RPC} ws2_32)
     endif()
 
     set(GGML_HEADERS_RPC ../include/ggml-rpc.h)
@@ -777,6 +796,7 @@ if (GGML_VULKAN)
         set(GGML_SOURCES_VULKAN ggml-vulkan.cpp ${_ggml_vk_source})
 
         set(GGML_EXTRA_LIBS     ${GGML_EXTRA_LIBS} Vulkan::Vulkan)
+        set(GGML_EXTRA_LIBS_VULKAN ${GGML_EXTRA_LIBS_VULKAN} Vulkan::Vulkan)
         set(GGML_EXTRA_INCLUDES ${GGML_EXTRA_INCLUDES} ${CMAKE_CURRENT_BINARY_DIR})
     else()
         message(WARNING "Vulkan not found")
@@ -845,6 +865,7 @@ if (GGML_CANN)
             message(STATUS "CANN: CANN_LIBRARIES =  ${CANN_LIBRARIES}")
 
             set(GGML_EXTRA_LIBS     ${GGML_EXTRA_LIBS}     ${CANN_LIBRARIES} )
+            set(GGML_EXTRA_LIBS_CANN ${GGML_EXTRA_LIBS_CANN} ${CANN_LIBRARIES} )
             set(GGML_EXTRA_INCLUDES ${GGML_EXTRA_INCLUDES} ${CANN_INCLUDE_DIRS})
             set(GGML_EXTRA_LIBDIRS  ${GGML_EXTRA_LIBDIRS}  ${CANN_INSTALL_DIR}/lib64)
             list(APPEND GGML_CDEF_PUBLIC GGML_USE_CANN)
@@ -1293,6 +1314,27 @@ endif()
 # libraries
 #
 
+if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
+    message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
+endif()
+
+if (GGML_BACKEND_DL)
+    # backends are built as separate shared libraries (libggml-*.so) and loaded at runtime,
+    # the core ggml library is backend-agnostic
+    set(GGML_SOURCES_BACKENDS "")
+    set(GGML_CDEF_PUBLIC "")
+else()
+    set(GGML_SOURCES_BACKENDS
+        ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}
+        ${GGML_SOURCES_METAL}     ${GGML_HEADERS_METAL}
+        ${GGML_SOURCES_RPC}       ${GGML_HEADERS_RPC}
+        ${GGML_SOURCES_SYCL}      ${GGML_HEADERS_SYCL}
+        ${GGML_SOURCES_VULKAN}    ${GGML_HEADERS_VULKAN}
+        ${GGML_SOURCES_ROCM}      ${GGML_HEADERS_ROCM}
+        ${GGML_SOURCES_CANN}      ${GGML_HEADERS_CANN}
+        )
+endif()
+
 # ggml
 
 add_library(ggml
@@ -1302,23 +1344,19 @@ add_library(ggml
             ggml.c
             ggml-alloc.c
             ggml-backend.cpp
+            ggml-backend-dl.cpp
+            ggml-backend-dl.h
             ggml-moe-prefetch.cpp
             ggml-moe-prefetch.h
             ggml-quants.c
             ggml-quants.h
             ggml-utils.h
             ggml-impl.h
-            ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}
-            ${GGML_SOURCES_METAL}     ${GGML_HEADERS_METAL}
-            ${GGML_SOURCES_RPC}       ${GGML_HEADERS_RPC}
+            ${GGML_SOURCES_BACKENDS}
             ${GGML_SOURCES_EXTRA}     ${GGML_HEADERS_EXTRA}
-            ${GGML_SOURCES_SYCL}      ${GGML_HEADERS_SYCL}
-            ${GGML_SOURCES_VULKAN}    ${GGML_HEADERS_VULKAN}
-            ${GGML_SOURCES_ROCM}      ${GGML_HEADERS_ROCM}
             ${GGML_SOURCES_BLAS}      ${GGML_HEADERS_BLAS}
             ${GGML_SOURCES_IQK_MM}    ${GGML_HEADERS_IQK_MM}
             ${GGML_SOURCES_IQK}       ${GGML_HEADERS_IQK}
-            ${GGML_SOURCES_CANN}      ${GGML_HEADERS_CANN}
             ggml-aarch64.c            ggml-aarch64.h
             )
 
@@ -1351,4 +1389,70 @@ endif()
 if (BUILD_SHARED_LIBS)
     set_target_properties(ggml PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(ggml PRIVATE GGML_SHARED GGML_BUILD)
+endif()
+
+if (GGML_BACKEND_DIR)
+    if (NOT GGML_BACKEND_DL)
+        message(FATAL_ERROR "GGML_BACKEND_DIR requires GGML_BACKEND_DL")
+    endif()
+    target_compile_definitions(ggml PUBLIC GGML_BACKEND_DIR="${GGML_BACKEND_DIR}")
+endif()
+
+if (GGML_BACKEND_DL)
+    # helper to create a backend as a separate shared library, e.g. libggml-cuda.so,
+    # that is loaded at runtime via ggml_backend_load_all()
+    function(ggml_add_backend_dl_library backend_name backend_use backend_libs)
+        add_library(${backend_name} MODULE ${ARGN})
+        set_target_properties(${backend_name} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+        target_compile_definitions(${backend_name} PRIVATE GGML_BACKEND_DL)
+        target_compile_definitions(${backend_name} PRIVATE ${backend_use})
+        # the backends are consumers of the ggml shared library
+        target_compile_definitions(${backend_name} PRIVATE GGML_SHARED)
+        target_include_directories(${backend_name} PRIVATE . ${GGML_EXTRA_INCLUDES})
+        target_link_directories(${backend_name} PRIVATE ${GGML_EXTRA_LIBDIRS})
+        target_link_libraries(${backend_name} PRIVATE ggml ${backend_libs})
+        # GNUInstallDirs is included after add_subdirectory(src), so CMAKE_INSTALL_BINDIR may be empty here
+        set(_ggml_backend_install_dir ${CMAKE_INSTALL_BINDIR})
+        if (NOT _ggml_backend_install_dir)
+            set(_ggml_backend_install_dir "bin")
+        endif()
+        if (GGML_BACKEND_DIR)
+            install(TARGETS ${backend_name} LIBRARY DESTINATION ${GGML_BACKEND_DIR})
+        else()
+            install(TARGETS ${backend_name} LIBRARY DESTINATION ${_ggml_backend_install_dir})
+        endif()
+    endfunction()
+
+    if (GGML_CUDA)
+        message(STATUS "Building ggml-cuda as a dynamically loadable backend")
+        if (GGML_MUSA)
+            ggml_add_backend_dl_library(ggml-cuda GGML_USE_CUDA GGML_USE_MUSA "${GGML_EXTRA_LIBS_CUDA}" ${GGML_SOURCES_CUDA} ${GGML_HEADERS_CUDA})
+        else()
+            ggml_add_backend_dl_library(ggml-cuda GGML_USE_CUDA "${GGML_EXTRA_LIBS_CUDA}" ${GGML_SOURCES_CUDA} ${GGML_HEADERS_CUDA})
+        endif()
+    endif()
+    if (GGML_HIPBLAS)
+        message(STATUS "Building ggml-hip as a dynamically loadable backend")
+        ggml_add_backend_dl_library(ggml-hip GGML_USE_CUDA GGML_USE_HIPBLAS "${GGML_EXTRA_LIBS_ROCM}" ${GGML_SOURCES_ROCM} ${GGML_HEADERS_ROCM})
+    endif()
+    if (GGML_METAL)
+        message(STATUS "Building ggml-metal as a dynamically loadable backend")
+        ggml_add_backend_dl_library(ggml-metal GGML_USE_METAL "${GGML_EXTRA_LIBS_METAL}" ${GGML_SOURCES_METAL} ${GGML_HEADERS_METAL})
+    endif()
+    if (GGML_SYCL)
+        message(STATUS "Building ggml-sycl as a dynamically loadable backend")
+        ggml_add_backend_dl_library(ggml-sycl GGML_USE_SYCL "${GGML_EXTRA_LIBS_SYCL}" ${GGML_SOURCES_SYCL} ${GGML_HEADERS_SYCL})
+    endif()
+    if (GGML_VULKAN)
+        message(STATUS "Building ggml-vulkan as a dynamically loadable backend")
+        ggml_add_backend_dl_library(ggml-vulkan GGML_USE_VULKAN "${GGML_EXTRA_LIBS_VULKAN}" ${GGML_SOURCES_VULKAN} ${GGML_HEADERS_VULKAN})
+    endif()
+    if (GGML_CANN)
+        message(STATUS "Building ggml-cann as a dynamically loadable backend")
+        ggml_add_backend_dl_library(ggml-cann GGML_USE_CANN "${GGML_EXTRA_LIBS_CANN}" ${GGML_SOURCES_CANN} ${GGML_HEADERS_CANN})
+    endif()
+    if (GGML_RPC)
+        message(STATUS "Building ggml-rpc as a dynamically loadable backend")
+        ggml_add_backend_dl_library(ggml-rpc GGML_USE_RPC "${GGML_EXTRA_LIBS_RPC}" ${GGML_SOURCES_RPC} ${GGML_HEADERS_RPC})
+    endif()
 endif()

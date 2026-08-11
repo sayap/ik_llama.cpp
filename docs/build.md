@@ -547,6 +547,44 @@ cmake --build build --config Release
 # ggml_vulkan: Using Intel(R) Graphics (ADL GT2) | uma: 1 | fp16: 1 | warp size: 32
 ```
 
+## Dynamic backend loading (`GGML_BACKEND_DL`)
+
+By default the GPU backends (CUDA, Vulkan, Metal, ...) are compiled into the `ggml` library.
+Alternatively, they can be built as **separate shared libraries** (e.g. `libggml-cuda.so`,
+`libggml-vulkan.so`) that are discovered and loaded at runtime:
+
+```bash
+cmake -B build -DGGML_BACKEND_DL=ON -DGGML_CUDA=ON -DGGML_VULKAN=ON
+cmake --build build --config Release
+```
+
+This produces `libggml.so` plus one shared library per enabled backend in `bin/`:
+
+```bash
+$ ls bin/
+libggml-cuda.so   libggml-vulkan.so   llama-cli
+```
+
+The backends are loaded at runtime by `ggml_backend_load_all()` (called from
+`llama_backend_init()`), which searches the executable directory and the current working
+directory for `[lib]ggml-{name}[-*].[so|dll]` files. Each backend library exports
+`ggml_backend_init()` to register itself and optionally `ggml_backend_score()` to indicate
+whether it is usable on the current system. Additional search paths can be provided with
+`ggml_backend_load_all_from_path()` or the `GGML_BACKEND_PATH` environment variable, and
+individual libraries can be loaded with `ggml_backend_load()`.
+
+Notes:
+
+- `GGML_BACKEND_DL` requires `BUILD_SHARED_LIBS=ON` (the default) and is off by default.
+- With `GGML_BACKEND_DL` the `ggml`/`llama` libraries are compiled without the `GGML_USE_*`
+  defines, so the backend libraries are not linked into the main binaries. Since the llama
+  library uses compile-time backend APIs for GPU offload, use the classic build
+  (`GGML_BACKEND_DL=OFF`, the default) when you need GPU offload in `llama-cli`; the dynamic
+  build is intended for applications that load backends at runtime via the ggml backend
+  registry (e.g. `ggml_backend_reg_init_backend()`).
+- `GGML_BACKEND_DIR=/path/to/backends` can be used to install the backend libraries to a
+  custom location (implies `GGML_BACKEND_DL`).
+
 ### Android
 
 To read documentation for how to build on Android, [click here](./android.md)

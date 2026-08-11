@@ -152,3 +152,43 @@ extern "C" {
 #ifdef  __cplusplus
 }
 #endif
+
+//
+// Dynamic loading
+//
+
+// Backends built as separate shared libraries (e.g. libggml-cuda.so) export the following
+// symbols, which are used by ggml_backend_load()/ggml_backend_load_all():
+//
+//   int ggml_backend_score(void)  - optional, returns 0 if the backend is not usable on this system
+//   int ggml_backend_init(void)   - registers the backend devices via ggml_backend_register(),
+//                                   returns the number of registered devices
+
+#ifdef GGML_BACKEND_DL
+#    ifdef __cplusplus
+#        define GGML_BACKEND_DL_IMPL(reg_fn)                                        \
+            extern "C" GGML_CALL int ggml_backend_init(void);                      \
+            int ggml_backend_init(void) {                                          \
+                return reg_fn();                                                   \
+            }
+#        define GGML_BACKEND_DL_SCORE_IMPL(score_fn)                               \
+            extern "C" GGML_CALL int ggml_backend_score(void);                     \
+            int ggml_backend_score(void) {                                         \
+                return score_fn();                                                 \
+            }
+#    else
+#        define GGML_BACKEND_DL_IMPL(reg_fn)                                       \
+            GGML_CALL int ggml_backend_init(void);                                 \
+            int ggml_backend_init(void) {                                         \
+                return reg_fn();                                                   \
+            }
+#        define GGML_BACKEND_DL_SCORE_IMPL(score_fn)                              \
+            GGML_CALL int ggml_backend_score(void);                               \
+            int ggml_backend_score(void) {                                        \
+                return score_fn();                                                \
+            }
+#    endif
+#else
+#    define GGML_BACKEND_DL_IMPL(reg_fn)
+#    define GGML_BACKEND_DL_SCORE_IMPL(score_fn)
+#endif
