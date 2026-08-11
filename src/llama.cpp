@@ -46,11 +46,14 @@ void llama_set_mtp_n_heads(struct llama_context * ctx, int32_t mtp_n_heads);
 
 #ifdef GGML_USE_CUDA
 #  include "ggml-cuda.h"
-#elif defined(GGML_USE_VULKAN)
+#endif
+#ifdef GGML_USE_VULKAN
 #  include "ggml-vulkan.h"
-#elif defined(GGML_USE_SYCL)
+#endif
+#ifdef GGML_USE_SYCL
 #  include "ggml-sycl.h"
-#elif defined(GGML_USE_CANN)
+#endif
+#ifdef GGML_USE_CANN
 #   include "ggml-cann.h"
 #endif
 
@@ -432,6 +435,11 @@ llama_model::~llama_model() {
 }
 
 static size_t llama_get_device_count(const llama_model & model, int initial_count = 1) {
+    // if the model has an explicit device list (set during llama_model_load_from_file),
+    // it is authoritative (it may contain devices from multiple backends)
+    if (!model.devices.empty()) {
+        return model.devices.size();
+    }
     size_t count = initial_count;
 #if defined(GGML_USE_CUDA)
     count = ggml_backend_cuda_get_device_count();
@@ -449,36 +457,85 @@ static size_t llama_get_device_count(const llama_model & model, int initial_coun
     GGML_UNUSED(model);
 }
 
+// prefix of the device names of the compile-time default backend, used to keep the
+// default device selection (no -dev flag) unchanged
+static const char * llama_default_backend_prefix() {
+#if defined(GGML_USE_METAL)
+    return "Metal";
+#elif defined(GGML_USE_CUDA)
+    return "CUDA";
+#elif defined(GGML_USE_VULKAN)
+    return "Vulkan";
+#elif defined(GGML_USE_SYCL)
+    return "SYCL";
+#elif defined(GGML_USE_CANN)
+    return "CANN";
+#else
+    return "";
+#endif
+}
+
+// model->devices holds backend registry indices; translate one to the raw device id
+// expected by the backend-specific init/memory functions (e.g. "CUDA3" -> 3)
+static int llama_device_raw_id(int dev) {
+    if (dev < 0 || dev >= (int) ggml_backend_reg_get_count()) {
+        return dev;
+    }
+    const char * name = ggml_backend_reg_get_name(dev);
+    if (name == nullptr) {
+        return dev;
+    }
+    const char * p = name;
+    while (*p) {
+        p++;
+    }
+    while (p > name && isdigit((unsigned char) p[-1])) {
+        p--;
+    }
+    return atoi(p);
+}
+
+// check whether any of the selected devices belongs to the given backend family
+// (e.g. "CUDA", "Vulkan"); RPC devices are not part of the registry
+static bool llama_selected_devices_use_backend(const llama_model & model, const char * prefix) {
+    for (int dev : model.devices) {
+        if (dev < 0 || dev >= (int) ggml_backend_reg_get_count()) {
+            continue; // RPC device
+        }
+        const char * name = ggml_backend_reg_get_name(dev);
+        if (name && strncmp(name, prefix, strlen(prefix)) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_model & model, int gpu) {
-    ggml_backend_buffer_type_t buft = nullptr;
+    // gpu refers to an entry in model.devices: a backend registry index for ggml
+    // backends, or reg_count + rpc position for RPC devices
+    const int reg_count = (int) ggml_backend_reg_get_count();
 
 #if defined(GGML_USE_RPC)
-    int dev_count = (int)llama_get_device_count(model);
-    int rpc_count = (int)model.rpc_servers.size();
-    if (gpu >= dev_count - rpc_count) {
-        int rpc_idx = gpu - dev_count + rpc_count;
-        rpc_device rpc = model.rpc_servers[rpc_idx];
-        const char * endpoint = rpc.endpoint.c_str();
-        return ggml_backend_rpc_buffer_type(endpoint, rpc.device);
+    if (gpu >= reg_count) {
+        const int rpc_idx = gpu - reg_count;
+        if (rpc_idx >= 0 && rpc_idx < (int) model.rpc_servers.size()) {
+            const rpc_device rpc = model.rpc_servers[rpc_idx];
+            return ggml_backend_rpc_buffer_type(rpc.endpoint.c_str(), rpc.device);
+        }
     }
+#else
+    GGML_UNUSED(model);
 #endif
-#if defined(GGML_USE_METAL)
-    buft = ggml_backend_metal_buffer_type();
-#elif defined(GGML_USE_CUDA)
-    buft = ggml_backend_cuda_buffer_type(gpu);
-#elif defined(GGML_USE_VULKAN)
-    buft = ggml_backend_vk_buffer_type(gpu);
-#elif defined(GGML_USE_SYCL)
-    buft = ggml_backend_sycl_buffer_type(gpu);
-#elif defined(GGML_USE_CANN)
-    buft = ggml_backend_cann_buffer_type(gpu);
-#endif
+
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (gpu >= 0 && gpu < reg_count) {
+        buft = ggml_backend_reg_get_default_buffer_type(gpu);
+    }
 
     if (buft == nullptr) {
         buft = llama_default_buffer_type_cpu(true);
     }
     return buft;
-    GGML_UNUSED(model);
     GGML_UNUSED(gpu);
 }
 
@@ -513,41 +570,57 @@ ggml_backend_buffer_type_t llama_model::default_buffer_type_offload(int device) 
 }
 
 static size_t llama_get_device_memory(const llama_model & model, int device) {
+    // device is an entry in model.devices: a backend registry index or an RPC device
+    const int reg_count = (int) ggml_backend_reg_get_count();
+
 #if defined(GGML_USE_RPC)
-    int dev_count = (int)llama_get_device_count(model);
-    int rpc_count = (int)model.rpc_servers.size();
-    if (device >= dev_count - rpc_count) {
+    if (device >= reg_count) {
+        const int rpc_idx = device - reg_count;
+        if (rpc_idx >= 0 && rpc_idx < (int) model.rpc_servers.size()) {
+            size_t total;
+            size_t free;
+            const rpc_device rpc = model.rpc_servers[rpc_idx];
+            ggml_backend_rpc_get_device_memory(rpc.endpoint.c_str(), rpc.device, &free, &total);
+            return free;
+        }
+    }
+#endif
+
+    // dispatch to the backend-specific memory query based on the registry device name
+    const char * name = device >= 0 && device < reg_count ? ggml_backend_reg_get_name(device) : nullptr;
+#if defined(GGML_USE_CUDA)
+    if (name && strncmp(name, "CUDA", 4) == 0) {
         size_t total;
         size_t free;
-        rpc_device rpc = model.rpc_servers[device - dev_count + rpc_count];
-        const char * endpoint = rpc.endpoint.c_str();
-        ggml_backend_rpc_get_device_memory(endpoint, rpc.device, &free, &total);
+        ggml_backend_cuda_get_device_memory(llama_device_raw_id(device), &free, &total);
         return free;
     }
 #endif
-#if defined(GGML_USE_CUDA)
-    size_t total;
-    size_t free;
-    ggml_backend_cuda_get_device_memory(device, &free, &total);
-    return free;
-#elif defined(GGML_USE_SYCL)
-    size_t total;
-    size_t free;
-    ggml_backend_sycl_get_device_memory(device, &free, &total);
-    return free;
-#elif defined(GGML_USE_VULKAN)
-    size_t total;
-    size_t free;
-    ggml_backend_vk_get_device_memory(device, &free, &total);
-    return free;
-#elif defined(GGML_USE_CANN)
-    size_t total;
-    size_t free;
-    ggml_backend_cann_get_device_memory(device, &free, &total);
-    return free;
-#else
-    return 1;
+#if defined(GGML_USE_SYCL)
+    if (name && strncmp(name, "SYCL", 4) == 0) {
+        size_t total;
+        size_t free;
+        ggml_backend_sycl_get_device_memory(llama_device_raw_id(device), &free, &total);
+        return free;
+    }
 #endif
+#if defined(GGML_USE_VULKAN)
+    if (name && strncmp(name, "Vulkan", 6) == 0) {
+        size_t total;
+        size_t free;
+        ggml_backend_vk_get_device_memory(llama_device_raw_id(device), &free, &total);
+        return free;
+    }
+#endif
+#if defined(GGML_USE_CANN)
+    if (name && strncmp(name, "CANN", 4) == 0) {
+        size_t total;
+        size_t free;
+        ggml_backend_cann_get_device_memory(llama_device_raw_id(device), &free, &total);
+        return free;
+    }
+#endif
+    return 1;
     GGML_UNUSED(model);
     GGML_UNUSED(device);
 }
@@ -7821,7 +7894,69 @@ struct llama_model * llama_model_load_from_file(
         model->rpc_servers = extract_device_from_rpc_device(string_split(params.rpc_servers, ","));
     }
 
-    auto n_gpu = llama_get_device_count(*model, 0);
+    // model->devices holds the indices of the devices used for offloading, taken from
+    // the ggml backend registry (e.g. CUDA0, CUDA1, Vulkan0, ...), with RPC devices
+    // appended after the registered backends. If no device is specified via -dev,
+    // all devices of the compile-time default backend are included.
+
+    std::vector<std::string> params_devices;
+    if (params.devices && !striequals(params.devices, "")) {
+        params_devices = string_split(params.devices, ",");
+    }
+
+    std::map<std::string, int32_t> buffer_names;
+    std::vector<std::string> gpu_names;
+    // list all registered device buffer type names
+    for (size_t idx = 0; idx < ggml_backend_reg_get_count(); idx++) {
+        if (striequals(ggml_backend_reg_get_name(idx), "CPU")) {
+            continue;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_reg_get_default_buffer_type(idx);
+        if (!buft) {
+            continue;
+        }
+        const std::string name = ggml_backend_buft_name(buft);
+        buffer_names.insert({ name, (int32_t) idx });
+        gpu_names.push_back(name);
+    }
+    const int32_t rpc_base = (int32_t) ggml_backend_reg_get_count();
+    if (has_rpc) {
+        for (size_t j = 0; j < model->rpc_servers.size(); j++) {
+            const auto & rpc = model->rpc_servers[j];
+            buffer_names.insert({ create_rpc_name(rpc.endpoint, rpc.device), rpc_base + (int32_t) j });
+        }
+    }
+    std::vector<std::string> device_names;
+    if (params_devices.size()) {
+        // -dev "none" means no offload
+        if (!(params_devices.size() == 1 && striequals(params_devices[0].c_str(), "none"))) {
+            device_names = params_devices;
+        }
+    } else {
+        // add RPC servers at the front of the list to minimize the network transfers
+        if (has_rpc) {
+            for (auto& it : model->rpc_servers) {
+                device_names.push_back(create_rpc_name(it.endpoint, it.device));
+            }
+        }
+        // default to the devices of the compile-time backend
+        const char * default_prefix = llama_default_backend_prefix();
+        for (const auto & name : gpu_names) {
+            if (default_prefix[0] == '\0' || strncmp(name.c_str(), default_prefix, strlen(default_prefix)) == 0) {
+                device_names.push_back(name);
+            }
+        }
+    }
+
+    for (auto & device : device_names) {
+        if (buffer_names.count(device)) {
+            model->devices.push_back(buffer_names[device]);
+        } else {
+            LLAMA_LOG_ERROR("%s backend not available.\n", device.c_str());
+        }
+    }
+
+    auto n_gpu = model->devices.size();
     if (params.n_gpu_layers < 0) {
         params.n_gpu_layers = n_gpu > 0 ? 999 : 0;
     } else if (n_gpu == 0) {
@@ -7849,53 +7984,6 @@ struct llama_model * llama_model_load_from_file(
         };
     }
     model->set_tensor_overrides(params);
-    // model->devices hold device indices that are used to offload
-    // use model->devices to determine offload device
-    // if no device is specified, all device are included
-    // if device is specified, only those in the devices are included in the model->devices
-
-    std::vector<std::string> params_devices;
-    if (params.devices && !striequals(params.devices, "")) {
-        params_devices = string_split(params.devices, ",");
-    }
-
-    std::map<std::string, int32_t> buffer_names;
-    std::vector<std::string> gpu_names;
-    int32_t idx = 0;
-    int dev_count = (int)llama_get_device_count(*model);
-    // list all buffer type names
-    for (idx = 0; idx < dev_count; idx++) {
-        ggml_backend_buffer_type_t buft = llama_default_buffer_type_offload(*model, idx);
-        const char* name = ggml_backend_buft_name(buft);
-        buffer_names.insert({ std::string(name), idx });
-        gpu_names.push_back(std::string(name));
-    }
-    if (has_rpc) {
-        for (auto rpc : model->rpc_servers) {
-            buffer_names.insert({ create_rpc_name(rpc.endpoint, rpc.device), idx});
-            idx++;
-        }
-    }
-    std::vector<std::string> device_names;
-    if (params_devices.size()) {
-        device_names = params_devices;
-    } else {
-        // add RPC servers at the front of the list to minimize the network transfers
-        if (has_rpc) {
-            for (auto& it : model->rpc_servers) {
-                device_names.push_back(create_rpc_name(it.endpoint, it.device));
-            }
-        }
-        device_names.insert(device_names.end(), gpu_names.begin(), gpu_names.end());
-    }
-
-    for (auto & device : device_names) {
-        if (buffer_names.count(device)) {
-            model->devices.push_back(buffer_names[device]);
-        } else {
-            LLAMA_LOG_ERROR("%s backend not available.\n", device.c_str());
-        }
-    }
 
     // no gpu used, so set layers offload to be 0
     if (!model->devices.size()) {
@@ -8401,10 +8489,10 @@ struct llama_context * llama_init_from_model(
         // (auto-fit assigns device_count-1, MTP clamps to [0, device_count), buffer-type
         // setup wraps with model.devices[main_gpu]). Translate to a raw device id here.
         [[maybe_unused]] const int main_gpu_id = (model->main_gpu >= 0 && model->main_gpu < (int)model->devices.size())
-            ? model->devices[model->main_gpu]
+            ? llama_device_raw_id(model->devices[model->main_gpu])
             : model->main_gpu;
 #if defined(GGML_USE_METAL)
-        if (model->n_gpu_layers > 0) {
+        if (model->n_gpu_layers > 0 && llama_selected_devices_use_backend(*model, "Metal")) {
             ctx->backend_metal = ggml_backend_metal_init();
             if (ctx->backend_metal == nullptr) {
                 LLAMA_LOG_ERROR("%s: failed to initialize Metal backend\n", __func__);
@@ -8414,107 +8502,115 @@ struct llama_context * llama_init_from_model(
             ggml_backend_add_from_device(ctx,  ctx->backend_metal);
         }
 #elif defined(GGML_USE_CUDA)
-        if (model->split_mode == LLAMA_SPLIT_MODE_NONE) {
-            // with split_mode LLAMA_SPLIT_MODE_NONE or LLAMA_SPLIT_MODE_GRAPH, only the main GPU backend is used
-            ggml_backend_t backend = ggml_backend_cuda_init(main_gpu_id, cparams.cuda_params, ctx);
-            if (backend == nullptr) {
-                LLAMA_LOG_ERROR("%s: failed to initialize CUDA%d backend\n", __func__, main_gpu_id);
-                llama_free(ctx);
-                return nullptr;
-            }
-            ggml_backend_add_from_device(ctx, backend);
-
-        } else {
-            // LLAMA_SPLIT_MODE_LAYER and LLAMA_SPLIT_MODE_GRAPH require a backend for each GPU
-            auto params = cparams.cuda_params;
-            std::string new_params;
-            if (false && model->split_mode == LLAMA_SPLIT_MODE_GRAPH) {
-                static const std::string extra_string{"graphs=0"};
-                if (params) new_params = std::string{(const char *)params} + ',';
-                new_params += extra_string;
-                params = new_params.data();
-            }
-            for (int device = 0; device < ggml_backend_cuda_get_device_count(); ++device) {
-                ggml_backend_t backend = ggml_backend_cuda_init(device, params, ctx);
+        if (llama_selected_devices_use_backend(*model, "CUDA")) {
+            if (model->split_mode == LLAMA_SPLIT_MODE_NONE) {
+                // with split_mode LLAMA_SPLIT_MODE_NONE or LLAMA_SPLIT_MODE_GRAPH, only the main GPU backend is used
+                ggml_backend_t backend = ggml_backend_cuda_init(main_gpu_id, cparams.cuda_params, ctx);
                 if (backend == nullptr) {
-                    LLAMA_LOG_ERROR("%s: failed to initialize CUDA%d backend\n", __func__, device);
+                    LLAMA_LOG_ERROR("%s: failed to initialize CUDA%d backend\n", __func__, main_gpu_id);
                     llama_free(ctx);
                     return nullptr;
                 }
                 ggml_backend_add_from_device(ctx, backend);
+
+            } else {
+                // LLAMA_SPLIT_MODE_LAYER and LLAMA_SPLIT_MODE_GRAPH require a backend for each GPU
+                auto params = cparams.cuda_params;
+                std::string new_params;
+                if (false && model->split_mode == LLAMA_SPLIT_MODE_GRAPH) {
+                    static const std::string extra_string{"graphs=0"};
+                    if (params) new_params = std::string{(const char *)params} + ',';
+                    new_params += extra_string;
+                    params = new_params.data();
+                }
+                for (int device = 0; device < ggml_backend_cuda_get_device_count(); ++device) {
+                    ggml_backend_t backend = ggml_backend_cuda_init(device, params, ctx);
+                    if (backend == nullptr) {
+                        LLAMA_LOG_ERROR("%s: failed to initialize CUDA%d backend\n", __func__, device);
+                        llama_free(ctx);
+                        return nullptr;
+                    }
+                    ggml_backend_add_from_device(ctx, backend);
+                }
             }
         }
 #elif defined(GGML_USE_VULKAN)
-        if (model->split_mode == LLAMA_SPLIT_MODE_GRAPH || model->split_mode == LLAMA_SPLIT_MODE_ATTN) {
-            LLAMA_LOG_ERROR("%s: split mode 'graph' or 'attn' not supported. Failed to initialize Vulkan backend\n", __func__);
-            llama_free(ctx);
-            return nullptr;
-        }
-        if (model->split_mode == LLAMA_SPLIT_MODE_NONE) {
-            ggml_backend_t backend = ggml_backend_vk_init(main_gpu_id);
-            if (backend == nullptr) {
-                LLAMA_LOG_ERROR("%s: failed to initialize Vulkan backend\n", __func__);
+        if (llama_selected_devices_use_backend(*model, "Vulkan")) {
+            if (model->split_mode == LLAMA_SPLIT_MODE_GRAPH || model->split_mode == LLAMA_SPLIT_MODE_ATTN) {
+                LLAMA_LOG_ERROR("%s: split mode 'graph' or 'attn' not supported. Failed to initialize Vulkan backend\n", __func__);
                 llama_free(ctx);
                 return nullptr;
             }
-            ggml_backend_add_from_device(ctx, backend);
-        } else {
-            for (int device = 0; device < ggml_backend_vk_get_device_count(); ++device) {
-                ggml_backend_t backend = ggml_backend_vk_init(device);
+            if (model->split_mode == LLAMA_SPLIT_MODE_NONE) {
+                ggml_backend_t backend = ggml_backend_vk_init(main_gpu_id);
                 if (backend == nullptr) {
-                    LLAMA_LOG_ERROR("%s: failed to initialize Vulkan%d backend\n", __func__, device);
+                    LLAMA_LOG_ERROR("%s: failed to initialize Vulkan backend\n", __func__);
                     llama_free(ctx);
                     return nullptr;
                 }
                 ggml_backend_add_from_device(ctx, backend);
+            } else {
+                for (int device = 0; device < ggml_backend_vk_get_device_count(); ++device) {
+                    ggml_backend_t backend = ggml_backend_vk_init(device);
+                    if (backend == nullptr) {
+                        LLAMA_LOG_ERROR("%s: failed to initialize Vulkan%d backend\n", __func__, device);
+                        llama_free(ctx);
+                        return nullptr;
+                    }
+                    ggml_backend_add_from_device(ctx, backend);
+                }
             }
         }
 #elif defined(GGML_USE_SYCL)
-        // with split_mode LLAMA_SPLIT_MODE_NONE or LLAMA_SPLIT_MODE_GRAPH, only the main GPU backend is used
-        if (model->split_mode == LLAMA_SPLIT_MODE_NONE || model->split_mode == LLAMA_SPLIT_MODE_GRAPH) {
-            ggml_backend_t backend = ggml_backend_sycl_init(main_gpu_id);
-            if (backend == nullptr) {
-                LLAMA_LOG_ERROR("%s: failed to initialize SYCL%d backend\n", __func__, main_gpu_id);
-                llama_free(ctx);
-                return nullptr;
-            }
-            ctx->backends.push_back(backend);
-        } else {
-            // LLAMA_SPLIT_LAYER requires a backend for each GPU
-            for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
-                ggml_backend_t backend = ggml_backend_sycl_init(i);
+        if (llama_selected_devices_use_backend(*model, "SYCL")) {
+            // with split_mode LLAMA_SPLIT_MODE_NONE or LLAMA_SPLIT_MODE_GRAPH, only the main GPU backend is used
+            if (model->split_mode == LLAMA_SPLIT_MODE_NONE || model->split_mode == LLAMA_SPLIT_MODE_GRAPH) {
+                ggml_backend_t backend = ggml_backend_sycl_init(main_gpu_id);
                 if (backend == nullptr) {
-                    LLAMA_LOG_ERROR("%s: failed to initialize SYCL%d for No.%d backend\n", __func__, i, i);
+                    LLAMA_LOG_ERROR("%s: failed to initialize SYCL%d backend\n", __func__, main_gpu_id);
+                    llama_free(ctx);
+                    return nullptr;
+                }
+                ctx->backends.push_back(backend);
+            } else {
+                // LLAMA_SPLIT_LAYER requires a backend for each GPU
+                for (int i = 0; i < ggml_backend_sycl_get_device_count(); ++i) {
+                    ggml_backend_t backend = ggml_backend_sycl_init(i);
+                    if (backend == nullptr) {
+                        LLAMA_LOG_ERROR("%s: failed to initialize SYCL%d for No.%d backend\n", __func__, i, i);
+                        llama_free(ctx);
+                        return nullptr;
+                    }
+                    ggml_backend_add_from_device(ctx, backend);
+                }
+            }
+        }
+#elif defined(GGML_USE_CANN)
+        if (llama_selected_devices_use_backend(*model, "CANN")) {
+            // with split_mode LLAMA_SPLIT_MODE_NONE or LLAMA_SPLIT_MODE_GRAPH, only the main GPU backend is used
+            // TODO: ggml_backend_cann is not support split tensor now, just leave code here.
+            if (model->split_mode == LLAMA_SPLIT_MODE_NONE || model->split_mode == LLAMA_SPLIT_MODE_GRAPH) {
+                ggml_backend_t backend = ggml_backend_cann_init(main_gpu_id);
+                if (backend == nullptr) {
+                    LLAMA_LOG_ERROR("%s: failed to initialize CANN%d backend\n", __func__, main_gpu_id);
                     llama_free(ctx);
                     return nullptr;
                 }
                 ggml_backend_add_from_device(ctx, backend);
+            } else {
+                // LLAMA_SPLIT_MODE_LAYER requires a backend for each GPU
+                // TODO: currently, CANN can't use multi-gpus, just leave code here for further cann version.
+                for (int32_t device = 0; device < ggml_backend_cann_get_device_count(); ++device) {
+                    ggml_backend_t backend = ggml_backend_cann_init(device);
+                    if (backend == nullptr) {
+                        LLAMA_LOG_ERROR("%s: failed to initialize CANN%d backend\n", __func__, device);
+                        llama_free(ctx);
+                        return nullptr;
+                    }
+                    ggml_backend_add_from_device(ctx, backend);
+                }
             }
         }
-#elif defined(GGML_USE_CANN)
-    // with split_mode LLAMA_SPLIT_MODE_NONE or LLAMA_SPLIT_MODE_GRAPH, only the main GPU backend is used
-    // TODO: ggml_backend_cann is not support split tensor now, just leave code here.
-    if (model->split_mode == LLAMA_SPLIT_MODE_NONE || model->split_mode == LLAMA_SPLIT_MODE_GRAPH) {
-        ggml_backend_t backend = ggml_backend_cann_init(main_gpu_id);
-        if (backend == nullptr) {
-            LLAMA_LOG_ERROR("%s: failed to initialize CANN%d backend\n", __func__, main_gpu_id);
-            llama_free(ctx);
-            return nullptr;
-        }
-        ggml_backend_add_from_device(ctx, backend);
-    } else {
-        // LLAMA_SPLIT_MODE_LAYER requires a backend for each GPU
-        // TODO: currently, CANN can't use multi-gpus, just leave code here for further cann version.
-        for (int32_t device = 0; device < ggml_backend_cann_get_device_count(); ++device) {
-            ggml_backend_t backend = ggml_backend_cann_init(device);
-            if (backend == nullptr) {
-                LLAMA_LOG_ERROR("%s: failed to initialize CANN%d backend\n", __func__, device);
-                llama_free(ctx);
-                return nullptr;
-            }
-            ggml_backend_add_from_device(ctx, backend);
-        }
-    }
 #endif
 
 #if defined(GGML_USE_RPC)
@@ -8531,6 +8627,31 @@ struct llama_context * llama_init_from_model(
             }
         }
 #endif
+        // initialize any selected devices that were not initialized above, e.g. a device
+        // from a backend other than the compile-time default in a multi-backend build,
+        // selected via the -dev/--device flag
+        if (model->n_gpu_layers > 0) {
+            for (const int dev : model->devices) {
+                if (dev < 0 || dev >= (int) ggml_backend_reg_get_count()) {
+                    continue; // RPC devices are initialized above
+                }
+                ggml_backend_buffer_type_t buft = ggml_backend_reg_get_default_buffer_type(dev);
+                if (!buft) {
+                    continue;
+                }
+                const char * name = ggml_backend_buft_name(buft);
+                if (ctx->ggml_backend_by_name(name)) {
+                    continue; // already initialized
+                }
+                ggml_backend_t backend = ggml_backend_reg_init_backend(dev, nullptr);
+                if (backend == nullptr) {
+                    LLAMA_LOG_ERROR("%s: failed to initialize %s backend\n", __func__, name);
+                    llama_free(ctx);
+                    return nullptr;
+                }
+                ggml_backend_add_from_device(ctx, backend);
+            }
+        }
         if (ctx->cparams.devices.size()) {
             // reorder the backend from devices params
             std::vector<ggml_backend_t> backends = {};
