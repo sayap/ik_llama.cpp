@@ -3879,7 +3879,7 @@ static void ggml_vk_instance_init() {
             return;
         }
 
-        // Default to using all dedicated GPUs
+        // Default to using all dedicated GPUs, as well as integrated GPUs that are supported
         for (size_t i = 0; i < devices.size(); i++) {
             vk::PhysicalDeviceProperties2 new_props;
             vk::PhysicalDeviceDriverProperties new_driver;
@@ -3888,7 +3888,8 @@ static void ggml_vk_instance_init() {
             new_driver.pNext = &new_id;
             devices[i].getProperties2(&new_props);
 
-            if (new_props.properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+            if (new_props.properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu ||
+                new_props.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu) {
                 // Check if there are two physical devices corresponding to the same GPU
                 auto old_device = std::find_if(
                     vk_instance.device_indices.begin(),
