@@ -2436,6 +2436,9 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
 }
 
 static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_backend_t split_backend, ggml_backend_sched_split * split) {
+#if IK_PRINT_TIMING
+    int64_t tim1 = ggml_time_us();
+#endif
     if (!sched->callback_eval) {
 #if IK_PRINT_TIMING
         int64_t tim2 = ggml_time_us();
