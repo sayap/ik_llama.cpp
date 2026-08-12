@@ -1,0 +1,133 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+#include "mul_mat_vec_iqk_base.comp"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+#define QUANT_K 256
+#define BLOCK_BYTES 86
+#define META 2
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, const uint i,
+                     const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    // 16 threads per block: ib64 = itid/4 (0..3), quarter = itid%4
+    //   quarter 0: dl1 y 0..15, 1: dl1 y 16..31, 2: dl2 y 32..47, 3: dl2 y 48..63
+    // Each thread handles 8 (j, pair) -> 16 elements
+    const uint ib64 = itid / 4;
+    const uint quarter = itid % 4;
+    const uint e = 64 * ib64 + 16 * quarter;
+    const bool low = quarter < 2;
+
+    const uint y_idx = i * QUANT_K + e;
+    const uint row_bytes = p.stride_a + num_blocks_per_row * BLOCK_BYTES;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint row_byte = a_byte + (first_row + n) * row_bytes;
+        const uint block_byte = row_byte + META + i * BLOCK_BYTES;
+
+        const float d = iqk_f16_to_f32(iqk_load_u16(row_byte));
+        const uint scales_h = iqk_load_u16(block_byte);
+        const uint sc = data_a[block_byte + 2 + (2 * ib64 + (low ? 0u : 1u)) % 4];
+        const float dl = d * (float(((sc >> (4 * (ib64 / 2))) & 0xFu) | (((scales_h >> (4 * ib64 + 2 * (low ? 0u : 1u))) & 3u) << 4)) - 32.0f);
+        const uint sft_h = 2 * ib64 + (low ? 0u : 1u);
+
+        const uint qs_off = 6 + 16 * ib64 + 8 * (quarter & 1);
+        const uint qh_off = 70 + 8 * (quarter & 1);
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b4 = (j * p.batch_stride_b + b_offset + y_idx) / 4;
+            vec4 b0 = vec4(data_b_v4[b4 + 0]);
+            vec4 b1 = vec4(data_b_v4[b4 + 1]);
+            vec4 b2 = vec4(data_b_v4[b4 + 2]);
+            vec4 b3 = vec4(data_b_v4[b4 + 3]);
+            FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
+            // element 2*pair+m: weight = low byte (m=0) or high byte (m=1) of iq2kl_values[idx]
+            [[unroll]] for (uint k = 0; k < 4; ++k) {
+                const uint pair = k / 2;
+                const uint m = k % 2;
+                const uint q = data_a[block_byte + qs_off + pair];
+                const uint hb = data_a[block_byte + qh_off + pair];
+                const uint idx = low
+                    ? ((q & 0xFu) | (((hb >> sft_h) & 1u) << 4))
+                    : ((q >> 4) | (((hb >> sft_h) & 1u) << 4));
+                const uint v = iq2kl_values[idx];
+                sum += FLOAT_TYPE(b0[k]) * FLOAT_TYPE(float(int8_t(m == 0 ? (v & 0xffu) : (v >> 8))));
+            }
+            [[unroll]] for (uint k = 0; k < 4; ++k) {
+                const uint pair = 2 + k / 2;
+                const uint m = k % 2;
+                const uint q = data_a[block_byte + qs_off + pair];
+                const uint hb = data_a[block_byte + qh_off + pair];
+                const uint idx = low
+                    ? ((q & 0xFu) | (((hb >> sft_h) & 1u) << 4))
+                    : ((q >> 4) | (((hb >> sft_h) & 1u) << 4));
+                const uint v = iq2kl_values[idx];
+                sum += FLOAT_TYPE(b1[k]) * FLOAT_TYPE(float(int8_t(m == 0 ? (v & 0xffu) : (v >> 8))));
+            }
+            [[unroll]] for (uint k = 0; k < 4; ++k) {
+                const uint pair = 4 + k / 2;
+                const uint m = k % 2;
+                const uint q = data_a[block_byte + qs_off + pair];
+                const uint hb = data_a[block_byte + qh_off + pair];
+                const uint idx = low
+                    ? ((q & 0xFu) | (((hb >> sft_h) & 1u) << 4))
+                    : ((q >> 4) | (((hb >> sft_h) & 1u) << 4));
+                const uint v = iq2kl_values[idx];
+                sum += FLOAT_TYPE(b2[k]) * FLOAT_TYPE(float(int8_t(m == 0 ? (v & 0xffu) : (v >> 8))));
+            }
+            [[unroll]] for (uint k = 0; k < 4; ++k) {
+                const uint pair = 6 + k / 2;
+                const uint m = k % 2;
+                const uint q = data_a[block_byte + qs_off + pair];
+                const uint hb = data_a[block_byte + qh_off + pair];
+                const uint idx = low
+                    ? ((q & 0xFu) | (((hb >> sft_h) & 1u) << 4))
+                    : ((q >> 4) | (((hb >> sft_h) & 1u) << 4));
+                const uint v = iq2kl_values[idx];
+                sum += FLOAT_TYPE(b3[k]) * FLOAT_TYPE(float(int8_t(m == 0 ? (v & 0xffu) : (v >> 8))));
+            }
+            temp[j][n] = fma(dl, sum, temp[j][n]);
+        }
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_byte, b_offset, d_offset;
+    get_offsets(a_byte, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+
+    const uint blocks_per_wg = gl_WorkGroupSize.x / 16;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid % 16;
+    const uint ix = tid / 16;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg)
+        calc_superblock(a_byte, b_offset, itid, i, num_blocks_per_row, first_row, num_rows);
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

@@ -1,0 +1,116 @@
+// Shared base for mul_mat_vec shaders of the IQK / KT quant families.
+//
+// These formats use QK_K = 256 element blocks, optionally with a per-row scale
+// header (row_meta_size: 0, 2 or 4 bytes). The weight buffer is therefore read
+// as raw bytes with explicit row/block addressing:
+//
+//   row byte stride  = p.stride_a + nbpb * BLOCK_BYTES     (p.stride_a = meta bytes)
+//   block byte offset = row * row_stride + p.stride_a + blk * BLOCK_BYTES
+//
+// p.stride_a (the A row stride push constant) is unused by the pre-existing
+// mul_mat_vec shaders, so it is repurposed here to carry the row meta size.
+// p.batch_stride_a carries the per-batch A stride in BYTES (not elements).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#ifdef MUL_MAT_ID
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+
+#include "types.comp"
+#include "iqk_tables.comp"
+
+layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
+layout (binding = 1) readonly buffer BV2 {B_TYPE_VEC2 data_b_v2[];};
+layout (binding = 1) readonly buffer BV4 {B_TYPE_VEC4 data_b_v4[];};
+layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+#ifdef MUL_MAT_ID
+layout (binding = 3) readonly buffer IDS {int data_ids[];};
+#endif
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;
+    uint stride_a;      // row meta size in bytes
+    uint stride_b;      // (B row stride for MUL_MAT_ID; unused otherwise)
+    uint stride_d;
+
+    uint batch_stride_a; // bytes per batch/expert of A
+    uint batch_stride_b;
+    uint batch_stride_d;
+
+#ifdef MUL_MAT_ID
+    uint nei0;
+    uint ne11;
+#else
+    uint ne02;
+    uint ne12;
+    uint broadcast2;
+    uint broadcast3;
+#endif
+} p;
+
+void get_offsets(out uint a_byte, out uint b_offset, out uint d_offset) {
+#ifdef MUL_MAT_ID
+    const uint expert_idx = gl_GlobalInvocationID.y;
+    const uint expert_id = data_ids[expert_idx];
+    a_byte = expert_id * p.batch_stride_a;
+    b_offset = (expert_idx % p.ne11) * p.stride_b;
+    d_offset = expert_idx * p.stride_d;
+#else
+    const uint batch_idx = gl_GlobalInvocationID.y;
+
+    uint batch_idx_a = 0;
+    if (batch_idx != 0) {
+        const uint i13 = batch_idx / p.ne12;
+        const uint i12 = batch_idx % p.ne12;
+
+        const uint i03 = i13 / p.broadcast3;
+        const uint i02 = i12 / p.broadcast2;
+
+        batch_idx_a = i03 * p.ne02 + i02;
+    }
+
+    a_byte = batch_idx_a * p.batch_stride_a;
+    b_offset = batch_idx * p.batch_stride_b;
+    d_offset = batch_idx * p.batch_stride_d;
+#endif
+}
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 16;
+layout (constant_id = 1) const uint NUM_ROWS = 1;
+layout (constant_id = 2) const uint NUM_COLS = 1;
+
+shared FLOAT_TYPE tmpsh[NUM_COLS][NUM_ROWS][BLOCK_SIZE];
+
+void reduce_result(const in FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
+    // sum up partial sums and write back result
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            tmpsh[j][n][tid] = temp[j][n];
+        }
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                    tmpsh[j][n][tid] += tmpsh[j][n][tid + s];
+                }
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+            }
+        }
+    }
+}
+
+// (rows-per-workgroup etc. are per-pipeline spec constants; row math is done in the type shaders)

@@ -67,6 +67,26 @@ const std::vector<std::string> type_names = {
     "bf16",
 };
 
+// IQK (QK_K=256) and KT quant families. These only get mul_mat_vec and
+// dequant shaders: the mat-mat path uses the dequant-to-F16 fallback.
+const std::vector<std::string> iqk_type_names = {
+    "iq2_k",
+    "iq3_k",
+    "iq4_k",
+    "iq5_k",
+    "iq6_k",
+    "iq2_ks",
+    "iq3_ks",
+    "iq4_ks",
+    "iq4_kss",
+    "iq5_ks",
+    "iq2_kl",
+    "iq1_kt",
+    "iq2_kt",
+    "iq3_kt",
+    "iq4_kt",
+};
+
 namespace {
 void execute_command(const std::string& command, std::string& stdout_str, std::string& stderr_str) {
 #ifdef _WIN32
@@ -488,6 +508,18 @@ void process_shaders() {
             }
             string_to_spv("get_rows_" + tname + "_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
         }
+    }
+
+    // IQK / KT quant families: mul_mat_vec (f32/f16 activations + MoE id) and dequant shaders
+    for (const auto& tname : iqk_type_names) {
+        const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+        const std::string shader = "mul_mat_vec_" + tname + ".comp";
+
+        string_to_spv("mul_mat_vec_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}));
+        string_to_spv("mul_mat_vec_" + tname + "_f16_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}}));
+        string_to_spv("mul_mat_vec_id_" + tname + "_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}));
+
+        string_to_spv("dequant_" + tname, "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
     }
 
     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPE_VEC4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});

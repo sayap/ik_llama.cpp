@@ -1,0 +1,112 @@
+// Lookup tables for the IQK (QK_K=256) and KT quant families.
+// Values mirror ggml-common.h (iq2nl_values, iq2kl_values, iq3nl_values,
+// iq4k_values, iq5nl_values, iq6nl_values).
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Byte-addressed weight buffer shared by the IQK/KT dequant and mul_mat_vec shaders
+layout (binding = 0) readonly buffer A {uint8_t data_a[];};
+
+// Unpack a 16-bit IEEE half to float (helper for byte-addressed blocks)
+float iqk_f16_to_f32(uint u) {
+    const uint sign = (u >> 15) & 1u;
+    const uint exp  = (u >> 10) & 0x1Fu;
+    const uint man  = u & 0x3FFu;
+    float f;
+    if (exp == 0u) {
+        f = ldexp(float(man), -24);
+    } else if (exp == 31u) {
+        f = 1.0f / 0.0f; // inf/nan
+    } else {
+        f = ldexp(float(man) + 1024.0f, int(exp) - 25);
+    }
+    return sign != 0u ? -f : f;
+}
+
+uint iqk_load_u16(uint off) {
+    return uint(data_a[off]) | (uint(data_a[off + 1]) << 8);
+}
+
+uint iqk_load_u32(uint off) {
+    return uint(data_a[off]) | (uint(data_a[off + 1]) << 8) | (uint(data_a[off + 2]) << 16) | (uint(data_a[off + 3]) << 24);
+}
+
+// KT-family value decode: 4 hash rounds of x *= ka produce 4 values
+// (see QuantizerIQKT::set_values with is_int = true). x is advanced so a
+// second call continues the chain. The result can be negated per value via
+// sign_mask (bit k set negates value k).
+vec4 iqk_hash_values(inout uint x, bool is_abs, uint sign_mask) {
+    vec4 res;
+    [[unroll]] for (int k = 0; k < 4; ++k) {
+        x *= 0xCBAC1FEDu;
+        const uint s = x & 0x3F3F3F3Fu;
+        float v = float(int((s & 0xffu) + ((s >> 8) & 0xffu) + ((s >> 16) & 0xffu) + ((s >> 24) & 0xffu)) - 126);
+        if (is_abs) v = abs(v);
+        if (((sign_mask >> k) & 1u) != 0u) v = -v;
+        res[k] = v;
+    }
+    return res;
+}
+
+// 2-bit nonlinear values (two 4-entry tables)
+const int8_t iq2nl_values[8] = {
+    int8_t(-31), int8_t(-13), int8_t(1), int8_t(17),
+    int8_t(-26), int8_t(-8),  int8_t(6), int8_t(22),
+};
+
+// 2-bit nonlinear values for IQ2_KL (16-bit pairs; low byte first)
+const uint16_t iq2kl_values[32] = {
+    uint16_t(0xe9c1), uint16_t(0x0dc1), uint16_t(0xc1d8), uint16_t(0xf6d8), uint16_t(0x0dd8), uint16_t(0x2fd8), uint16_t(0xd8e9), uint16_t(0xe9e9),
+    uint16_t(0x01e9), uint16_t(0x0de9), uint16_t(0x1ce9), uint16_t(0xc1f6), uint16_t(0x01f6), uint16_t(0x0df6), uint16_t(0x2ff6), uint16_t(0xe901),
+    uint16_t(0xf601), uint16_t(0x0101), uint16_t(0x0d01), uint16_t(0x1c01), uint16_t(0xd80d), uint16_t(0xe90d), uint16_t(0xf60d), uint16_t(0x010d),
+    uint16_t(0x0d0d), uint16_t(0xc11c), uint16_t(0xe91c), uint16_t(0x011c), uint16_t(0x1c1c), uint16_t(0x2f1c), uint16_t(0xe92f), uint16_t(0x0d2f),
+};
+
+// 3-bit nonlinear values (two 8-entry tables)
+const int8_t iq3nl_values[16] = {
+    int8_t(-63), int8_t(-40), int8_t(-23), int8_t(-10), int8_t(1),  int8_t(13), int8_t(28), int8_t(47),
+    int8_t(-59), int8_t(-36), int8_t(-19), int8_t(-6),  int8_t(5),  int8_t(17), int8_t(32), int8_t(51),
+};
+
+// 4-bit nonlinear values (two 16-entry tables)
+const int8_t iq4k_values[32] = {
+    int8_t(-127), int8_t(-104), int8_t(-83), int8_t(-65), int8_t(-49), int8_t(-35), int8_t(-22), int8_t(-10),
+    int8_t(1),    int8_t(13),   int8_t(25),  int8_t(38),  int8_t(53),  int8_t(69),  int8_t(89),  int8_t(113),
+    int8_t(-123), int8_t(-100), int8_t(-79), int8_t(-61), int8_t(-45), int8_t(-31), int8_t(-18), int8_t(-6),
+    int8_t(5),    int8_t(17),   int8_t(29),  int8_t(42),  int8_t(57),  int8_t(73),  int8_t(93),  int8_t(117),
+};
+
+// 5-bit nonlinear values (two 32-entry tables)
+const int8_t iq5nl_values[64] = {
+    int8_t(-126), int8_t(-114), int8_t(-103), int8_t(-92), int8_t(-83), int8_t(-74), int8_t(-65), int8_t(-57),
+    int8_t(-50),  int8_t(-43),  int8_t(-36),  int8_t(-30), int8_t(-24), int8_t(-18), int8_t(-12), int8_t(-6),
+    int8_t(-1),   int8_t(5),    int8_t(11),   int8_t(17),  int8_t(23),  int8_t(29),  int8_t(36),  int8_t(43),
+    int8_t(51),   int8_t(59),   int8_t(68),   int8_t(77),  int8_t(87),  int8_t(97),  int8_t(109), int8_t(121),
+    int8_t(-124), int8_t(-112), int8_t(-101), int8_t(-90), int8_t(-81), int8_t(-72), int8_t(-63), int8_t(-55),
+    int8_t(-48),  int8_t(-41),  int8_t(-34),  int8_t(-28), int8_t(-22), int8_t(-16), int8_t(-10), int8_t(-4),
+    int8_t(1),    int8_t(7),    int8_t(13),   int8_t(19),  int8_t(25),  int8_t(31),  int8_t(38),  int8_t(45),
+    int8_t(53),   int8_t(61),   int8_t(70),   int8_t(79),  int8_t(89),  int8_t(99),  int8_t(111), int8_t(123),
+};
+
+// 6-bit nonlinear values (two 64-entry tables)
+const int8_t iq6nl_values[128] = {
+    int8_t(-127), int8_t(-121), int8_t(-115), int8_t(-109), int8_t(-104), int8_t(-98),  int8_t(-93),  int8_t(-88),
+    int8_t(-84),  int8_t(-79),  int8_t(-74),  int8_t(-70),  int8_t(-66),  int8_t(-62),  int8_t(-58),  int8_t(-54),
+    int8_t(-51),  int8_t(-47),  int8_t(-44),  int8_t(-40),  int8_t(-37),  int8_t(-34),  int8_t(-31),  int8_t(-28),
+    int8_t(-25),  int8_t(-22),  int8_t(-19),  int8_t(-16),  int8_t(-13),  int8_t(-11),  int8_t(-8),   int8_t(-5),
+    int8_t(-2),   int8_t(0),    int8_t(3),    int8_t(6),    int8_t(9),    int8_t(12),   int8_t(14),   int8_t(17),
+    int8_t(20),   int8_t(23),   int8_t(27),   int8_t(30),   int8_t(33),   int8_t(36),   int8_t(40),   int8_t(44),
+    int8_t(47),   int8_t(51),   int8_t(55),   int8_t(59),   int8_t(63),   int8_t(68),   int8_t(72),   int8_t(77),
+    int8_t(82),   int8_t(87),   int8_t(92),   int8_t(98),   int8_t(103),  int8_t(109),  int8_t(115),  int8_t(121),
+    int8_t(-126), int8_t(-120), int8_t(-114), int8_t(-108), int8_t(-103), int8_t(-97),  int8_t(-92),  int8_t(-87),
+    int8_t(-83),  int8_t(-78),  int8_t(-73),  int8_t(-69),  int8_t(-65),  int8_t(-61),  int8_t(-57),  int8_t(-53),
+    int8_t(-50),  int8_t(-46),  int8_t(-43),  int8_t(-39),  int8_t(-36),  int8_t(-33),  int8_t(-30),  int8_t(-27),
+    int8_t(-24),  int8_t(-21),  int8_t(-18),  int8_t(-15),  int8_t(-12),  int8_t(-10),  int8_t(-7),   int8_t(-4),
+    int8_t(-1),   int8_t(1),    int8_t(4),    int8_t(7),    int8_t(10),   int8_t(13),   int8_t(15),   int8_t(18),
+    int8_t(21),   int8_t(24),   int8_t(28),   int8_t(31),   int8_t(34),   int8_t(37),   int8_t(41),   int8_t(45),
+    int8_t(48),   int8_t(52),   int8_t(56),   int8_t(60),   int8_t(64),   int8_t(69),   int8_t(73),   int8_t(78),
+    int8_t(83),   int8_t(88),   int8_t(93),   int8_t(99),   int8_t(104),  int8_t(110),  int8_t(116),  int8_t(122),
+};

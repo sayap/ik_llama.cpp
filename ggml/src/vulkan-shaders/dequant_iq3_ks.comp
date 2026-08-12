@@ -1,0 +1,43 @@
+#version 450
+
+#include "dequant_head.comp"
+#include "iqk_tables.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+#define QUANT_K 256
+#define BLOCK_BYTES 102
+#define META 2
+
+void main() {
+    const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
+    const uint k = gl_LocalInvocationID.x % 8;
+
+    if (ib >= p.nel / QUANT_K) {
+        return;
+    }
+
+    const uint nbpb = p.K;
+    const uint meta = p.stride_a;
+    const uint row_bytes = meta + nbpb * BLOCK_BYTES;
+    const uint block_byte = (ib / nbpb) * row_bytes + META + (ib % nbpb) * BLOCK_BYTES;
+
+    const uint extra = iqk_load_u16(block_byte);
+    const float d = iqk_f16_to_f32(iqk_load_u16(row_bytes * (ib / nbpb)));
+
+    const uint sc = data_a[block_byte + 2 + k % 4];
+    const float dl = d * (float(((sc >> (4 * (k / 4))) & 0xFu) | (((extra >> k) & 1u) << 4)) - 16.0f);
+    const uint v_off = ((extra >> (8 + k)) & 1u) != 0 ? 8 : 0;
+
+    const uint b_idx = QUANT_K * ib + 32 * k;
+    const uint qs_off = 6 + 32 * (k / 4);
+    const uint qh_off = 70;
+    [[unroll]] for (uint j = 0; j < 32; ++j) {
+        const uint q = data_a[block_byte + qs_off + j];
+        const uint hb = data_a[block_byte + qh_off + j];
+        const uint idx = ((q >> (2 * (k % 4))) & 3u) | (((hb >> k) & 1u) << 2);
+        data_b[b_idx + j] = D_TYPE(dl * float(iq3nl_values[idx + v_off]));
+    }
+}
