@@ -353,15 +353,29 @@ running many iterations) shows both remaining gaps are dominated by the FFN:
     Correctness is covered by `tests/test-iqk-quants.cpp` (multi-token mat-mat cases now
     exercise the cm2 path).
 
-    Performance reality check: on the RTX 3090 the FFN-shaped matmul
-    `[152064, 5120] x [152064, 512]` measures ~26 ms with both the cm2 inline-dequant and
-    the old dequant+F16 path, and model-level prompt processing is unchanged (~513 tok/s
-    at batch 2048 on the 32B IQ4_KT model). The per-element decode invocation (driver
-    overhead + re-reading the per-row scale header and block selectors for every element)
-    offsets the benefit of reading the quantized weights once, so this does **not** yet
-    deliver the hoped-for 2-3x prompt speedup; the decode-side bottleneck would need to be
-    reduced (e.g. caching the row/block headers across a tile) for the tensor cores to
-    become the limiter.
+    Performance reality check (RTX 3090, real FFN shape `[27648, 5120] x [27648, n]` —
+    Qwen2.5-32B's `feed_forward_length` is 27648): the matmul costs ~15-17 ms for **any**
+    n (32 to 512); the cost is a fixed ~15 ms A-side per-element decode (~141 M driver
+    invocations at ~100 cycles each), and the tensor-core multiply is only ~2 ms. The
+    dequant+F16 path is the same (~16-23 ms measured): its flat dequant kernel is also
+    ~10x off memory-bound (141 M elements, ~350 MB read / 280 MB write, would be ~1 ms).
+    Model-level prompt processing is unchanged (~513 tok/s at batch 2048 on the 32B
+    IQ4_KT; ~11k tok/s on the 0.5B quants where IQ4_KS PP is marginally faster than
+    IQ4_KT). The docs' earlier hope of a 2-3x prompt speedup assumed the A-side dequant
+    was cheap; on Ampere it is the bottleneck in every form tried.
+
+    A V=4 vector-decode path (`GL_NV_cooperative_matrix_decode_vector`, one driver
+    invocation per 4 elements with shared row-header/block-selector reads) is implemented
+    for all 15 types with SPIR-V stripping for devices without the capability, but the
+    RTX 3090 (Ampere, driver 610.57.04) does not expose the extension, so it falls back
+    to the scalar decode there. It should help on decode-vector-capable GPUs.
+
+    **Next step (biggest headroom): optimize the flat dequant kernels.** Both paths are
+    A-side bound at ~15 ms; the tensor cores are near the fp16 peak. A vectorized,
+    ILP-friendly flat dequant (256 elements per block, u32/qword loads, amortized row
+    headers) should take the dequant+F16 mat-mat path from ~16 ms to ~5-6 ms per FFN
+    matmul (2-3x prompt processing), which the byte-addressed per-element cm2 decode
+    cannot match on this hardware.
 - The base IQK types (IQ2_K..IQ6_K) have per-16-element dequant scales, which fit neither
   the SIMT mmq's per-32-group scale nor a simple cm2 tile without per-16 handling.
 
