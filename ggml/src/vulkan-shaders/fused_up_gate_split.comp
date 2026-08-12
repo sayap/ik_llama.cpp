@@ -1,0 +1,86 @@
+#version 450
+
+#include "generic_head.comp"
+#include "types.comp"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+// Fused up-gate combine for the fused (gate+up interleaved-per-expert) MoE weights case.
+//
+// The matmul result of the fused weight matrix lives in data_a with layout
+//   [2*n, n_ids, n_tokens]  (row-major, ne0 = 2*n)
+// where the first n rows of each "column" are the gate result and the next n
+// rows are the up result. This shader computes
+//   dst = act(gate) * mul(up)
+// elementwise into data_d with layout [n, n_ids, n_tokens].
+//
+// Push constants: p.KX = nelements(dst), p.KY = n (half width), p.param1 = limit.
+//
+// The activation is selected at compile time via FUG_SILU / FUG_GELU / FUG_RELU /
+// FUG_SWIGLU_OAI defines. Limit clamping follows the CPU (iqk) reference: for
+// non-swiglu_oai ops with a limit > 0 the gate activation is capped at +limit
+// and the up result is clamped to [-limit, limit].
+
+float act_gate(float x) {
+#if defined(FUG_SILU)
+    float a = x / (1.0f + exp(-x));
+    if (p.param1 > 1e-6f) {
+        a = min(a, p.param1);
+    }
+    return a;
+#elif defined(FUG_GELU)
+    const float GELU_COEF_A    = 0.044715f;
+    const float SQRT_2_OVER_PI = 0.79788456080286535587989211986876f;
+    const float val = SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x);
+    float a = 0.5f*x*(1.0f + tanh(val));
+    if (p.param1 > 1e-6f) {
+        a = min(a, p.param1);
+    }
+    return a;
+#elif defined(FUG_RELU)
+    float a = max(x, 0.0f);
+    if (p.param1 > 1e-6f) {
+        a = min(a, p.param1);
+    }
+    return a;
+#elif defined(FUG_SWIGLU_OAI)
+    const float ALPHA = 1.702f;
+    const float LIMIT = 7.0f;
+    const float xi = min(x, LIMIT);
+    return xi / (1.0f + exp(-xi * ALPHA));
+#endif
+}
+
+float mul_up(float y) {
+#if defined(FUG_SILU) || defined(FUG_GELU) || defined(FUG_RELU)
+    if (p.param1 > 1e-6f) {
+        y = clamp(y, -p.param1, p.param1);
+    }
+    return y;
+#elif defined(FUG_SWIGLU_OAI)
+    const float LIMIT = 7.0f;
+    return 1.0f + clamp(y, -LIMIT, LIMIT);
+#endif
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+
+    if (i >= p.KX) {
+        return;
+    }
+
+    const uint n = p.KY;
+    const uint row = i % n;
+    const uint rest = i / n; // (tok * n_ids + id)
+    const uint base = rest * (2u*n) + row;
+
+    const float g = float(data_a[base]);
+    const float u = float(data_a[base + n]);
+    data_d[i] = D_TYPE(act_gate(g) * mul_up(u));
+}

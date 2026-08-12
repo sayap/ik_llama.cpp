@@ -509,6 +509,14 @@ struct vk_device_struct {
     vk_pipeline pipeline_fused_mul_gelu[2];
     vk_pipeline pipeline_fused_mul_silu[2];
     vk_pipeline pipeline_fused_mul_relu[2];
+    vk_pipeline pipeline_fused_mul_swiglu_oai[2];
+    // fused up-gate combine for fused (gate+up) MoE weights: one buffer, two halves
+    vk_pipeline pipeline_fused_up_gate_split_silu;
+    vk_pipeline pipeline_fused_up_gate_split_gelu;
+    vk_pipeline pipeline_fused_up_gate_split_relu;
+    vk_pipeline pipeline_fused_up_gate_split_swiglu_oai;
+    // per-expert bias add for MoE matmul results (in-place)
+    vk_pipeline pipeline_add_bias_id;
     vk_pipeline pipeline_multi_add_f32;
 
     // ============================== ik_llama.cpp pipelines end ========================================
@@ -691,6 +699,17 @@ struct vk_op_push_constants {
     uint32_t KY;
     float param1;
     float param2;
+};
+
+struct vk_op_bias_id_push_constants {
+    uint32_t KX;
+    uint32_t KY;
+    uint32_t ne1;
+    uint32_t dst_stride;
+    uint32_t bias_ne0;
+    uint32_t ids_stride;
+    uint32_t bias_misalign;
+    uint32_t dst_misalign;
 };
 
 struct vk_op_glu_push_constants {
@@ -3003,6 +3022,24 @@ static void ggml_vk_load_shaders(vk_device& device) {
             "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_fused_mul_relu[1], "fused_mul_relu_f16", fused_mul_relu_f16_len, fused_mul_relu_f16_data,
             "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_mul_swiglu_oai[0], "fused_mul_swiglu_oai_f32", fused_mul_swiglu_oai_f32_len, fused_mul_swiglu_oai_f32_data,
+            "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_mul_swiglu_oai[1], "fused_mul_swiglu_oai_f16", fused_mul_swiglu_oai_f16_len, fused_mul_swiglu_oai_f16_data,
+            "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+
+    // fused up-gate combine for fused (gate+up) MoE weights: one buffer, two halves
+    ggml_vk_create_pipeline(device, device->pipeline_fused_up_gate_split_silu, "fused_up_gate_split_silu_f32", fused_up_gate_split_silu_f32_len, fused_up_gate_split_silu_f32_data,
+            "main", 2, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_up_gate_split_gelu, "fused_up_gate_split_gelu_f32", fused_up_gate_split_gelu_f32_len, fused_up_gate_split_gelu_f32_data,
+            "main", 2, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_up_gate_split_relu, "fused_up_gate_split_relu_f32", fused_up_gate_split_relu_f32_len, fused_up_gate_split_relu_f32_data,
+            "main", 2, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_up_gate_split_swiglu_oai, "fused_up_gate_split_swiglu_oai_f32", fused_up_gate_split_swiglu_oai_f32_len, fused_up_gate_split_swiglu_oai_f32_data,
+            "main", 2, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+
+    // per-expert bias add for MoE matmul results (in-place)
+    ggml_vk_create_pipeline(device, device->pipeline_add_bias_id, "add_bias_id_f32", add_bias_id_f32_len, add_bias_id_f32_data,
+            "main", 3, sizeof(vk_op_bias_id_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_multi_add_f32, "multi_add_f32", multi_add_f32_len, multi_add_f32_data,
             "main", 2, sizeof(vk_op_multiadd_push_constants), {512, 1, 1}, {}, 1);
@@ -6887,6 +6924,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                     return ctx->device->pipeline_fused_mul_gelu[dst->type == GGML_TYPE_F16];
                 case GGML_UNARY_OP_RELU:
                     return ctx->device->pipeline_fused_mul_relu[dst->type == GGML_TYPE_F16];
+                case GGML_UNARY_OP_SWIGLU_OAI:
+                    return ctx->device->pipeline_fused_mul_swiglu_oai[dst->type == GGML_TYPE_F16];
                 default:
                     break;
             }
@@ -7877,6 +7916,215 @@ static void ggml_vk_fused_mul_unary(ggml_backend_vk_context * ctx, vk_context& s
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, dst, GGML_OP_FUSED_MUL_UNARY, { (uint32_t)ggml_nelements(src0), 0, 0.0f, 0.0f }, dryrun);
 }
+
+// Same as ggml_vk_fused_mul_unary but with an activation limit (op_params[1] of the fused up-gate
+// ops, used by step35/deepseek4 style models). A limit <= 1e-6 disables clamping.
+static void ggml_vk_fused_mul_unary_limit(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, float limit, bool dryrun = false) {
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_are_same_shape(src0, src1));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, dst, GGML_OP_FUSED_MUL_UNARY, { (uint32_t)ggml_nelements(src0), 0, limit, 0.0f }, dryrun);
+}
+
+// A shallow copy of `dst` whose data lives in `vbuf` at byte offset `offset`. Used to redirect a
+// matmul's output into a temporary buffer (or to run a matmul into the real dst with default
+// precision, since the fused up-gate node's op_params hold the unary op, not a ggml_prec).
+// In dryrun mode `vbuf` may be nullptr: the mul_mat / op_f32 dryrun paths never dereference the
+// dst buffer, and using the fake tensors keeps the requested pipelines identical to the real run.
+static std::string ggml_vk_tmp_tensor_name = "ggml_vk_fused_up_gate_tmp";
+
+struct ggml_vk_tmp_tensor {
+    ggml_backend_vk_buffer_context buf_ctx;
+    ggml_backend_buffer buf;
+    ggml_tensor tensor;
+
+    ggml_vk_tmp_tensor(ggml_backend_vk_context * ctx, const ggml_tensor * dst, vk_buffer vbuf, uint64_t offset) :
+        buf_ctx(ctx->device, std::move(vbuf), ggml_vk_tmp_tensor_name), tensor(*dst) {
+        memset(&buf, 0, sizeof(buf));
+        buf.context = &buf_ctx;
+        buf.size = buf_ctx.dev_buffer ? buf_ctx.dev_buffer->size : 0;
+        buf.buft = dst->buffer->buft;
+
+        tensor.buffer = &buf;
+        tensor.data = (uint8_t *)vk_ptr_base + offset;
+        tensor.view_src = nullptr;
+        tensor.view_offs = 0;
+        memset(tensor.op_params, 0, sizeof(tensor.op_params));
+        tensor.name[0] = '\0';
+    }
+};
+
+// Adds a per-expert bias vector to a MoE matmul result (in-place):
+//   dst[row, id, tok] += bias[row, ids[id, tok]]
+// dst is [n, ids->ne[0], ids->ne[1]] with row stride dst->nb[1]/4; `n` is the row width (for the
+// fused gate+up weights case dst is the full [2n, ...] temporary result and n is the half width).
+// For the fused case the gate/up halves are selected by `dst_offset_elems` (0 or n) and `nelements`
+// is the number of elements in one half.
+static void ggml_vk_add_bias_id(ggml_backend_vk_context * ctx, vk_context& subctx,
+        ggml_tensor * dst, const ggml_tensor * bias, const ggml_tensor * ids,
+        uint32_t n, uint64_t dst_offset_elems, uint64_t bias_offset_elems, uint32_t nelements, bool dryrun = false) {
+    vk_pipeline pipeline = ctx->device->pipeline_add_bias_id;
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        return;
+    }
+
+    const uint64_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    GGML_ASSERT((dst->nb[1] % sizeof(float)) == 0);
+    GGML_ASSERT((ids->nb[1] % sizeof(int32_t)) == 0);
+    GGML_ASSERT(bias->nb[1] == bias->nb[0] * bias->ne[0]); // contiguous per-expert rows
+
+    ggml_backend_vk_buffer_context * dst_buf_ctx  = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    ggml_backend_vk_buffer_context * bias_buf_ctx = (ggml_backend_vk_buffer_context *)bias->buffer->context;
+    ggml_backend_vk_buffer_context * ids_buf_ctx  = (ggml_backend_vk_buffer_context *)ids->buffer->context;
+
+    uint64_t dst_off = vk_tensor_offset(dst) + dst->view_offs + dst_offset_elems * sizeof(float);
+    const uint32_t dst_misalign = (uint32_t)(dst_off & (align - 1));
+    GGML_ASSERT((dst_misalign % sizeof(float)) == 0);
+    dst_off &= ~(align - 1);
+
+    uint64_t ids_off = vk_tensor_offset(ids) + ids->view_offs;
+    GGML_ASSERT((ids_off & (align - 1)) == 0);
+
+    uint64_t bias_off = vk_tensor_offset(bias) + bias->view_offs + bias_offset_elems * sizeof(float);
+    const uint32_t bias_misalign = (uint32_t)(bias_off & (align - 1));
+    GGML_ASSERT((bias_misalign % sizeof(float)) == 0);
+    bias_off &= ~(align - 1);
+
+    const vk_op_bias_id_push_constants pc = {
+        /* KX            = */ nelements,
+        /* KY            = */ n,
+        /* ne1           = */ (uint32_t)ids->ne[0],
+        /* dst_stride    = */ (uint32_t)(dst->nb[1] / sizeof(float)),
+        /* bias_ne0      = */ (uint32_t)bias->ne[0],
+        /* ids_stride    = */ (uint32_t)(ids->nb[1] / sizeof(int32_t)),
+        /* bias_misalign = */ (uint32_t)(bias_misalign / sizeof(float)),
+        /* dst_misalign  = */ dst_misalign / sizeof(float),
+    };
+
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { vk_subbuffer{ ids_buf_ctx->dev_buffer,  ids_off,  ggml_nbytes(ids) },
+          vk_subbuffer{ bias_buf_ctx->dev_buffer, bias_off, bias_misalign + ggml_nbytes(bias) },
+          vk_subbuffer{ dst_buf_ctx->dev_buffer,  dst_off,  ggml_nbytes(dst) - dst_offset_elems * sizeof(float) } },
+        pc, { nelements, 1, 1 });
+}
+
+// Combines the two halves of a fused gate+up MoE matmul result:
+//   dst = act(temp[0..n)) * temp[n..2n)
+// temp is the [2n, n_ids, n_tokens] matmul result, dst is [n, n_ids, n_tokens].
+static void ggml_vk_fused_up_gate_split(ggml_backend_vk_context * ctx, vk_context& subctx,
+        const ggml_tensor * src0, ggml_tensor * dst, ggml_unary_op op, float limit, bool dryrun = false) {
+    vk_pipeline pipeline = nullptr;
+    switch (op) {
+        case GGML_UNARY_OP_SILU:       pipeline = ctx->device->pipeline_fused_up_gate_split_silu;       break;
+        case GGML_UNARY_OP_GELU:       pipeline = ctx->device->pipeline_fused_up_gate_split_gelu;       break;
+        case GGML_UNARY_OP_RELU:       pipeline = ctx->device->pipeline_fused_up_gate_split_relu;       break;
+        case GGML_UNARY_OP_SWIGLU_OAI: pipeline = ctx->device->pipeline_fused_up_gate_split_swiglu_oai; break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        return;
+    }
+
+    const uint32_t nelements = (uint32_t)ggml_nelements(dst);
+    const uint32_t n = (uint32_t)dst->ne[0];
+    GGML_ASSERT(src0->ne[0] == 2 * dst->ne[0]);
+
+    ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
+    ggml_backend_vk_buffer_context * dst_buf_ctx  = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+
+    const uint64_t src0_off = vk_tensor_offset(src0) + src0->view_offs;
+    const uint64_t dst_off  = vk_tensor_offset(dst) + dst->view_offs;
+
+    ggml_vk_sync_buffers(subctx);
+    const vk_op_push_constants pc = { nelements, n, limit, 0.0f };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { vk_subbuffer{ src0_buf_ctx->dev_buffer, src0_off, ggml_nbytes(src0) },
+          vk_subbuffer{ dst_buf_ctx->dev_buffer,  dst_off,  ggml_nbytes(dst) } },
+        pc, { nelements, 1, 1 });
+}
+
+// GGML_OP_FUSED_UP_GATE: dst = act(gate @ b) * (up @ b)
+static void ggml_vk_fused_up_gate(ggml_backend_vk_context * ctx, vk_context& subctx,
+        const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * b,
+        ggml_tensor * dst, bool dryrun = false) {
+    VK_LOG_DEBUG("ggml_vk_fused_up_gate(" << up << ", " << gate << ", " << b << ", " << dst << ")");
+    const float limit = *(const float *)(dst->op_params + 1);
+
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    GGML_ASSERT(dst_buf_ctx != nullptr);
+
+    // gate result goes directly into dst, up result into a temporary buffer
+    vk_buffer tmp_buf = dryrun ? nullptr : ggml_vk_create_buffer_temp(ctx, ggml_nbytes(dst));
+    ggml_vk_tmp_tensor dst_tmp(ctx, dst, dst_buf_ctx->dev_buffer, vk_tensor_offset(dst) + dst->view_offs);
+    ggml_vk_tmp_tensor up_tmp(ctx, dst, tmp_buf, 0);
+
+    ggml_vk_mul_mat(ctx, subctx, gate, b, &dst_tmp.tensor, dryrun);
+    ggml_vk_mul_mat(ctx, subctx, up,   b, &up_tmp.tensor,  dryrun);
+
+    ggml_vk_fused_mul_unary_limit(ctx, subctx, &dst_tmp.tensor, &up_tmp.tensor, dst, limit, dryrun);
+}
+
+// GGML_OP_MOE_FUSED_UP_GATE: dst = act(gate @_id b [+ gate_b]) * (up @_id b [+ up_b])
+// With fused gate+up weights (as_gate == nullptr) the first half of as_up's rows are the gate
+// weights and the second half the up weights.
+static void ggml_vk_moe_fused_up_gate(ggml_backend_vk_context * ctx, vk_context& subctx,
+        const ggml_tensor * as_up, const ggml_tensor * as_gate, const ggml_tensor * b,
+        const ggml_tensor * ids, const ggml_tensor * as_up_b, const ggml_tensor * as_gate_b,
+        ggml_tensor * dst, bool dryrun = false) {
+    VK_LOG_DEBUG("ggml_vk_moe_fused_up_gate(" << as_up << ", " << as_gate << ", " << b << ", " << ids << ", " << dst << ")");
+    const float limit = *(const float *)(dst->op_params + 1);
+
+    const uint32_t n = (uint32_t)dst->ne[0];
+    const uint32_t n_ids = (uint32_t)ids->ne[0];
+    const uint32_t n_tokens = (uint32_t)ids->ne[1];
+    const uint32_t half_elements = n * n_ids * n_tokens;
+
+    if (as_gate == nullptr) {
+        // fused gate+up weights: single matmul produces [2n, n_ids, n_tokens]
+        vk_buffer tmp_buf = dryrun ? nullptr : ggml_vk_create_buffer_temp(ctx, 2 * ggml_nbytes(dst));
+        ggml_vk_tmp_tensor tmp(ctx, dst, tmp_buf, 0);
+        tmp.tensor.ne[0] = 2 * n;
+        tmp.tensor.nb[1] = tmp.tensor.nb[0] * tmp.tensor.ne[0];
+        tmp.tensor.nb[2] = tmp.tensor.nb[1] * tmp.tensor.ne[1];
+        tmp.tensor.nb[3] = tmp.tensor.nb[2] * tmp.tensor.ne[2];
+
+        ggml_vk_mul_mat_id(ctx, subctx, as_up, b, ids, &tmp.tensor, dryrun);
+
+        if (as_up_b) {
+            // first half of the bias belongs to the gate result, second half to the up result
+            ggml_vk_add_bias_id(ctx, subctx, &tmp.tensor, as_up_b, ids, n, 0, 0, half_elements, dryrun);
+            ggml_vk_add_bias_id(ctx, subctx, &tmp.tensor, as_up_b, ids, n, n, n, half_elements, dryrun);
+        }
+
+        ggml_vk_fused_up_gate_split(ctx, subctx, &tmp.tensor, dst, (ggml_unary_op)dst->op_params[0], limit, dryrun);
+        return;
+    }
+
+    // separate gate/up weights: two matmuls + bias adds + elementwise combine
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    GGML_ASSERT(dst_buf_ctx != nullptr);
+
+    vk_buffer tmp_buf = dryrun ? nullptr : ggml_vk_create_buffer_temp(ctx, ggml_nbytes(dst));
+    ggml_vk_tmp_tensor dst_tmp(ctx, dst, dst_buf_ctx->dev_buffer, vk_tensor_offset(dst) + dst->view_offs);
+    ggml_vk_tmp_tensor up_tmp(ctx, dst, tmp_buf, 0);
+
+    ggml_vk_mul_mat_id(ctx, subctx, as_gate, b, ids, &dst_tmp.tensor, dryrun);
+    ggml_vk_mul_mat_id(ctx, subctx, as_up,   b, ids, &up_tmp.tensor,  dryrun);
+
+    if (as_gate_b) {
+        ggml_vk_add_bias_id(ctx, subctx, &dst_tmp.tensor, as_gate_b, ids, n, 0, 0, half_elements, dryrun);
+    }
+    if (as_up_b) {
+        ggml_vk_add_bias_id(ctx, subctx, &up_tmp.tensor, as_up_b, ids, n, 0, 0, half_elements, dryrun);
+    }
+
+    ggml_vk_fused_mul_unary_limit(ctx, subctx, &dst_tmp.tensor, &up_tmp.tensor, dst, limit, dryrun);
+}
+
 
 static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
     uint32_t nadd = (uint32_t)dst->op_params[0];
@@ -9121,6 +9369,8 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     const ggml_tensor * src1 = node->src[1];
     const ggml_tensor * src2 = node->src[2];
     const ggml_tensor * src3 = node->src[3];
+    const ggml_tensor * src4 = node->src[4];
+    const ggml_tensor * src5 = node->src[5];
 
     switch (node->op) {
     // Return on empty ops to avoid generating a compute_ctx and setting exit_tensor
@@ -9193,6 +9443,8 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_ROPE_BACK:
     case GGML_OP_MUL_MAT:
     case GGML_OP_MUL_MAT_ID:
+    case GGML_OP_FUSED_UP_GATE:
+    case GGML_OP_MOE_FUSED_UP_GATE:
     case GGML_OP_ARGSORT:
     case GGML_OP_SUM:
     case GGML_OP_SUM_ROWS:
@@ -9504,6 +9756,14 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_mul_mat_id(ctx, compute_ctx, src0, src1, src2, node, dryrun);
 
         break;
+    case GGML_OP_FUSED_UP_GATE:
+        ggml_vk_fused_up_gate(ctx, compute_ctx, src0, src1, src2, node, dryrun);
+
+        break;
+    case GGML_OP_MOE_FUSED_UP_GATE:
+        ggml_vk_moe_fused_up_gate(ctx, compute_ctx, src0, src1, src2, src3, src4, src5, node, dryrun);
+
+        break;
 
     case GGML_OP_FLASH_ATTN_EXT:
         ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node, dryrun);
@@ -9660,6 +9920,8 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     //    break;
     case GGML_OP_MUL_MAT:
     case GGML_OP_MUL_MAT_ID:
+    case GGML_OP_FUSED_UP_GATE:
+    case GGML_OP_MOE_FUSED_UP_GATE:
     case GGML_OP_FLASH_ATTN_EXT:
         buf = tensor->buffer;
 
@@ -10214,7 +10476,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ctx->num_additional_fused_ops = 1;
         }
         ggml_vk_build_graph(ctx, cgraph, i, nullptr, 0, true, false, false, false);
-        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT || cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT || cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID ||
+            cgraph->nodes[i]->op == GGML_OP_FUSED_UP_GATE || cgraph->nodes[i]->op == GGML_OP_MOE_FUSED_UP_GATE) {
             total_mat_mul_bytes += ggml_nbytes(cgraph->nodes[i]->src[0]);
         }
         i += ctx->num_additional_fused_ops;
@@ -10276,7 +10539,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             submit_node_idx = i;
         }
 
-        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT || cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT || cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID ||
+            cgraph->nodes[i]->op == GGML_OP_FUSED_UP_GATE || cgraph->nodes[i]->op == GGML_OP_MOE_FUSED_UP_GATE) {
             mul_mat_bytes += ggml_nbytes(cgraph->nodes[i]->src[0]);
         }
 
@@ -10488,6 +10752,84 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                     return false;
                 }
 
+                return true;
+            } break;
+        case GGML_OP_FUSED_UP_GATE:
+        case GGML_OP_MOE_FUSED_UP_GATE:
+            {
+                switch ((ggml_unary_op)op->op_params[0]) {
+                    case GGML_UNARY_OP_SILU:
+                    case GGML_UNARY_OP_GELU:
+                    case GGML_UNARY_OP_RELU:
+                    case GGML_UNARY_OP_SWIGLU_OAI:
+                        break;
+                    default:
+                        return false;
+                }
+                if (op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                const ggml_tensor * as_up   = op->src[0];
+                const ggml_tensor * as_gate = op->src[1];
+                const ggml_tensor * b       = op->src[2];
+                const ggml_tensor * ids     = op->src[3];
+                if (op->op == GGML_OP_MOE_FUSED_UP_GATE) {
+                    if (ids == nullptr || ids->type != GGML_TYPE_I32 || ids->ne[0] > 4096) {
+                        return false;
+                    }
+                }
+                if (as_gate != nullptr && (as_up->type != as_gate->type || !ggml_are_same_shape(as_up, as_gate))) {
+                    return false;
+                }
+                // The b (activation) tensor must be f32 (as the CPU reference requires) and the
+                // weights must be a type the mul_mat path supports
+                if (b->type != GGML_TYPE_F32 || b->ne[3] != 1) {
+                    return false;
+                }
+                switch (as_up->type) {
+                    case GGML_TYPE_F32:
+                    case GGML_TYPE_F16:
+                    case GGML_TYPE_BF16:
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q5_0:
+                    case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q2_K:
+                    case GGML_TYPE_Q3_K:
+                    case GGML_TYPE_Q4_K:
+                    case GGML_TYPE_Q5_K:
+                    case GGML_TYPE_Q6_K:
+                    case GGML_TYPE_IQ1_S:
+                    case GGML_TYPE_IQ1_M:
+                    case GGML_TYPE_IQ2_XXS:
+                    case GGML_TYPE_IQ2_XS:
+                    case GGML_TYPE_IQ2_S:
+                    case GGML_TYPE_IQ3_XXS:
+                    case GGML_TYPE_IQ3_S:
+                    case GGML_TYPE_IQ4_XS:
+                    case GGML_TYPE_IQ4_NL:
+                        break;
+                    default:
+                        return false;
+                }
+                if (!ggml_vk_dim01_contiguous(as_up) ||
+                    (as_gate != nullptr && !ggml_vk_dim01_contiguous(as_gate)) ||
+                    !ggml_vk_dim01_contiguous(b)) {
+                    return false;
+                }
+                if (op->op == GGML_OP_MOE_FUSED_UP_GATE) {
+                    if (op->src[4] != nullptr) {
+                        if (op->src[4]->type != GGML_TYPE_F32 || op->src[4]->ne[0] != as_up->ne[1]) {
+                            return false;
+                        }
+                    }
+                    if (op->src[5] != nullptr) {
+                        if (as_gate == nullptr || op->src[5]->type != GGML_TYPE_F32 || op->src[5]->ne[0] != as_gate->ne[1]) {
+                            return false;
+                        }
+                    }
+                }
                 return true;
             } break;
         case GGML_OP_FLASH_ATTN_EXT:

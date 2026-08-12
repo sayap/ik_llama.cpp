@@ -20,5 +20,13 @@ void main() {
 
     const float xi = float(data_a[i]);
     const float yi = float(data_b[i]);
-    data_d[i] = D_TYPE(xi * yi / (1.0f + exp(-xi)));
+
+    if (p.param1 > 1e-6f) {
+        // limit clamping (used by the fused up-gate op for step35/deepseek4 style models)
+        const float limit = p.param1;
+        const float act = min(xi / (1.0f + exp(-xi)), limit);
+        data_d[i] = D_TYPE(act * clamp(yi, -limit, limit));
+    } else {
+        data_d[i] = D_TYPE(xi * yi / (1.0f + exp(-xi)));
+    }
 }

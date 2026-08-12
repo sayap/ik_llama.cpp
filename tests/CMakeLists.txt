@@ -207,6 +207,9 @@ llama_build_and_test(test-regex-partial.cpp)
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")
 llama_target_and_test(test-autorelease.cpp        LABEL "model")
 
+# fused up-gate / MoE fused up-gate correctness (CPU vs backend comparison)
+llama_build_and_test(test-fused-up-gate.cpp LABEL "main" ARGS Vulkan0)
+
 
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)

@@ -1,0 +1,60 @@
+#version 450
+
+#include "types.comp"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer IDS {int data_ids[];};
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) buffer D {float data_d[];};
+
+// Adds a per-expert bias vector to a MoE matmul result (in-place):
+//   data_d[row, id, tok] += data_b[row + expert * bias_ne0, expert = data_ids[id, tok]]
+//
+// data_d layout:   [n, n_ids, n_tokens] (row-major). For the fused gate+up weights case this may
+//                  be the full [2n, n_ids, n_tokens] temporary result, with the gate/up halves
+//                  selected via the descriptor offset (dst_offset_elems) and dst_stride = 2n.
+// data_b layout:   contiguous [bias_ne0, n_experts] (or [bias_ne0, 1, n_experts]); the gate/up
+//                  half of a fused bias is selected via the descriptor offset.
+// data_ids layout: [n_ids, n_tokens] with row stride p.ids_stride (elements)
+//
+// Push constants:
+//   KX = number of elements in the dst region being added to
+//   KY = n
+//   ne1 = n_ids
+//   dst_stride = stride between (id, tok) groups in the dst in elements (dst->nb[1] / 4)
+//   bias_ne0 = bias->ne[0] (expert stride in elements)
+//   ids_stride = ids row stride in elements (ids->nb[1] / 4)
+//   bias_misalign = number of elements the bias descriptor offset was rounded down by
+
+layout (push_constant) uniform parameter
+{
+    uint KX;
+    uint KY;
+    uint ne1;
+    uint dst_stride;
+    uint bias_ne0;
+    uint ids_stride;
+    uint bias_misalign;
+    uint dst_misalign;
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+
+    if (i >= p.KX) {
+        return;
+    }
+
+    const uint n = p.KY;
+    const uint row = i % n;
+    const uint rest = i / n; // tok * n_ids + id
+    const uint id = rest % p.ne1;
+    const uint tok = rest / p.ne1;
+
+    const int expert = data_ids[id + tok * p.ids_stride];
+    const uint base = (tok * p.ne1 + id) * p.dst_stride + row + p.dst_misalign;
+    data_d[base] += data_b[(uint(expert) * p.bias_ne0) + row + p.bias_misalign];
+}

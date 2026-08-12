@@ -11,22 +11,21 @@ layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
 layout (binding = 1) readonly buffer Y {B_TYPE data_b[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
+// SwiGLU with the OAI ("swiglu_oai") activation, as used by step35/deepseek4 models:
+//   gate: min(x, 7) / (1 + exp(-min(x, 7) * 1.702))
+//   up:   1 + clamp(y, -7, 7)
+//   out = gate * up
+
 void main() {
+    const float ALPHA = 1.702f;
+    const float LIMIT = 7.0f;
     const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
 
     if (i >= p.KX) {
         return;
     }
 
-    const float xi = float(data_a[i]);
-    const float yi = float(data_b[i]);
-    const float act = max(xi, 0.0f);
-
-    if (p.param1 > 1e-6f) {
-        // limit clamping (used by the fused up-gate op for step35/deepseek4 style models)
-        const float limit = p.param1;
-        data_d[i] = D_TYPE(min(act, limit) * clamp(yi, -limit, limit));
-    } else {
-        data_d[i] = D_TYPE(act * yi);
-    }
+    const float xi = min(float(data_a[i]), LIMIT);
+    const float gi = clamp(float(data_b[i]), -LIMIT, LIMIT);
+    data_d[i] = D_TYPE((xi / (1.0f + exp(-xi * ALPHA))) * (1.0f + gi));
 }
