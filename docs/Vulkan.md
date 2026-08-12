@@ -37,6 +37,12 @@ and `GET_ROWS`:
   existing F16 matmul. The flat dequant shaders are row-meta aware (blocks-per-row and meta size
   are passed in the push constants) and the dispatch passes the tensor's full byte size (the
   per-row scale headers must be included in the source subbuffer).
+
+  `IQ4_KT` additionally has a native Q8_1 integer-dot mmq (`mul_mmq.comp`): a byte-addressed
+  tile loader runs the hash decode with `dot4` and packs the values as signed int8, then the
+  standard dp4a vec-dot accumulates against Q8_1 activations. It is gated to devices without
+  cooperative matrices — on tensor-core GPUs it is correct but slower than the dequant+F16 path
+  (see "vs CUDA" below).
 - **GET_ROWS (quantized token embeddings)**: a byte-addressed `get_rows_iqk.comp` shader
   dequantizes one element per thread (1024 per workgroup, matching the pipeline's
   elements-per-workgroup denom). The per-row scale header is read from the explicit row byte
@@ -309,13 +315,20 @@ running many iterations) shows both remaining gaps are dominated by the FFN:
   FFN matmul: ~1.5 ms dequant + ~2.9 ms tensor-core matmul). CUDA has a native quantized
   matmul (`mmq`) that reads the quantized weights once. Two approaches were explored for
   adding one to Vulkan:
-  * **The SIMT dot4 mmq (`mul_mmq.comp` with Q8_1 activations)** works for the 10 IQK/KT
-    row-meta types (their dequant scale varies per 32-element group, which fits the mmq's
-    per-chunk scale) — the hash decode runs in the tile loader with `dot4`, like CUDA's
-    `load_tiles_iq4_kt`. But on this NVIDIA part it is *not* faster than the dequant+F16
-    path (q4_0's SIMT mmq is also ~4.6 ms there; only q8_0's 8-bit variant is fast at
-    ~0.85 ms), so it was not wired up. It could still be a win on non-tensor-core devices
-    (AMD/Intel), where the F16 matmul has no tensor cores.
+  * **The SIMT dot4 mmq (`mul_mmq.comp` with Q8_1 activations) is now implemented for
+    `IQ4_KT`** (the only IQK/KT type wired up so far; the other row-meta types could follow
+    the same pattern): a byte-addressed tile loader runs the hash decode with `dot4` and
+    packs the values as signed int8, then the standard dp4a vec-dot accumulates against
+    Q8_1 activations — the same shape as CUDA's `load_tiles_iq4_kt`. Two bugs were found
+    and fixed while wiring it up: the raw-weights binding must use `ggml_nbytes()` (the
+    `type_size*ne/blck` size omits the per-row META header, so buffer robustness zeroed the
+    last rows), and the mmq path must not dispatch the `y_non_contig` src1 copy (it is only
+    budgeted when `qy_needs_dequant`, and on coopmat2 `y_non_contig` is forced true for f32
+    activations). On the RTX 3090 it is *correct but slower* than the dequant+F16 path
+    (261 vs 489 tok/s PP): SIMT dp4a cannot beat the tensor-core F16 matmul, matching the
+    earlier reverted attempt. It is therefore enabled only on devices without cooperative
+    matrices (AMD/Intel), where the F16 matmul has no tensor cores and reading the
+    quantized weights once can win.
   * **The coopmat2 tensor-core mmq (`mul_mm_cm2.comp`, the fast path for q4_0 at
     ~1.26 ms)** cannot currently load IQK tiles: `coopMatLoadTensorNV` addresses the A
     matrix by element stride, but the IQK layout is byte-addressed with per-row scale

@@ -97,3 +97,28 @@ FLOAT_TYPE_VEC2 get_dm(uint ib) {
     return FLOAT_TYPE_VEC2(data_a_packed32[ib].dm);
 }
 #endif
+
+// ---- IQ4_KT (Q8_1 mmq, byte-addressed load done inline in mul_mmq.comp) ----
+// Only mul_q8_1 is needed here; the tile population is custom because the
+// IQ4_KT layout (256-element blocks, 4-byte per-row scale header) is
+// byte-addressed and does not fit the typed data_a[ib] repack() model.
+#if defined(DATA_A_IQ4_KT)
+// KT-family multiplicative-hash decode: 4 rounds of x *= ka, each yielding one
+// value = byte_sum(x & 0x3f3f3f3f) - 126 (signed, fits int8: -126..126). The
+// device integer dot product replaces the 4-shift + 3-add byte sum.
+ivec4 iqk_kt_hash(uint x) {
+    ivec4 res;
+    [[unroll]] for (int k = 0; k < 4; ++k) {
+        x *= 0xCBAC1FEDu;
+        const uint s = x & 0x3F3F3F3Fu;
+        res[k] = dotPacked4x8EXT(int(s), 0x01010101) - 126;
+    }
+    return res;
+}
+
+// IQ4_KT weight = dl * v, v signed (no zero offset), so the Q8_1 activation
+// block sum (dsb.y) is not needed.
+ACC_TYPE mul_q8_1(int32_t q_sum, float da, vec2 dsb) {
+    return ACC_TYPE(float(q_sum) * da * dsb.x);
+}
+#endif
