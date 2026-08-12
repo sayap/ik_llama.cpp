@@ -23,7 +23,8 @@ ik_llama.cpp, what has been fixed, how to get good performance, and what is stil
 
 ### 0. IQK / KT quant families (QK_K = 256 imatrix quants)
 
-All 15 base IQK/KT types are now supported by `MUL_MAT`, `MUL_MAT_ID` (vec and mat-mat paths):
+All 15 base IQK/KT types are now supported by `MUL_MAT`, `MUL_MAT_ID` (vec and mat-mat paths)
+and `GET_ROWS`:
 
 - **decode (mul_mat_vec)**: a dedicated GLSL kernel per type (`mul_mat_vec_iq{1,2,3,4,5,6}_k*`,
   `mul_mat_vec_iq{2,3,4,5}_ks*`, `mul_mat_vec_iq4_kss*`, `mul_mat_vec_iq2_kl*`,
@@ -34,9 +35,14 @@ All 15 base IQK/KT types are now supported by `MUL_MAT`, `MUL_MAT_ID` (vec and m
   existing F16 matmul. The flat dequant shaders are row-meta aware (blocks-per-row and meta size
   are passed in the push constants) and the dispatch passes the tensor's full byte size (the
   per-row scale headers must be included in the source subbuffer).
+- **GET_ROWS (quantized token embeddings)**: a byte-addressed `get_rows_iqk.comp` shader
+  dequantizes one element per thread (1024 per workgroup, matching the pipeline's
+  elements-per-workgroup denom). The per-row scale header is read from the explicit row byte
+  offset (only the first block's header sits at `block_byte - row_meta_size`).
 - The KT-family value decode (`QuantizerIQKT::set_values`, the multiplicative-hash lookup into
   `iq4k_values`) is implemented in `iqk_hash_values` in `iqk_tables.comp`.
-- `supports_op` accepts the 15 types; `ggml_vk_dim01_contiguous` accounts for `row_meta_size`.
+- `supports_op` accepts the 15 types for `MUL_MAT`, `MUL_MAT_ID`, `GET_ROWS` and
+  `FUSED_UP_GATE`/`MOE_FUSED_UP_GATE`; `ggml_vk_dim01_contiguous` accounts for `row_meta_size`.
 
 Note on the reference: the CPU backend's own `to_float` and its optimized `iqk_mul_mat` kernels
 use slightly different scale conventions for several of these experimental types (e.g. the
@@ -61,8 +67,11 @@ looser tolerance because of the calibration factor.
   existing `fused_mul_*` shaders clamp when the limit is non-zero, and a new
   `fused_mul_swiglu_oai` shader implements the OAI variant.
 - `supports_op` accepts the ops when the weight type is one the matmul path supports (F32/F16/
-  BF16 and the supported quant types), the activations are F32 and the unary op is one of the
-  four supported ones; anything else falls back to the CPU backend as before.
+  BF16 and the supported quant types, including the 15 IQK/KT types), the activations are F32
+  and the unary op is one of the four supported ones; anything else falls back to the CPU
+  backend as before. (The IQK/KT types were originally missing from this switch, which made
+  every FFN of an IQK/KT model fall back to the CPU — see "Fixed: large IQK/KT models were
+  slow on Vulkan" below.)
 
 A work-size bug in `ggml_graph_plan` was fixed along the way: the `MOE_FUSED_UP_GATE` plan
 skipped the quantized-activation work buffer when the gate weights are fused (`src[1] == NULL`),
@@ -231,7 +240,49 @@ are still not supported and run their matmuls on CPU.
   looser tolerance.
 - `tests/test-iqk-quants.cpp` validates the 15 IQK/KT types against the scalar dequant
   reference (the format definition): single-token decode, small batches, larger K,
-  multi-token (dequant-to-F16 path) and MoE (`MUL_MAT_ID`). Run as
+  multi-token (dequant-to-F16 path), MoE (`MUL_MAT_ID`) and `GET_ROWS` (quantized token
+  embeddings, both single-block and multi-block rows). Run as
   `test-iqk-quants CPU|Vulkan0|CUDA0`. The KT family is allowed a looser tolerance because
   of its calibration factor (see above).
 - `test-backend-ops` does not currently compile against this fork's headers.
+
+### Fixed: large IQK/KT models were slow on Vulkan
+
+A 32B Qwen2.5-Coder model quantized to `IQ4_KT` (16.7 GiB, fully offloaded to a 24 GiB RTX
+3090) previously decoded at only ~0.6 tok/s with ~400-500% CPU usage. The root cause turned
+out to be neither of the initially suspected GPU kernel costs:
+
+- **`FUSED_UP_GATE` / `MOE_FUSED_UP_GATE` fell back to the CPU backend for IQK/KT weight
+  types.** `supports_op` had the 15 IQK/KT types in the `MUL_MAT` and `GET_ROWS` switches
+  but not in the fused up-gate switch, so every FFN `gate`+`up` matmul ran on the CPU.
+  Each such split copied the IQ4_KT weights device→host (~23 ms for the two 141 MB FFN
+  matrices over PCIe), computed on CPU, and copied the result back — the decode graph has
+  ~60-130 such splits per token, which accounted for ~97% of the wall time (the GPU per-op
+  timings were microseconds; the output projection was ~0.7 ms). The fix adds the 15
+  IQK/KT types to the fused up-gate `supports_op` switch; the fused path is two `MUL_MAT`s
+  (native `mul_mat_vec` for single token, dequant-to-F16 for batches) plus the combine,
+  all already supported for these types.
+- **`GET_ROWS` (quantized token embeddings) ran on the CPU.** A byte-addressed
+  `get_rows_iqk.comp` shader now covers the 15 IQK/KT types. Two bugs were found and
+  fixed while adding test coverage: the workgroup size (1024 elements per workgroup,
+  matching the pipeline denom, instead of 256 which under-launched for `k > 1024`) and
+  the per-row scale header read (`block_byte - META` is only the row start for block 0;
+  the header is now read from the explicit row byte offset).
+
+After the fix, decode runs at ~17 tok/s and prompt processing at ~41 tok/s on the same
+machine — a ~28x / ~19x speedup — with the GPU doing the FFN work (the earlier ~80% GPU
+utilization at 0.6 tok/s was the GPU waiting on the CPU splits).
+
+Remaining performance notes:
+
+- The decode (`mul_mat_vec`) kernels still dequantize per element with the KT-family
+  multiplicative-hash decode (4 hash rounds per weight); the output projection
+  `[5120, 152064]` alone is ~0.7 ms/token. This is ALU-heavy but no longer the dominant
+  term — a native quantized matmul kernel for the mat-mat path would help prompt
+  processing, which currently dequantizes each weight matrix to F16 on the GPU.
+- The scheduler no longer copies the IQ4_KT FFN weights per split; the remaining
+  device→host traffic is limited to the logits.
+
+An earlier symptom (the model generating "!" repeatedly) was from a pre-fix build (wrong
+`ql`/`qh` offsets and 16-bit reads in the IQ4_KT kernels); the current build generates
+coherent text.
