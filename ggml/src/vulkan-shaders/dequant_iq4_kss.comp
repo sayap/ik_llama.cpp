@@ -2,10 +2,9 @@
 
 #include "dequant_head.comp"
 #include "iqk_tables.comp"
+#include "dequant_iqk_common.comp"
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
-
-layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
 
 #define QUANT_K 256
 #define BLOCK_BYTES 128
@@ -22,28 +21,46 @@ void main() {
     const uint nbpb = p.K;
     const uint meta = p.stride_a;
     const uint row_bytes = meta + nbpb * BLOCK_BYTES;
-    const uint block_byte = (ib / nbpb) * row_bytes + META + (ib % nbpb) * BLOCK_BYTES;
+    const uint row = ib / nbpb;
+    const uint block_byte = row * row_bytes + META + (ib % nbpb) * BLOCK_BYTES;
 
-    const float d = uintBitsToFloat(iqk_load_u32(row_bytes * (ib / nbpb)));
-
-    // Decode the 8 packed 16-bit values of this 32-element sub-block
-    uint ls = 0;
-    uint aux16[8];
-    const uint qs16_off = 16 * ib32;
-    [[unroll]] for (uint k = 0; k < 8; ++k) {
-        const uint q16 = iqk_load_u16(block_byte + qs16_off + 2 * k);
-        uint a = q16 & 0xfffeu;
-        a ^= a >> 1;
-        aux16[k] = a;
-        ls |= (q16 & 1u) << k;
-    }
-    const float dl = d * (float(ls & 254u) - 127.0f);
-    const uint v_off = (ls & 1u) != 0 ? 16 : 0;
-
+    const float d = uintBitsToFloat(data_a32[(row * row_bytes) / 4]);
     const uint b_idx = QUANT_K * ib + 32 * ib32;
-    [[unroll]] for (uint j = 0; j < 16; ++j) {
-        const uint a8 = (aux16[j / 2] >> (8 * (j & 1))) & 0xffu;
-        data_b[b_idx + j]      = D_TYPE(dl * float(iq4k_values[(a8 & 0xFu) + v_off]));
-        data_b[b_idx + j + 16] = D_TYPE(dl * float(iq4k_values[(a8 >> 4) + v_off]));
+    const uint qs_dw = (block_byte + 16 * ib32) / 4;
+
+    uint a[8];
+    uint ls = 0u;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint w = data_a32[qs_dw + k];
+        const uint qlo = w & 0xffffu;
+        const uint qhi = w >> 16;
+        uint a0 = qlo & 0xfffeu;
+        a0 ^= a0 >> 1;
+        uint a1 = qhi & 0xfffeu;
+        a1 ^= a1 >> 1;
+        a[2 * k] = a0;
+        a[2 * k + 1] = a1;
+        ls |= (qlo & 1u) << (2 * k);
+        ls |= (qhi & 1u) << (2 * k + 1);
+    }
+
+    const float dl = d * (float(ls & 254u) - 127.0f);
+    const uint v_off = (ls & 1u) != 0 ? 16u : 0u;
+
+    [[unroll]] for (uint t = 0; t < 4; ++t) {
+        const uint b0 = a[2 * t] & 0xffu;
+        const uint b1 = (a[2 * t] >> 8) & 0xffu;
+        const uint b2 = a[2 * t + 1] & 0xffu;
+        const uint b3 = (a[2 * t + 1] >> 8) & 0xffu;
+        iqk_store4(b_idx + 4 * t, dl * vec4(
+            float(iq4k_values[(b0 & 0xFu) + v_off]),
+            float(iq4k_values[(b1 & 0xFu) + v_off]),
+            float(iq4k_values[(b2 & 0xFu) + v_off]),
+            float(iq4k_values[(b3 & 0xFu) + v_off])));
+        iqk_store4(b_idx + 16 + 4 * t, dl * vec4(
+            float(iq4k_values[((b0 >> 4) & 0xFu) + v_off]),
+            float(iq4k_values[((b1 >> 4) & 0xFu) + v_off]),
+            float(iq4k_values[((b2 >> 4) & 0xFu) + v_off]),
+            float(iq4k_values[((b3 >> 4) & 0xFu) + v_off])));
     }
 }

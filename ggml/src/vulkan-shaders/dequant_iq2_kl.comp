@@ -2,14 +2,19 @@
 
 #include "dequant_head.comp"
 #include "iqk_tables.comp"
+#include "dequant_iqk_common.comp"
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
-
-layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
 
 #define QUANT_K 256
 #define BLOCK_BYTES 86
 #define META 2
+
+vec2 iq2kl_one(uint q, uint hb, uint sft_h, bool hi) {
+    const uint idx = (hi ? (q >> 4) : (q & 0xFu)) | (((hb >> sft_h) & 1u) << 4);
+    const uint v = iq2kl_values[idx];
+    return vec2(float(int8_t(v & 0xffu)), float(int8_t(v >> 8)));
+}
 
 void main() {
     const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
@@ -23,27 +28,31 @@ void main() {
     const uint nbpb = p.K;
     const uint meta = p.stride_a;
     const uint row_bytes = meta + nbpb * BLOCK_BYTES;
-    const uint block_byte = (ib / nbpb) * row_bytes + META + (ib % nbpb) * BLOCK_BYTES;
+    const uint row = ib / nbpb;
+    const uint block_byte = row * row_bytes + META + (ib % nbpb) * BLOCK_BYTES;
 
-    const float d = iqk_f16_to_f32(iqk_load_u16(row_bytes * (ib / nbpb)));
+    const float d = iqk_f16_to_f32(iqk_load_u16(row * row_bytes));
     const uint scales_h = iqk_load_u16(block_byte);
-
-    // part 0: dl1 (elements 0..31), part 1: dl2 (elements 32..63)
-    const uint sc = data_a[block_byte + 2 + (2 * ib64 + part) % 4];
-    const float dl = d * (float(((sc >> (4 * (ib64 / 2))) & 0xFu) | (((scales_h >> (4 * ib64 + 2 * part)) & 3u) << 4)) - 32.0f);
-    const uint sft_h = 2 * ib64 + part;
-
     const uint b_idx = QUANT_K * ib + 64 * ib64 + 32 * part;
-    const uint qs_off = 6 + 16 * ib64;
-    const uint qh_off = 70;
-    [[unroll]] for (uint j = 0; j < 16; ++j) {
-        const uint q = data_a[block_byte + qs_off + j];
-        const uint hb = data_a[block_byte + qh_off + j];
-        const uint idx = (part == 0)
-            ? ((q & 0xFu) | (((hb >> sft_h) & 1u) << 4))
-            : ((q >> 4) | (((hb >> sft_h) & 1u) << 4));
-        const uint v = iq2kl_values[idx];
-        data_b[b_idx + 2 * j]     = D_TYPE(dl * float(int8_t(v & 0xffu)));
-        data_b[b_idx + 2 * j + 1] = D_TYPE(dl * float(int8_t(v >> 8)));
+
+    const uint sc = data_a[block_byte + 2 + (2 * ib64 + part) % 4];
+    const uint dl_idx = ((sc >> (4 * (ib64 / 2))) & 0xFu) | (((scales_h >> (4 * ib64 + 2 * part)) & 3u) << 4);
+    const float dl = d * (float(dl_idx) - 32.0f);
+    const uint sft_h = 2 * ib64 + part;
+    const bool hi = part == 1;
+    const uint qs_base = block_byte + 6 + 16 * ib64;
+    const uint qh_base = block_byte + 70;
+
+    [[unroll]] for (uint t = 0; t < 8; ++t) {
+        const uint qw = iqk_load_u32a(qs_base + 4 * (t / 2));
+        const uint hw = iqk_load_u32a(qh_base + 4 * (t / 2));
+        const uint sh0 = 16 * (t % 2);
+        const uint q0 = (qw >> sh0) & 0xffu;
+        const uint q1 = (qw >> (sh0 + 8)) & 0xffu;
+        const uint h0 = (hw >> sh0) & 0xffu;
+        const uint h1 = (hw >> (sh0 + 8)) & 0xffu;
+        const vec2 a = iq2kl_one(q0, h0, sft_h, hi);
+        const vec2 b = iq2kl_one(q1, h1, sft_h, hi);
+        iqk_store4(b_idx + 4 * t, dl * vec4(a.x, a.y, b.x, b.y));
     }
 }

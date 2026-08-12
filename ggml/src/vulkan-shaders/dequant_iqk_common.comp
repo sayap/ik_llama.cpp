@@ -1,0 +1,42 @@
+// Shared helpers for the IQK/KT flat dequant shaders (dequant_iq*.comp for the
+// QK_K=256 imatrix types). These keep the original 8-threads-per-block mapping
+// but read the quantized bytes through a uint32 view (aliasing the byte view
+// declared by iqk_tables.comp at binding 0) and write outputs as f16vec4.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// uint32 view of the weight buffer (same binding 0 as the byte view in
+// iqk_tables.comp; two SSBO variables may reference the same descriptor).
+layout (binding = 0) readonly buffer A32 {uint data_a32[];};
+
+// f16vec4 view of the destination buffer (aliases the scalar D view).
+layout (binding = 1) writeonly buffer D4 {f16vec4 data_b4[];};
+
+// 32-bit load at an arbitrary byte offset (unaligned-safe).
+uint iqk_load_u32a(uint byte_off) {
+    const uint w = data_a32[byte_off >> 2];
+    const uint sh = (byte_off & 3u) * 8u;
+    if (sh == 0u) {
+        return w;
+    }
+    return (w >> sh) | (data_a32[(byte_off >> 2) + 1u] << (32u - sh));
+}
+
+// 16-bit load at an arbitrary byte offset (unaligned-safe).
+uint iqk_load_u16a(uint byte_off) {
+    const uint w = data_a32[byte_off >> 2];
+    const uint sh = (byte_off & 3u) * 8u;
+    if (sh <= 16u) {
+        return (w >> sh) & 0xffffu;
+    }
+    return ((w >> sh) | (data_a32[(byte_off >> 2) + 1u] << (32u - sh))) & 0xffffu;
+}
+
+// Write one 4-element group as a single f16vec4 store.
+void iqk_store4(uint b_idx, vec4 v) {
+    data_b4[b_idx >> 2] = f16vec4(v);
+}

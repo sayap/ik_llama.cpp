@@ -2,18 +2,32 @@
 
 #include "dequant_head.comp"
 #include "iqk_tables.comp"
+#include "dequant_iqk_common.comp"
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
-
-layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
 
 #define QUANT_K 256
 #define BLOCK_BYTES 176
 
+// part 0: 4-bit low nibbles, high bit = h bit shift
+vec4 iq5k_lo(uint qw, uint hw, uint shift, uint vo) {
+    return vec4(
+        float(iq5nl_values[((qw & 0xFu) | ((((hw & 0xffu) >> shift) & 1u) << 4)) + vo]),
+        float(iq5nl_values[((((qw >> 8) & 0xFu) | ((((hw >> 8) & 0xffu) >> shift & 1u) << 4))) + vo]),
+        float(iq5nl_values[((((qw >> 16) & 0xFu) | ((((hw >> 16) & 0xffu) >> shift & 1u) << 4))) + vo]),
+        float(iq5nl_values[((((qw >> 24) & 0xFu) | ((((hw >> 24) & 0xffu) >> shift & 1u) << 4))) + vo]));
+}
+
+// part 1: 4-bit high nibbles, high bit = h bit shift+1
+vec4 iq5k_hi(uint qw, uint hw, uint shift, uint vo) {
+    return vec4(
+        float(iq5nl_values[((((qw >> 4) & 0xFu) | ((((hw & 0xffu) >> shift) & 2u) << 3))) + vo]),
+        float(iq5nl_values[((((qw >> 12) & 0xFu) | ((((hw >> 8) & 0xffu) >> shift & 2u) << 3))) + vo]),
+        float(iq5nl_values[((((qw >> 20) & 0xFu) | ((((hw >> 16) & 0xffu) >> shift & 2u) << 3))) + vo]),
+        float(iq5nl_values[((((qw >> 28) & 0xFu) | ((((hw >> 24) & 0xffu) >> shift & 2u) << 3))) + vo]));
+}
+
 void main() {
-    // Each workgroup processes 32 blocks, 8 threads per block.
-    // Thread t handles 32 elements of the block:
-    //   ib64 = t%4 (0..3), part = t/4 (0: elements 64*ib64..+31, 1: +32..+63)
     const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
     const uint ib64 = gl_LocalInvocationID.x % 4;
     const uint part = (gl_LocalInvocationID.x % 8) / 4;
@@ -27,44 +41,41 @@ void main() {
     const uint row_bytes = meta + nbpb * BLOCK_BYTES;
     const uint block_byte = (ib / nbpb) * row_bytes + meta + (ib % nbpb) * BLOCK_BYTES;
 
-    const uint shift = 2 * ib64;
-
-    const uint extra = iqk_load_u16(block_byte + 2);
-    const uint e_shift = extra >> (4 * ib64);
-
-    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
-    const uint sh = data_a[block_byte + 4 + ib64];
-    const uint sl0 = data_a[block_byte + 8 + 2 * ib64];
-    const uint sl1 = data_a[block_byte + 8 + 2 * ib64 + 1];
-
-    float dl1, dl2;
-    uint v1_off, v2_off;
-    if (part == 0) {
-        dl1 = d * (float((sl0 & 0xFu) | ((sh << 4) & 0x30u)) - 32.0f);
-        dl2 = d * (float((sl0 >> 4) | ((sh << 2) & 0x30u)) - 32.0f);
-        v1_off = ((e_shift & 1u) != 0) ? 32 : 0;
-        v2_off = ((e_shift & 2u) != 0) ? 32 : 0;
-    } else {
-        dl1 = d * (float((sl1 & 0xFu) | (sh & 0x30u)) - 32.0f);
-        dl2 = d * (float((sl1 >> 4) | ((sh >> 2) & 0x30u)) - 32.0f);
-        v1_off = ((e_shift & 4u) != 0) ? 32 : 0;
-        v2_off = ((e_shift & 8u) != 0) ? 32 : 0;
-    }
-
+    const uint dw = block_byte / 4;
+    const uint head = data_a32[dw];
+    const float d = iqk_f16_to_f32(head & 0xffffu);
+    const uint extra = head >> 16;
+    const uint sh01 = data_a32[dw + 1];
+    const uint sl01 = data_a32[dw + 2];
+    const uint sl23 = data_a32[dw + 3];
     const uint b_idx = QUANT_K * ib + 64 * ib64 + 32 * part;
-    const uint qs_off = 16 + 32 * ib64;
-    const uint qh_off = 144;
-    [[unroll]] for (uint j = 0; j < 16; ++j) {
-        const uint qa = data_a[block_byte + qs_off + j];
-        const uint qb = data_a[block_byte + qs_off + 16 + j];
-        const uint ha = data_a[block_byte + qh_off + j];
-        const uint hb = data_a[block_byte + qh_off + 16 + j];
-        if (part == 0) {
-            data_b[b_idx + j]      = D_TYPE(dl1 * float(iq5nl_values[((qa & 0xFu) | (((ha >> shift) & 1u) << 4)) + v1_off]));
-            data_b[b_idx + j + 16] = D_TYPE(dl2 * float(iq5nl_values[((qb & 0xFu) | (((hb >> shift) & 1u) << 4)) + v2_off]));
-        } else {
-            data_b[b_idx + j]      = D_TYPE(dl1 * float(iq5nl_values[((qa >> 4) | (((ha >> shift) & 2u) << 3)) + v1_off]));
-            data_b[b_idx + j + 16] = D_TYPE(dl2 * float(iq5nl_values[((qb >> 4) | (((hb >> shift) & 2u) << 3)) + v2_off]));
+
+    const uint shift = 2 * ib64;
+    const uint e = extra >> (4 * ib64);
+    const uint sh = (sh01 >> (8 * ib64)) & 0xffu;
+    const uint sl_dw = ib64 < 2 ? sl01 : sl23;
+    const uint sl0 = (sl_dw >> (16 * (ib64 & 1))) & 0xffu;
+    const uint sl1 = (sl_dw >> (16 * (ib64 & 1) + 8)) & 0xffu;
+    const uint qs_dw = (block_byte + 16 + 32 * ib64) / 4;
+    const uint qh_dw = (block_byte + 144) / 4;
+
+    if (part == 0) {
+        const float dl1 = d * (float((sl0 & 0xFu) | ((sh << 4) & 0x30u)) - 32.0f);
+        const float dl2 = d * (float(((sl0 >> 4) & 0xFu) | ((sh << 2) & 0x30u)) - 32.0f);
+        const uint v1_off = (e & 1u) != 0 ? 32u : 0u;
+        const uint v2_off = (e & 2u) != 0 ? 32u : 0u;
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            iqk_store4(b_idx + 4 * j,      dl1 * iq5k_lo(data_a32[qs_dw + j],     data_a32[qh_dw + j],     shift, v1_off));
+            iqk_store4(b_idx + 16 + 4 * j, dl2 * iq5k_lo(data_a32[qs_dw + 4 + j], data_a32[qh_dw + 4 + j], shift, v2_off));
+        }
+    } else {
+        const float dl1 = d * (float((sl1 & 0xFu) | (sh & 0x30u)) - 32.0f);
+        const float dl2 = d * (float(((sl1 >> 4) & 0xFu) | ((sh >> 2) & 0x30u)) - 32.0f);
+        const uint v1_off = (e & 4u) != 0 ? 32u : 0u;
+        const uint v2_off = (e & 8u) != 0 ? 32u : 0u;
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            iqk_store4(b_idx + 4 * j,      dl1 * iq5k_hi(data_a32[qs_dw + j],     data_a32[qh_dw + j],     shift, v1_off));
+            iqk_store4(b_idx + 16 + 4 * j, dl2 * iq5k_hi(data_a32[qs_dw + 4 + j], data_a32[qh_dw + 4 + j], shift, v2_off));
         }
     }
 }
