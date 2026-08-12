@@ -15,10 +15,10 @@ ik_llama.cpp, what has been fixed, how to get good performance, and what is stil
 - The imatrix quant types from the IQK/K-family (`IQ2_K`...`IQ6_K`, `IQ4_KS`, `IQ2_KS`,
   `IQ4_KSS`, `IQ5_KS`, `IQ3_KS`, `IQ2_KL`) and the KT-family (`IQ1_KT`...`IQ4_KT`) are **now
   supported** by the Vulkan backend (see "What we fixed"): single-token decode runs a native
-  `mul_mat_vec` kernel per type and prompt processing runs a coopmat2 tensor-core matmul with
-  inline dequant (the quantized weights are read once; see "vs CUDA" for the measured result).
-  The `*_R4` repack variants and `Q6_0`, `MXFP4`, `IQ1_BN`, `IQ2_BN` are still not supported
-  and fall back to the CPU backend.
+  `mul_mat_vec` kernel per type and prompt processing runs a flat-dequant-to-F16 + tensor-core
+  matmul (the dequant kernels are vectorized and the quantized weights are read once; see
+  "vs CUDA" for the measured result). The `*_R4` repack variants and `Q6_0`, `MXFP4`,
+  `IQ1_BN`, `IQ2_BN` are still not supported and fall back to the CPU backend.
 
 ## What we fixed
 
@@ -375,21 +375,23 @@ running many iterations) shows both remaining gaps are dominated by the FFN:
     RTX 3090 (Ampere, driver 610.57.04) does not expose the extension, so it falls back
     to the scalar decode there. It should help on decode-vector-capable GPUs.
 
-    **The "optimize the flat dequant kernels" idea was tried and reverted (no win on
-    Ampere).** A rewrite of the 15 `dequant_iqX_*` shaders to one 256-element block per
-    thread with u32 loads and `f16vec4` stores was benchmarked against the existing
-    byte-addressed 8-threads-per-block kernels on the RTX 3090 (IQ4_KT, FFN shape
-    `[27648, 5120] x [27648, n]`, 20-iteration warmup to lock clocks). The rewrite was
-    ~11% slower for the dequant+`MUL_MAT_ID` path (4.27 ms vs 3.83 ms at n=32), and
-    wiring it into dense `MUL_MAT` was also slower end-to-end (~427 vs ~501 tok/s prompt
-    on the 32B IQ4_KT, batch ~512). The earlier ~15-17 ms cm2 / ~16-23 ms flat-dequant
-    numbers above were cold-clock artifacts; with locked clocks the cm2 FFN matmul is
-    ~3.1 ms (n=32) to ~4.7 ms (n=512) and the byte-addressed flat dequant is ~3.5 ms,
-    so the cm2 inline-dequant path remains the right choice for dense IQK/KT MUL_MAT on
-    coopmat2. The flat dequant stays the fallback for MoE (`MUL_MAT_ID`) and non-coopmat2
-    devices, where cm2 is not available.
+    **The flat dequant kernels are now optimized, and dense IQK/KT MUL_MAT uses them.**
+    The 15 `dequant_iqX_*` shaders keep the original 8-threads-per-block mapping but now
+    read the quantized bytes through a uint32 view (aliasing the byte view at binding 0),
+    write `f16vec4` stores, and (on integer-dot devices) use a hardware `dot4` for the
+    KT-family hash byte-sum (`dequant_iqX_dot4` variants). On the RTX 3090 the
+    dequant+`MUL_MAT_ID` FFN matmul (`[27648, 5120] x [27648, n]`) drops to ~1.3-2.3 ms
+    (n=32) from ~3.8 ms, now faster than the scalar cm2 inline dequant (~3.1 ms). The
+    dense `MUL_MAT` path therefore falls back to dequant+F16 for the IQK/KT families
+    (cm2 is kept only on decode-vector-capable GPUs). End-to-end prompt processing on the
+    32B IQ4_KT model improves from ~500 tok/s to ~850 tok/s (batch ~512); the remaining
+    gap to CUDA (~1240 tok/s) is the tensor-core F16 matmul itself.
 
-    While investigating this, a pre-existing crash was fixed and kept:
+    Note that the earlier ~15-17 ms cm2 / ~16-23 ms flat-dequant numbers above were
+    cold-clock artifacts; with 20-iteration warmup the cm2 FFN matmul is ~3.1 ms (n=32)
+    to ~4.7 ms (n=512).
+
+    While investigating this, a pre-existing crash was also fixed:
     `ggml_vk_get_mul_mat_mat_pipeline` returned a non-null but empty
     `pipeline_dequant_mul_mat_mat[type]` struct for the IQK/KT types on coopmat1
     (non-coopmat2) devices (only the coopmat2 cm2 variants are ever created for these

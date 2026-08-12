@@ -551,6 +551,9 @@ void process_shaders() {
 #endif
 
         string_to_spv("dequant_" + tname, "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+        string_to_spv("dequant_" + tname + "_dot4", "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"IQK_USE_DOT4", "1"}}));
+#endif
 
         // get_rows (quantized embeddings): byte-addressed row lookup
         string_to_spv("get_rows_" + tname, "get_rows_iqk.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));

@@ -3006,21 +3006,29 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ3_S],   "dequant_iq3_s",   dequant_iq3_s_len,   dequant_iq3_s_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_XS],  "dequant_iq4_xs",  dequant_iq4_xs_len,  dequant_iq4_xs_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_NL],  "dequant_iq4_nl",  dequant_iq4_nl_len,  dequant_iq4_nl_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ2_K],  "dequant_iq2_k",  dequant_iq2_k_len,  dequant_iq2_k_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ3_K],  "dequant_iq3_k",  dequant_iq3_k_len,  dequant_iq3_k_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_K],  "dequant_iq4_k",  dequant_iq4_k_len,  dequant_iq4_k_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ5_K],  "dequant_iq5_k",  dequant_iq5_k_len,  dequant_iq5_k_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ6_K],  "dequant_iq6_k",  dequant_iq6_k_len,  dequant_iq6_k_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ2_KS],  "dequant_iq2_ks",  dequant_iq2_ks_len,  dequant_iq2_ks_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ3_KS],  "dequant_iq3_ks",  dequant_iq3_ks_len,  dequant_iq3_ks_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_KS],  "dequant_iq4_ks",  dequant_iq4_ks_len,  dequant_iq4_ks_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_KSS], "dequant_iq4_kss", dequant_iq4_kss_len, dequant_iq4_kss_data, "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ5_KS],  "dequant_iq5_ks",  dequant_iq5_ks_len,  dequant_iq5_ks_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ2_KL],  "dequant_iq2_kl",  dequant_iq2_kl_len,  dequant_iq2_kl_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ1_KT],  "dequant_iq1_kt",  dequant_iq1_kt_len,  dequant_iq1_kt_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ2_KT],  "dequant_iq2_kt",  dequant_iq2_kt_len,  dequant_iq2_kt_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ3_KT],  "dequant_iq3_kt",  dequant_iq3_kt_len,  dequant_iq3_kt_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_KT],  "dequant_iq4_kt",  dequant_iq4_kt_len,  dequant_iq4_kt_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
+    // IQK / KT flat dequant (dot4 hash byte-sum when the device has the extension)
+#define CREATE_DEQUANT_IQK(TYPE, NAMELC) \
+    if (device->integer_dot_product) { \
+        ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], "dequant_" #NAMELC, dequant_ ## NAMELC ## _dot4_len, dequant_ ## NAMELC ## _dot4_data, "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1); \
+    } else { \
+        ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], "dequant_" #NAMELC, dequant_ ## NAMELC ## _len, dequant_ ## NAMELC ## _data, "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1); \
+    }
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ2_K,  iq2_k)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ3_K,  iq3_k)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ4_K,  iq4_k)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ5_K,  iq5_k)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ6_K,  iq6_k)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ2_KS, iq2_ks)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ3_KS, iq3_ks)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ4_KS, iq4_ks)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ4_KSS, iq4_kss)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ5_KS, iq5_ks)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ2_KL, iq2_kl)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ1_KT, iq1_kt)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ2_KT, iq2_kt)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ3_KT, iq3_kt)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ4_KT, iq4_kt)
+#undef CREATE_DEQUANT_IQK
 
     // get_rows
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F32 ], "get_rows_f32",  get_rows_f32_len,  get_rows_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
@@ -4517,6 +4525,12 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
 
     if (ctx->device->coopmat2) {
         assert(src1_type == GGML_TYPE_F16);
+        // The flat dequant+F16 fallback is now faster than the scalar per-element
+        // cm2 inline dequant for the IQK/KT families (see docs/Vulkan.md). Keep
+        // cm2 only on decode-vector-capable GPUs where the V=4 path may win.
+        if (ggml_vk_is_iqk_type(src0_type) && !ctx->device->coopmat2_decode_vector) {
+            return nullptr;
+        }
         vk_matmul_pipeline p = prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
         return ggml_vk_matmul_pipeline_empty(p) ? nullptr : p;
     }

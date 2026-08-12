@@ -2,17 +2,22 @@
 
 #include "dequant_head.comp"
 #include "iqk_tables.comp"
+#include "dequant_iqk_common.comp"
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
-
-layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
 
 #define QUANT_K 256
 #define BLOCK_BYTES 76
 
+vec4 iq2k_unpack(uint w, uint shift, uint vo) {
+    return vec4(
+        float(iq2nl_values[(((w & 0xffu) >> shift) & 3u) + vo]),
+        float(iq2nl_values[((((w >> 8) & 0xffu) >> shift) & 3u) + vo]),
+        float(iq2nl_values[((((w >> 16) & 0xffu) >> shift) & 3u) + vo]),
+        float(iq2nl_values[((((w >> 24) & 0xffu) >> shift) & 3u) + vo]));
+}
+
 void main() {
-    // Each workgroup processes 32 blocks, 8 threads per block.
-    // Thread ib32 handles sub-block ib32 (32 elements) of the block.
     const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
     const uint ib32 = gl_LocalInvocationID.x % 8;
 
@@ -20,27 +25,30 @@ void main() {
         return;
     }
 
-    const uint nbpb = p.K;          // blocks per row
-    const uint meta = p.stride_a;   // row meta bytes
+    const uint nbpb = p.K;
+    const uint meta = p.stride_a;
     const uint row_bytes = meta + nbpb * BLOCK_BYTES;
     const uint block_byte = (ib / nbpb) * row_bytes + meta + (ib % nbpb) * BLOCK_BYTES;
 
-    const uint shift = 2 * (ib32 % 4);
-    const uint qs_off = 12 + (ib32 / 4) * 32;
-
-    const uint extra = iqk_load_u16(block_byte + 2);
-    const uint e_shift = extra >> (2 * ib32);
-    const uint v1_off = (e_shift & 1u) != 0 ? 4 : 0;
-    const uint v2_off = (e_shift & 2u) != 0 ? 4 : 0;
-
-    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
-    const uint sc = data_a[block_byte + 4 + ib32];
-    const float dl1 = d * (float(sc & 0xFu) - 8.0f);
-    const float dl2 = d * (float(sc >> 4) - 8.0f);
-
+    const uint dw = block_byte / 4;
+    const uint head = data_a32[dw];
+    const float d = iqk_f16_to_f32(head & 0xffffu);
+    const uint extra = head >> 16;
+    const uint sc01 = data_a32[dw + 1];
+    const uint sc23 = data_a32[dw + 2];
     const uint b_idx = QUANT_K * ib + 32 * ib32;
-    [[unroll]] for (uint j = 0; j < 16; ++j) {
-        data_b[b_idx + j]      = D_TYPE(dl1 * float(iq2nl_values[((data_a[block_byte + qs_off + j] >> shift) & 3) + v1_off]));
-        data_b[b_idx + j + 16] = D_TYPE(dl2 * float(iq2nl_values[((data_a[block_byte + qs_off + 16 + j] >> shift) & 3) + v2_off]));
+
+    const uint shift = 2 * (ib32 % 4);
+    const uint sc = (ib32 < 4 ? sc01 : sc23) >> (8 * (ib32 & 3));
+    const float dl1 = d * (float(sc & 0xFu) - 8.0f);
+    const float dl2 = d * (float((sc >> 4) & 0xFu) - 8.0f);
+    const uint e = extra >> (2 * ib32);
+    const uint v1_off = (e & 1u) != 0 ? 4u : 0u;
+    const uint v2_off = (e & 2u) != 0 ? 4u : 0u;
+    const uint qs_dw = (block_byte + 12 + (ib32 / 4) * 32) / 4;
+
+    [[unroll]] for (uint j = 0; j < 4; ++j) {
+        iqk_store4(b_idx + 4 * j,      dl1 * iq2k_unpack(data_a32[qs_dw + j],     shift, v1_off));
+        iqk_store4(b_idx + 16 + 4 * j, dl2 * iq2k_unpack(data_a32[qs_dw + 4 + j], shift, v2_off));
     }
 }
