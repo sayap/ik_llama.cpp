@@ -2637,6 +2637,32 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_MM(GGML_TYPE_IQ4_XS,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS].f32acc,  matmul_id_iq4_xs_f32,  , mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, 4, _id);
         CREATE_MM(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL].f32acc,  matmul_id_iq4_nl_f32,  , mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, 4, _id);
     }
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    // IQ4_KT Q8_1 SIMT mmq (dot4). Only for pure-SIMT devices (no coopmat): on
+    // tensor-core (coopmat2/coopmat) GPUs the SIMT mmq is slower than the
+    // dequant->F16 tensor-core matmul (measured: 261 vs 489 tok/s PP on RTX 3090),
+    // so it is not created there and IQ4_KT keeps the fast path. The 256-element
+    // block / per-row META layout is handled by a custom byte-addressed load in
+    // mul_mmq.comp.
+    if (device->integer_dot_product && !device->coopmat2 && !device->coopmat_support) {
+        const std::array<uint32_t,3> l_wd_iqkt = {128,128,1}, m_wd_iqkt = {64,64,1}, s_wd_iqkt = {32,32,1};
+        const std::vector<uint32_t> l_wt_iqkt = { 128, 128, 128, 32, subgroup_size_8*2, 64, 2, 4, 4, 1, subgroup_size_8 };
+        const std::vector<uint32_t> m_wt_iqkt = { 128,  64,  64, 32, subgroup_size_8,     32, 2, 2, 2, 1, subgroup_size_8 };
+        const std::vector<uint32_t> s_wt_iqkt = { subgroup_size_32, 32, 32, 32, 32,       32, 2, 2, 1, 1, subgroup_size_8 };
+        if (device->mul_mat_l[GGML_TYPE_IQ4_KT]) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT].f16acc->l, "matmul_iq4_kt_q8_1_f16acc_l", matmul_iq4_kt_q8_1_f16acc_len, matmul_iq4_kt_q8_1_f16acc_data, "main", 3, sizeof(vk_mat_mat_push_constants), l_wd_iqkt, l_wt_iqkt, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT].f32acc->l, "matmul_iq4_kt_q8_1_l",        matmul_iq4_kt_q8_1_len,        matmul_iq4_kt_q8_1_data,        "main", 3, sizeof(vk_mat_mat_push_constants), l_wd_iqkt, l_wt_iqkt, 1);
+        }
+        if (device->mul_mat_m[GGML_TYPE_IQ4_KT]) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT].f16acc->m, "matmul_iq4_kt_q8_1_f16acc_m", matmul_iq4_kt_q8_1_f16acc_len, matmul_iq4_kt_q8_1_f16acc_data, "main", 3, sizeof(vk_mat_mat_push_constants), m_wd_iqkt, m_wt_iqkt, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT].f32acc->m, "matmul_iq4_kt_q8_1_m",        matmul_iq4_kt_q8_1_len,        matmul_iq4_kt_q8_1_data,        "main", 3, sizeof(vk_mat_mat_push_constants), m_wd_iqkt, m_wt_iqkt, 1);
+        }
+        if (device->mul_mat_s[GGML_TYPE_IQ4_KT]) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT].f16acc->s, "matmul_iq4_kt_q8_1_f16acc_s", matmul_iq4_kt_q8_1_f16acc_len, matmul_iq4_kt_q8_1_f16acc_data, "main", 3, sizeof(vk_mat_mat_push_constants), s_wd_iqkt, s_wt_iqkt, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT].f32acc->s, "matmul_iq4_kt_q8_1_s",        matmul_iq4_kt_q8_1_len,        matmul_iq4_kt_q8_1_data,        "main", 3, sizeof(vk_mat_mat_push_constants), s_wd_iqkt, s_wt_iqkt, 1);
+        }
+    }
+#endif
     // reusing CREATE_MM from the fp32 path
     if ((device->coopmat2 || device->coopmat_support)
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
@@ -5527,7 +5553,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ggml_vk_sync_buffers(subctx);
         ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0, { vk_subbuffer{ d_Qx, qx_buf_offset, ggml_nbytes(src0) }, vk_subbuffer{ d_X, 0, x_sz * ne02 * ne03 } }, pc, { (uint32_t)(x_ne * ne02 * ne03), 1, 1});
     }
-    if (y_non_contig) {
+    if (qy_needs_dequant) {
+        // copy src1 to a contiguous f16 buffer. Only when the dequant path is
+        // taken: the mmq (quantize_y) path reads src1 directly, so dispatching
+        // this copy there would exceed the descriptor sets requested in the
+        // dry-run (y_non_contig can be true for coopmat2 with f32 src1).
         ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_1, src1, { d_Qy, qy_buf_offset, VK_WHOLE_SIZE }, { d_Y, 0, VK_WHOLE_SIZE });
     }
     if (quantize_y) {
@@ -5546,9 +5576,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     // compute
+    // The A binding range must cover the full tensor when passing raw quantized
+    // weights (mmq path). x_sz omits the per-row scale header of row-meta types
+    // (e.g. IQ4_KT), which would put the last rows out of range (robustness reads
+    // them as zero). ggml_nbytes() includes the header, so use it for the raw case.
     ggml_vk_matmul(
         ctx, subctx, pipeline,
-        { d_X, x_buf_offset, x_sz * ne02 * ne03 }, { d_Y, y_buf_offset, y_sz * ne12 * ne13 },
+        { d_X, x_buf_offset, qx_needs_dequant ? (x_sz * ne02 * ne03) : ggml_nbytes(src0) }, { d_Y, y_buf_offset, y_sz * ne12 * ne13 },
         { d_D, d_buf_offset, d_sz * ne12 * ne13 }, { ctx->prealloc_split_k, 0, d_sz * ne12 * ne13 * split_k },
         ne01, ne11, ne10,
         ne10, ne10, ne01, stride_batch_x, stride_batch_y, ne20*ne21,

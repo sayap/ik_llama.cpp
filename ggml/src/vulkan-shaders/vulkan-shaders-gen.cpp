@@ -532,6 +532,22 @@ void process_shaders() {
         // get_rows (quantized embeddings): byte-addressed row lookup
         string_to_spv("get_rows_" + tname, "get_rows_iqk.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
         string_to_spv("get_rows_" + tname + "_f32", "get_rows_iqk.comp", merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
+
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+        // Q8_1 SIMT mmq (dot4) for IQ4_KT. The 256-element-block / per-row META
+        // layout is handled by a custom byte-addressed load in mul_mmq.comp.
+        // Generated in f32acc and f16acc variants (CREATE_MMQ expects both).
+        if (tname == "iq4_kt") {
+            // IQ4_KT hash values are large (signed, up to ~+/-126), so accumulate
+            // in float for both variants (f16 would overflow / lose precision).
+            string_to_spv("matmul_iq4_kt_q8_1", "mul_mmq.comp",
+                {{"FLOAT16", "1"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPE_VEC2", "vec2"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"ACC_TYPE", "float"}},
+                true, false, false, false);
+            string_to_spv("matmul_iq4_kt_q8_1", "mul_mmq.comp",
+                {{"FLOAT16", "1"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPE_VEC2", "vec2"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"ACC_TYPE", "float"}},
+                true, false, false, true);
+        }
+#endif
     }
 
     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPE_VEC4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});

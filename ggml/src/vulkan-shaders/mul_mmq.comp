@@ -3,6 +3,9 @@
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#if defined(DATA_A_IQ4_KT)
+#extension GL_EXT_shader_8bit_storage : enable
+#endif
 
 #extension GL_EXT_integer_dot_product : require
 
@@ -242,6 +245,52 @@ void main() {
     FLOAT_TYPE_VEC2 cache_b_ds[TN];
 
     for (uint block = start_k; block < end_k; block += BK) {
+#ifdef DATA_A_IQ4_KT
+        // Byte-addressed IQ4_KT load (256-element blocks, 4-byte per-row META header).
+        // Uses absolute row + k offset directly (shifts only, no integer divides).
+        // Each of the 8 iqs slots (loadr_a, 0..7) decodes one 4-value hash chain;
+        // the 8 slots together cover one 32-element (ib32) group, matching the
+        // BK=32 tile granularity and the Q8_1 dp4a vec_dot.
+        const uint KT_META  = 4;
+        const uint KT_BBYTES = 128;  // bytes per 256-element block
+        const uint row_bytes = KT_META + (p.stride_a / 256) * KT_BBYTES;
+        [[unroll]] for (uint l = 0; loadc_a + l < BM; l += loadstride_a) {
+            const uint buf_ib  = loadc_a + l;
+            const uint abs_row = batch_idx_a * p.M + ir * BM + buf_ib;
+            const uint iqs     = loadr_a;
+            const uint b256    = block / 256;
+            const uint ib32    = (block / 32) & 7;
+            const uint row_byte   = abs_row * row_bytes;
+            const uint block_byte = row_byte + KT_META + b256 * KT_BBYTES;
+
+            const float d   = uintBitsToFloat(uint(data_a[row_byte])     | (uint(data_a[row_byte + 1]) << 8)
+                                                                           | (uint(data_a[row_byte + 2]) << 16)
+                                                                           | (uint(data_a[row_byte + 3]) << 24));
+            const uint qs32_o = block_byte + 4 * ib32;
+            const uint qs32 = uint(data_a[qs32_o])     | (uint(data_a[qs32_o + 1]) << 8)
+                              | (uint(data_a[qs32_o + 2]) << 16)
+                              | (uint(data_a[qs32_o + 3]) << 24);
+
+            if (iqs == 0) {
+                buf_a_dm[buf_ib] = FLOAT_TYPE(d * (float((qs32 & 0xffu) >> 1) - 64.0f));
+            }
+
+            const uint idx0   = ((qs32 & 1u) << 15) + 4096u;
+            const uint ql_off = 32 + 8 * ib32;
+            const uint qh_off = 96 + 8 * (ib32 & 3);
+            const uint sh_shift = 8 - 4 * (ib32 / 4);
+            const uint sh = qs32 >> (8 + 3 * iqs);
+            uint x = uint(data_a[block_byte + ql_off + iqs])
+                   + ((uint(data_a[block_byte + qh_off + iqs]) << sh_shift) & 0xf00u)
+                   + ((sh & 7u) << 12)
+                   + idx0;
+            const ivec4 v = iqk_kt_hash(x);
+            buf_a_qs[buf_ib * SHMEM_STRIDE + iqs] = (v.x & 0xff)
+                                                  | ((v.y & 0xff) << 8)
+                                                  | ((v.z & 0xff) << 16)
+                                                  | ((v.w & 0xff) << 24);
+        }
+#else
         [[unroll]] for (uint l = 0; loadc_a + l < BM; l += loadstride_a) {
             const uint ib = pos_a_ib + (loadc_a + l) * p.stride_a / BK;
             const uint iqs = loadr_a;
@@ -262,6 +311,7 @@ void main() {
             buf_a_qs[buf_ib * SHMEM_STRIDE + iqs + 4] = vals.y;
 #endif
         }
+#endif
         [[unroll]] for (uint l = 0; loadc_b + l < BN; l += loadstride_b) {
 #ifdef MUL_MAT_ID
             const u16vec2 row_idx = row_ids[ic * BN + loadc_b + l];
