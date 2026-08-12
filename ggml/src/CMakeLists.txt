@@ -795,12 +795,33 @@ if (GGML_VULKAN)
         )
 
         set (_ggml_vk_host_suffix $<IF:$<STREQUAL:${CMAKE_HOST_SYSTEM_NAME},Windows>,.exe,>)
-        set (_ggml_vk_genshaders_dir "${CMAKE_BINARY_DIR}/$<CONFIG>")
-        set (_ggml_vk_genshaders_cmd "${_ggml_vk_genshaders_dir}/vulkan-shaders-gen${_ggml_vk_host_suffix}")
         set (_ggml_vk_header     "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.hpp")
         set (_ggml_vk_source     "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.cpp")
         set (_ggml_vk_input_dir  "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders")
         set (_ggml_vk_output_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")
+
+        # The ExternalProject build/install steps for vulkan-shaders-gen are stamp-based and
+        # never re-run when the generator's own sources change (only the inner `cmake --build`
+        # tracks them), so on incremental builds the generator binary can be stale and emit a
+        # header without the newest shaders, breaking the build with undeclared symbols. Use
+        # the inner build's binary directly and rebuild it here whenever its sources change.
+        set (_ggml_vk_shader_gens_sources
+             "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/vulkan-shaders-gen.cpp"
+             "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/CMakeLists.txt")
+        set (_ggml_vk_genshaders_build_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders-gen-prefix/src/vulkan-shaders-gen-build")
+        set (_ggml_vk_genshaders_cmd "${_ggml_vk_genshaders_build_dir}/vulkan-shaders-gen${_ggml_vk_host_suffix}")
+
+        add_custom_command(
+            OUTPUT ${_ggml_vk_genshaders_cmd}
+            COMMAND ${CMAKE_COMMAND} --build "${_ggml_vk_genshaders_build_dir}" --config $<CONFIG>
+            # the ExternalProject target creates/configures the inner build dir on a fresh build;
+            # on incremental builds it is stamp-gated (a no-op) and only this rule rebuilds the
+            # generator when its sources change
+            DEPENDS ${_ggml_vk_shader_gens_sources}
+                    vulkan-shaders-gen
+            COMMENT "Building vulkan-shaders-gen"
+            VERBATIM
+        )
 
         file(GLOB _ggml_vk_shader_files CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.comp")
 
@@ -818,7 +839,7 @@ if (GGML_VULKAN)
 
             DEPENDS ${_ggml_vk_shader_files}
                     ${_ggml_vk_shader_gens_sources}
-                    vulkan-shaders-gen
+                    ${_ggml_vk_genshaders_cmd}
 
             COMMENT "Generate vulkan shaders"
         )
