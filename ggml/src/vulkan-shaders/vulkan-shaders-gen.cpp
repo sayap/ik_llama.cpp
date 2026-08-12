@@ -415,17 +415,24 @@ void matmul_shaders(bool fp16, bool matmul_id, bool coopmat, bool coopmat2, bool
     if (coopmat2 && !matmul_id) {
         // IQK / KT quant families (QK_K = 256, byte-addressed with per-row META
         // headers): coopmat2 tensor-core matmul with inline dequant. The A side
-        // is loaded one element at a time through a decode function that computes
-        // the absolute byte address from the push constants; B is F16 (the
-        // activations are converted by the caller). IQK_USE_DOT4 lets the KT hash
-        // byte-sum use one hardware dot4 per element.
+        // is loaded through decode functions that compute the absolute byte
+        // address from the push constants; B is F16 (the activations are
+        // converted by the caller). IQK_USE_DOT4 lets the KT hash byte-sum use
+        // one hardware dot4 per element. GGML_VULKAN_COOPMAT2_DECODE_VECTOR
+        // selects the V=4 vector decode (one driver invocation per 4 elements).
+        std::map<std::string, std::string> iqk_cm2_defines = {
+            {"FLOAT_TYPE", FLOAT_TYPE("f16")}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}, {"IQK_USE_DOT4", "1"},
+        };
+#if defined(GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT)
+        iqk_cm2_defines["GGML_VULKAN_COOPMAT2_DECODE_VECTOR"] = "1";
+#endif
         for (const auto& tname : iqk_type_names) {
             std::string data_a_key = "DATA_A_" + to_uppercase(tname);
             // One variant per call: matmul_shaders is invoked twice for coopmat2
             // (f32acc then f16acc), so the f16acc flag selects which accumulator
             // variant to emit (the CREATE_MM2 pipelines reference both).
-            string_to_spv(shader_name + "_" + tname + "_f16", source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("f16")}, {data_a_key, "1"}, {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}, {"IQK_USE_DOT4", "1"}}), fp16, coopmat, coopmat2, f16acc);
-            string_to_spv(shader_name + "_" + tname + "_f16_aligned", source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("f16")}, {data_a_key, "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"D_TYPE", "float"}, {"ALIGNED", "1"}, {"IQK_USE_DOT4", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(shader_name + "_" + tname + "_f16", source_name, merge_maps(base_dict, merge_maps(iqk_cm2_defines, {{data_a_key, "1"}, {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "1"}})), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(shader_name + "_" + tname + "_f16_aligned", source_name, merge_maps(base_dict, merge_maps(iqk_cm2_defines, {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"ALIGNED", "1"}})), fp16, coopmat, coopmat2, f16acc);
         }
     }
 }

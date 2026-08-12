@@ -11,6 +11,9 @@
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_cooperative_matrix : enable
 #extension GL_NV_cooperative_matrix2 : enable
+#ifdef GGML_VULKAN_COOPMAT2_DECODE_VECTOR
+#extension GL_NV_cooperative_matrix_decode_vector : enable
+#endif
 #extension GL_EXT_buffer_reference : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_vote : enable
@@ -68,10 +71,12 @@ layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 #if QUANT_K > 1
-#define DECODEFUNCA , dequantFuncA
-
 #include "dequant_funcs_cm2.comp"
-
+#if defined(dequantFuncA_v) && defined(GGML_VULKAN_COOPMAT2_DECODE_VECTOR)
+#define DECODEFUNCA , dequantFuncA, dequantFuncA_v
+#else
+#define DECODEFUNCA , dequantFuncA
+#endif
 #else
 #define DECODEFUNCA
 #endif

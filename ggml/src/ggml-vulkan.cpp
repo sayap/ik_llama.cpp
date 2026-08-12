@@ -6,6 +6,7 @@
 #endif
 
 #include <vulkan/vulkan.hpp>
+#include <spirv/unified1/spirv.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -377,6 +378,7 @@ struct vk_device_struct {
     uint32_t coopmat_int_k;
 
     bool coopmat2;
+    bool coopmat2_decode_vector;
 
     size_t idx;
 
@@ -1222,6 +1224,125 @@ static uint32_t compile_count = 0;
 static std::mutex compile_count_mutex;
 static std::condition_variable compile_count_cond;
 
+// Strip the SPV_NV_cooperative_matrix_decode_vector extension (and the
+// DecodeVectorFunc tensor-addressing bit) from a SPIR-V module, so a shader
+// built with the vector decode can also run on devices without the
+// capability. Returns true if the module was modified (out is filled).
+static bool ggml_vk_strip_decode_vector(const uint32_t * code, size_t word_count, std::vector<uint32_t> & out) {
+    static const char kDecodeVectorExt[] = "SPV_NV_cooperative_matrix_decode_vector";
+
+    if (word_count < 5) {
+        return false;
+    }
+
+    bool uses_decode_vector = false;
+    for (size_t pos = 5; pos < word_count; ) {
+        uint32_t word = code[pos];
+        uint32_t wc   = word >> spv::WordCountShift;
+        uint32_t op   = word & spv::OpCodeMask;
+        GGML_ASSERT(wc > 0 && pos + wc <= word_count);
+        if (op == spv::OpExtension && wc >= 2) {
+            const char * s = reinterpret_cast<const char *>(&code[pos + 1]);
+            if (strcmp(s, kDecodeVectorExt) == 0) {
+                uses_decode_vector = true;
+                break;
+            }
+        }
+        pos += wc;
+    }
+
+    if (!uses_decode_vector) {
+        return false;
+    }
+
+    out.clear();
+    out.reserve(word_count);
+
+    size_t run_start = 0;
+    auto flush_run = [&](size_t up_to) {
+        if (up_to > run_start) {
+            out.insert(out.end(), code + run_start, code + up_to);
+        }
+    };
+
+    for (size_t pos = 5; pos < word_count; ) {
+        uint32_t word = code[pos];
+        uint32_t wc   = word >> spv::WordCountShift;
+        uint32_t op   = word & spv::OpCodeMask;
+        GGML_ASSERT(wc > 0 && pos + wc <= word_count);
+
+        if (op == spv::OpExtension && wc >= 2) {
+            const char * s = reinterpret_cast<const char *>(&code[pos + 1]);
+            if (strcmp(s, kDecodeVectorExt) == 0) {
+                flush_run(pos);
+                pos += wc;
+                run_start = pos;
+                continue;
+            }
+        }
+
+        if (op == spv::OpCapability && wc == 2 && code[pos + 1] == spv::CapabilityCooperativeMatrixDecodeVectorNV) {
+            flush_run(pos);
+            pos += wc;
+            run_start = pos;
+            continue;
+        }
+
+        if (op == spv::OpCooperativeMatrixLoadTensorNV) {
+            // [opcode/wc][ResultType][Result][Pointer][Object][TensorLayout][MemOperand mask][mem extras...][TA mask][ta extras...]
+            GGML_ASSERT(wc >= 8);
+
+            uint32_t mem_mask = code[pos + 6];
+            size_t   cur      = pos + 7;
+            // Each of these MemoryAccess bits (when set) carries one trailing operand.
+            cur += (mem_mask & 0x2)     ? 1 : 0; // Aligned
+            cur += (mem_mask & 0x8)     ? 1 : 0; // MakePointerAvailable
+            cur += (mem_mask & 0x10)    ? 1 : 0; // MakePointerVisible
+            cur += (mem_mask & 0x10000) ? 1 : 0; // AliasScopeINTELMask
+            cur += (mem_mask & 0x20000) ? 1 : 0; // NoAliasINTELMask
+            GGML_ASSERT(cur < pos + wc);
+
+            uint32_t ta_mask = code[cur];
+            if ((ta_mask & spv::TensorAddressingOperandsDecodeVectorFuncMask) == 0) {
+                pos += wc;
+                continue; // leave instruction inside the current unchanged run
+            }
+
+            flush_run(pos);
+
+            // Append unchanged prefix of the instruction (header through the mem-extras).
+            size_t inst_start = out.size();
+            size_t pre_n      = cur - pos;
+            out.insert(out.end(), code + pos, code + pos + pre_n);
+
+            // Emit TA mask with the DecodeVectorFunc bit cleared.
+            out.push_back(ta_mask & ~spv::TensorAddressingOperandsDecodeVectorFuncMask);
+
+            // TA extras: TensorView (0x1) and DecodeFunc (0x2) are kept verbatim;
+            // DecodeVectorFunc (0x4) is dropped along with its trailing id operand.
+            size_t keep_ta_extras = ((ta_mask & 0x1) ? 1 : 0) + ((ta_mask & 0x2) ? 1 : 0);
+            if (keep_ta_extras) {
+                out.insert(out.end(), code + cur + 1, code + cur + 1 + keep_ta_extras);
+            }
+
+            GGML_ASSERT(wc == pre_n + 1 + keep_ta_extras + 1);
+
+            // Patch the instruction header with the new (one-shorter) word count.
+            uint32_t new_wc = wc - 1;
+            out[inst_start] = (new_wc << spv::WordCountShift) | op;
+
+            pos += wc;
+            run_start = pos;
+            continue;
+        }
+
+        pos += wc;
+    }
+
+    flush_run(word_count);
+    return true;
+}
+
 static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipeline, size_t spv_size, const void* spv_data, const std::string entrypoint,
                                          uint32_t parameter_count, std::array<uint32_t, 3> wg_denoms, std::vector<uint32_t> specialization_constants,
                                          bool disable_robustness, bool require_full_subgroups, uint32_t required_subgroup_size) {
@@ -1233,6 +1354,14 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
 
     vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));
+#if defined(GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT)
+    std::vector<uint32_t> stripped;
+    if (device->coopmat2 && !device->coopmat2_decode_vector) {
+        if (ggml_vk_strip_decode_vector(reinterpret_cast<const uint32_t *>(spv_data), spv_size / sizeof(uint32_t), stripped)) {
+            shader_module_create_info = vk::ShaderModuleCreateInfo({}, stripped.size() * sizeof(uint32_t), stripped.data());
+        }
+    }
+#endif
     pipeline->shader_module = device->device.createShaderModule(shader_module_create_info);
 
     vk::PushConstantRange pcr(
@@ -3253,6 +3382,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         bool amd_shader_core_properties2 = false;
         bool pipeline_robustness = false;
         bool coopmat2_support = false;
+        bool coopmat2_decode_vector_support = false;
         device->coopmat_support = false;
         device->integer_dot_product = false;
         bool bfloat16_support = false;
@@ -3284,6 +3414,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
             } else if (strcmp("VK_NV_cooperative_matrix2", properties.extensionName) == 0 &&
                        !getenv("GGML_VK_DISABLE_COOPMAT2")) {
                 coopmat2_support = true;
+#endif
+#if defined(GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT)
+            } else if (strcmp("VK_NV_cooperative_matrix_decode_vector", properties.extensionName) == 0 &&
+                       !getenv("GGML_VK_DISABLE_COOPMAT2_DECODE_VECTOR")) {
+                coopmat2_decode_vector_support = true;
 #endif
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
             } else if (strcmp("VK_KHR_shader_integer_dot_product", properties.extensionName) == 0 &&
@@ -3340,6 +3475,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
         if (coopmat2_support) {
             last_struct->pNext = (VkBaseOutStructure *)&coopmat2_props;
             last_struct = (VkBaseOutStructure *)&coopmat2_props;
+        }
+#endif
+#if defined(GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT)
+        VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV coopmat2_decode_vector_features {};
+        coopmat2_decode_vector_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_DECODE_VECTOR_FEATURES_NV;
+        if (coopmat2_decode_vector_support) {
+            last_struct->pNext = (VkBaseOutStructure *)&coopmat2_decode_vector_features;
+            last_struct = (VkBaseOutStructure *)&coopmat2_decode_vector_features;
         }
 #endif
 
@@ -3613,6 +3756,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
                     device->coopmat2 = true;
                 }
             }
+#endif
+#if defined(GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT)
+        if (coopmat2_decode_vector_support && coopmat2_decode_vector_features.cooperativeMatrixDecodeVector) {
+            device->coopmat2_decode_vector = true;
+        }
 #endif
         }
 
