@@ -12,9 +12,11 @@ ik_llama.cpp, what has been fixed, how to get good performance, and what is stil
   backend now implements both ops (as two matmuls into the destination and a temporary buffer,
   followed by the fused activation combine), so dense and MoE FFNs run on the GPU without the
   `-no-fug` / `-no-fmoe` workarounds.
-- Quant types from the IQK family (`IQ4_KT`, ...) are **not** in the Vulkan backend's
-  `supports_op` list, so models quantized with those types run all their matmuls on CPU
-  regardless. Use a supported type (`Q8_0`, `Q6_K`, `Q4_K`, `Q4_0`, ...) or the CUDA backend.
+- The imatrix quant types from the IQK/K-family (`IQ2_K`...`IQ6_K`, `IQ4_KS`, `IQ2_KS`,
+  `IQ4_KSS`, `IQ5_KS`, `IQ3_KS`, `IQ2_KL`) and the KT-family (`IQ1_KT`...`IQ4_KT`) are **not**
+  in the Vulkan backend's `supports_op` list, so models quantized with those types run all
+  their matmuls on CPU. Use a supported type (`Q8_0`, `Q6_K`, `Q4_K`, `Q4_0`, ...) or the
+  CUDA backend.
 
 ## What we fixed
 
@@ -152,9 +154,19 @@ To close the remaining gaps, implement the missing ops as Vulkan kernels and ext
 
 The Vulkan `MUL_MAT` supports `F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K,
 Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL`.
-Missing are the IQK-family types used by ik_llama imatrix quants: `IQ4_KT` (and any other
-`*_KT` types). Models using those types run all matmuls on CPU. Adding them requires new
-dequant/mul_mat shaders and pipeline variants.
+Everything else falls back to the CPU backend. The missing types relevant to ik_llama
+imatrix quants (all supported by the CUDA backend) are:
+
+- the **IQK / K-family** (`QK_K` = 256 block): `IQ2_K, IQ3_K, IQ4_K, IQ5_K, IQ6_K,
+  IQ2_KS, IQ3_KS, IQ4_KS, IQ4_KSS, IQ5_KS, IQ2_KL` and the `*_R4` repack variants
+  (`IQ2_K_R4, IQ3_K_R4, IQ4_K_R4, IQ5_K_R4, IQ4_KS_R4, IQ5_KS_R4`);
+- the **KT-family**: `IQ1_KT, IQ2_KT, IQ3_KT, IQ4_KT`;
+- others CUDA supports but Vulkan does not: `Q6_0, MXFP4, IQ1_BN, IQ2_BN, IQ1_S_R4,
+  IQ1_M_R4`.
+
+Models using any of those types run all their matmuls on CPU (correct, but slow, and with
+GPU↔CPU copies per split). Adding them requires new dequant/mul_mat shaders and pipeline
+variants for each type.
 
 ### Performance / architecture
 
