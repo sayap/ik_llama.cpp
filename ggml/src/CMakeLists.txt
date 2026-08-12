@@ -663,6 +663,11 @@ if (GGML_VULKAN)
                 "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/test_coopmat2_support.comp"
                 "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
             )
+            test_shader_extension_support(
+                "GL_NV_cooperative_matrix_decode_vector"
+                "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2_decode_vector.comp"
+                "GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT"
+            )
         endif()
 
         if (NOT GGML_VULKAN_NO_INT_DOT)
