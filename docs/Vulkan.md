@@ -137,8 +137,19 @@ several quant types and batch sizes.
 These ops are produced by ik_llama's graph builder but are **not implemented** in the
 Vulkan backend, so they fall back to the CPU backend with expensive copies:
 
-- `GGML_OP_SSM_CONV`, `GGML_OP_DELTA_NET` and friends (recurrent / hybrid models)
-- `GGML_OP_L2_NORM` (and possibly other norm variants)
+- **Gated delta-net** (`qwen35` / `qwen3next` recurrent layers; e.g. Qwen3.5-0.8B): the
+  recurrent layer builds `GGML_OP_SSM_CONV` (causal conv over the qkv projection, with a
+  per-sequence conv state and per-step state save), `GGML_OP_L2_NORM` (q/k normalization;
+  the `l2_norm.comp` shader exists but is not wired in), `GGML_UNARY_OP_SOFTPLUS` (gate
+  `softplus(alpha+dt)*A`) and `GGML_OP_DELTA_NET` (the fused recurrent op
+  `f(q,k,v,g,beta,state) -> [output | new_state]`). `GGML_OP_REDUCE` is only needed for
+  multi-device splits of the layer. Unlike the fused up-gate, these ops are **stateful**
+  (they read and write the KV-cache state every step), so CPU fallback is not merely slow:
+  the per-step GPU<->CPU state round-trip currently produces garbage logits (NaN /
+  "Failed to sample token"). Implementing them requires new shaders + pipeline variants
+  and `supports_op` / `build_graph` entries; `DELTA_NET` is the large one (a fused,
+  flash-attention-style recurrent kernel; it is ik_llama-specific, so there is no upstream
+  Vulkan implementation to port).
 - `GGML_OP_MULTI_ADD` exists but check the specific fused-mul-multiadd variants
   (`fused_mmad`); `-no-mmad` disables them
 
