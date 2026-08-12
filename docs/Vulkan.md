@@ -30,7 +30,9 @@ and `GET_ROWS`:
   `mul_mat_vec_iq{2,3,4,5}_ks*`, `mul_mat_vec_iq4_kss*`, `mul_mat_vec_iq2_kl*`,
   `mul_mat_vec_iq{1,2,3,4}_kt*`) that reads the quantized bytes with explicit row/block byte
   addressing (the KS/KL/KT formats carry a per-row scale header, `row_meta_size` 2 or 4) and
-  dots against the F32/F16 activations.
+  dots against the F32/F16 activations. On devices with `VK_KHR_shader_integer_dot_product`
+  the KT-family hash decode's 4-shift + 3-add byte sum is replaced by one `dotPacked4x8EXT`
+  (a `_dot4` shader variant is selected at pipeline creation; the scalar fallback remains).
 - **prompt processing (mul_mat)**: a dequant-to-F16 kernel per type (`dequant_iqX_*`) feeding the
   existing F16 matmul. The flat dequant shaders are row-meta aware (blocks-per-row and meta size
   are passed in the push constants) and the dispatch passes the tensor's full byte size (the
@@ -286,11 +288,43 @@ Remaining performance notes:
 
 - The decode (`mul_mat_vec`) kernels still dequantize per element with the KT-family
   multiplicative-hash decode (4 hash rounds per weight); the output projection
-  `[5120, 152064]` alone is ~0.7 ms/token. This is ALU-heavy but no longer the dominant
-  term — a native quantized matmul kernel for the mat-mat path would help prompt
-  processing, which currently dequantizes each weight matrix to F16 on the GPU.
+  `[5120, 152064]` alone is ~0.7 ms/token.
 - The scheduler no longer copies the IQ4_KT FFN weights per split; the remaining
   device→host traffic is limited to the logits.
+
+### vs CUDA: the prompt-processing gap and the paths to close it
+
+On the same RTX 3090 the IQ4_KT model runs at ~27 tok/s decode / ~410 tok/s prompt on
+Vulkan vs ~30 / ~1240 on CUDA. Steady-state per-op profiling (GPU clocks locked by
+running many iterations) shows both remaining gaps are dominated by the FFN:
+
+- **Decode** (1.15x gap): the `mul_mat_vec` FFN was ALU-bound on the KT hash decode
+  (~320 GB/s weight reads, well below peak). Replacing the per-round byte sum with one
+  `dot4` (`dotPacked4x8EXT`) cut the fused gate+up from ~441 us to ~258 us and the FFN
+  down from ~237 us to ~138 us per layer, taking decode from ~17.7 to ~27 tok/s. The
+  activation dot is still scalar FMA; quantizing the activations to Q8_1 (like CUDA's
+  `vec_dot_iq4_kt_q8_1`) would let that use `dot4` too and should close the remaining gap.
+- **Prompt** (3x gap): prompt processing takes the mat-mat path for IQK/KT types, which
+  dequantizes each weight matrix to F16 on the GPU and runs the F16 matmul (~4.4 ms per
+  FFN matmul: ~1.5 ms dequant + ~2.9 ms tensor-core matmul). CUDA has a native quantized
+  matmul (`mmq`) that reads the quantized weights once. Two approaches were explored for
+  adding one to Vulkan:
+  * **The SIMT dot4 mmq (`mul_mmq.comp` with Q8_1 activations)** works for the 10 IQK/KT
+    row-meta types (their dequant scale varies per 32-element group, which fits the mmq's
+    per-chunk scale) — the hash decode runs in the tile loader with `dot4`, like CUDA's
+    `load_tiles_iq4_kt`. But on this NVIDIA part it is *not* faster than the dequant+F16
+    path (q4_0's SIMT mmq is also ~4.6 ms there; only q8_0's 8-bit variant is fast at
+    ~0.85 ms), so it was not wired up. It could still be a win on non-tensor-core devices
+    (AMD/Intel), where the F16 matmul has no tensor cores.
+  * **The coopmat2 tensor-core mmq (`mul_mm_cm2.comp`, the fast path for q4_0 at
+    ~1.26 ms)** cannot currently load IQK tiles: `coopMatLoadTensorNV` addresses the A
+    matrix by element stride, but the IQK layout is byte-addressed with per-row scale
+    headers and 256-element blocks of varying byte sizes. Reworking the cm2 tensor-load to
+    handle byte-addressed IQK rows is the principled fix and should bring the FFN matmul
+    to ~1.5-2 ms (2-3x prompt speedup), but it is a substantial change to the NV
+    cooperative-matrix2 loader.
+- The base IQK types (IQ2_K..IQ6_K) have per-16-element dequant scales, which fit neither
+  the SIMT mmq's per-32-group scale nor a simple cm2 tile without per-16 handling.
 
 An earlier symptom (the model generating "!" repeatedly) was from a pre-fix build (wrong
 `ql`/`qh` offsets and 16-bit reads in the IQ4_KT kernels); the current build generates

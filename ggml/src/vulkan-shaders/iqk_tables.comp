@@ -6,6 +6,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_16bit_storage : require
+#ifdef IQK_USE_DOT4
+#extension GL_EXT_integer_dot_product : require
+#endif
 
 // Byte-addressed weight buffer shared by the IQK/KT dequant and mul_mat_vec shaders
 layout (binding = 0) readonly buffer A {uint8_t data_a[];};
@@ -43,7 +46,12 @@ vec4 iqk_hash_values(inout uint x, bool is_abs, uint sign_mask) {
     [[unroll]] for (int k = 0; k < 4; ++k) {
         x *= 0xCBAC1FEDu;
         const uint s = x & 0x3F3F3F3Fu;
+#ifdef IQK_USE_DOT4
+        // one dot4 replaces the 4-shift + 3-add byte sum
+        float v = float(dotPacked4x8EXT(int(s), 0x01010101) - 126);
+#else
         float v = float(int((s & 0xffu) + ((s >> 8) & 0xffu) + ((s >> 16) & 0xffu) + ((s >> 24) & 0xffu)) - 126);
+#endif
         if (is_abs) v = abs(v);
         if (((sign_mask >> k) & 1u) != 0u) v = -v;
         res[k] = v;
