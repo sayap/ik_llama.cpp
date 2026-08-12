@@ -13,14 +13,40 @@ ik_llama.cpp, what has been fixed, how to get good performance, and what is stil
   followed by the fused activation combine), so dense and MoE FFNs run on the GPU without the
   `-no-fug` / `-no-fmoe` workarounds.
 - The imatrix quant types from the IQK/K-family (`IQ2_K`...`IQ6_K`, `IQ4_KS`, `IQ2_KS`,
-  `IQ4_KSS`, `IQ5_KS`, `IQ3_KS`, `IQ2_KL`) and the KT-family (`IQ1_KT`...`IQ4_KT`) are **not**
-  in the Vulkan backend's `supports_op` list, so models quantized with those types run all
-  their matmuls on CPU. Use a supported type (`Q8_0`, `Q6_K`, `Q4_K`, `Q4_0`, ...) or the
-  CUDA backend.
+  `IQ4_KSS`, `IQ5_KS`, `IQ3_KS`, `IQ2_KL`) and the KT-family (`IQ1_KT`...`IQ4_KT`) are **now
+  supported** by the Vulkan backend (see "What we fixed"): single-token decode runs a native
+  `mul_mat_vec` kernel per type and prompt processing runs a native dequant-to-F16 step followed
+  by the F16 matmul. The `*_R4` repack variants and `Q6_0`, `MXFP4`, `IQ1_BN`, `IQ2_BN` are
+  still not supported and fall back to the CPU backend.
 
 ## What we fixed
 
-### 0. Fused up-gate / MoE fused up-gate (`-fug` / `-fmoe`)
+### 0. IQK / KT quant families (QK_K = 256 imatrix quants)
+
+All 15 base IQK/KT types are now supported by `MUL_MAT`, `MUL_MAT_ID` (vec and mat-mat paths):
+
+- **decode (mul_mat_vec)**: a dedicated GLSL kernel per type (`mul_mat_vec_iq{1,2,3,4,5,6}_k*`,
+  `mul_mat_vec_iq{2,3,4,5}_ks*`, `mul_mat_vec_iq4_kss*`, `mul_mat_vec_iq2_kl*`,
+  `mul_mat_vec_iq{1,2,3,4}_kt*`) that reads the quantized bytes with explicit row/block byte
+  addressing (the KS/KL/KT formats carry a per-row scale header, `row_meta_size` 2 or 4) and
+  dots against the F32/F16 activations.
+- **prompt processing (mul_mat)**: a dequant-to-F16 kernel per type (`dequant_iqX_*`) feeding the
+  existing F16 matmul. The flat dequant shaders are row-meta aware (blocks-per-row and meta size
+  are passed in the push constants) and the dispatch passes the tensor's full byte size (the
+  per-row scale headers must be included in the source subbuffer).
+- The KT-family value decode (`QuantizerIQKT::set_values`, the multiplicative-hash lookup into
+  `iq4k_values`) is implemented in `iqk_hash_values` in `iqk_tables.comp`.
+- `supports_op` accepts the 15 types; `ggml_vk_dim01_contiguous` accounts for `row_meta_size`.
+
+Note on the reference: the CPU backend's own `to_float` and its optimized `iqk_mul_mat` kernels
+use slightly different scale conventions for several of these experimental types (e.g. the
+KT-family calibration factors 1.01/1.05 appear in the vec_dot kernels but not in `to_float`),
+and the CPU quantizer for the meta types has uninitialized-memory reads that depend on heap
+state. The Vulkan kernels follow the CUDA vec_dot convention (the established GPU reference).
+`tests/test-iqk-quants.cpp` validates against the scalar dequant; the KT family is allowed a
+looser tolerance because of the calibration factor.
+
+### 1. Fused up-gate / MoE fused up-gate (`-fug` / `-fmoe`)
 
 `GGML_OP_FUSED_UP_GATE` and `GGML_OP_MOE_FUSED_UP_GATE` are now implemented:
 
@@ -44,7 +70,7 @@ which made the CPU reference compute overflow its work buffer (heap corruption).
 `FUSED_UP_GATE` plan also sized the work buffer from the weights instead of the activations.
 Both now size it from `src[2]` (the activations).
 
-### 1. Synchronization: one wait per graph instead of per batch
+### 2. Synchronization: one wait per graph instead of per batch
 
 The backend waited on a fence at the end of every submitted batch of nodes, using a CPU
 **spin** (`getFenceStatus` polling with `_mm_pause`). This serialized CPU command recording
@@ -67,13 +93,13 @@ intra-graph overlap while guaranteeing the scheduler sees completed results. Thi
 correctness bug in an earlier iteration (fire-and-forget across splits produced garbage
 output).
 
-### 2. Fence mix-up found while debugging a hang
+### 3. Fence mix-up found while debugging a hang
 
 `ggml_vk_wait_for_fence()` spins on `ctx->fence`, but the graph finalization had been
 submitting an empty batch with `ctx->device->fence` — a *different* fence object. The
 result was an infinite spin with an idle GPU. The fix is to use `ctx->fence` consistently.
 
-### 3. Cooperative-matrix assert on coopmat2 GPUs
+### 4. Cooperative-matrix assert on coopmat2 GPUs
 
 `GGML_ASSERT((GGML_KQ_MASK_PAD % rows_cols[0]) == 0)` in the flash-attention shader setup
 crashed on any GPU with `NV_coopmat2` support (e.g. the RTX 3090), in both static and
@@ -81,14 +107,14 @@ dynamic builds. The coopmat2 shaders use clamped tensor layouts and handle the m
 explicitly, so the assert is now relaxed for row granularities larger than
 `GGML_KQ_MASK_PAD`.
 
-### 4. Integrated GPUs are enumerated
+### 5. Integrated GPUs are enumerated
 
 The instance init only added discrete GPUs to `vk_instance.device_indices`. Integrated GPUs
 (e.g. an AMD Strix Halo iGPU) are now included as well, matching upstream llama.cpp. This
 makes a device like the AMD Radeon 8060S show up as `Vulkan1` and selectable via
 `-dev Vulkan1` without `GGML_VK_VISIBLE_DEVICES`.
 
-### 5. `-dev`/`--device` integration
+### 6. `-dev`/`--device` integration
 
 `-dev CUDA0`, `-dev Vulkan1`, `-dev CUDA0,Vulkan1` etc. select devices from the ggml
 backend registry. See `docs/build.md` and the `-dev` commit for details.
@@ -164,20 +190,15 @@ To close the remaining gaps, implement the missing ops as Vulkan kernels and ext
 ### Quant type coverage
 
 The Vulkan `MUL_MAT` supports `F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K,
-Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL`.
-Everything else falls back to the CPU backend. The missing types relevant to ik_llama
-imatrix quants (all supported by the CUDA backend) are:
+Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL` plus
+the full **IQK/K-family** (`IQ2_K, IQ3_K, IQ4_K, IQ5_K, IQ6_K, IQ2_KS, IQ3_KS, IQ4_KS, IQ4_KSS,
+IQ5_KS, IQ2_KL`) and **KT-family** (`IQ1_KT, IQ2_KT, IQ3_KT, IQ4_KT`). The decode path uses
+native per-type `mul_mat_vec` kernels; prompt processing dequantizes to F16 on the GPU and uses
+the F16 matmul (correct, and on-GPU, but not as fast as a native quantized matmul kernel).
 
-- the **IQK / K-family** (`QK_K` = 256 block): `IQ2_K, IQ3_K, IQ4_K, IQ5_K, IQ6_K,
-  IQ2_KS, IQ3_KS, IQ4_KS, IQ4_KSS, IQ5_KS, IQ2_KL` and the `*_R4` repack variants
-  (`IQ2_K_R4, IQ3_K_R4, IQ4_K_R4, IQ5_K_R4, IQ4_KS_R4, IQ5_KS_R4`);
-- the **KT-family**: `IQ1_KT, IQ2_KT, IQ3_KT, IQ4_KT`;
-- others CUDA supports but Vulkan does not: `Q6_0, MXFP4, IQ1_BN, IQ2_BN, IQ1_S_R4,
-  IQ1_M_R4`.
-
-Models using any of those types run all their matmuls on CPU (correct, but slow, and with
-GPU↔CPU copies per split). Adding them requires new dequant/mul_mat shaders and pipeline
-variants for each type.
+The `*_R4` repack variants (`IQ2_K_R4, IQ3_K_R4, IQ4_K_R4, IQ5_K_R4, IQ4_KS_R4, IQ5_KS_R4`)
+and the remaining CUDA-supported types (`Q6_0, MXFP4, IQ1_BN, IQ2_BN, IQ1_S_R4, IQ1_M_R4`)
+are still not supported and run their matmuls on CPU.
 
 ### Performance / architecture
 
@@ -208,4 +229,9 @@ variants for each type.
   Run as `test-fused-up-gate CPU|Vulkan0|CUDA0`. Note that the IQ4_XS CPU-vs-GPU comparison
   has a large pre-existing gap (visible even in plain `MUL_MAT`), so that type is allowed a
   looser tolerance.
+- `tests/test-iqk-quants.cpp` validates the 15 IQK/KT types against the scalar dequant
+  reference (the format definition): single-token decode, small batches, larger K,
+  multi-token (dequant-to-F16 path) and MoE (`MUL_MAT_ID`). Run as
+  `test-iqk-quants CPU|Vulkan0|CUDA0`. The KT family is allowed a looser tolerance because
+  of its calibration factor (see above).
 - `test-backend-ops` does not currently compile against this fork's headers.

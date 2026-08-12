@@ -210,6 +210,9 @@ llama_target_and_test(test-autorelease.cpp        LABEL "model")
 # fused up-gate / MoE fused up-gate correctness (CPU vs backend comparison)
 llama_build_and_test(test-fused-up-gate.cpp LABEL "main" ARGS Vulkan0)
 
+# IQK / KT quant family correctness (CPU vs backend comparison)
+llama_build_and_test(test-iqk-quants.cpp LABEL "main" ARGS Vulkan0)
+
 
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
