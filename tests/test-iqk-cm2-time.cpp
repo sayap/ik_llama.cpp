@@ -50,9 +50,8 @@ int main(int argc, char ** argv) {
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
-    ggml_backend_graph_compute(backend_tgt, gf);  // warmup (shader compile)
-    ggml_backend_graph_compute(backend_tgt, gf);
-    int reps = 10;
+    for (int i = 0; i < 20; ++i) ggml_backend_graph_compute(backend_tgt, gf);  // warmup (shader compile + clocks)
+    int reps = 50;
     auto t0 = ggml_time_us();
     for (int r = 0; r < reps; ++r) ggml_backend_graph_compute(backend_tgt, gf);
     double ms = (double)(ggml_time_us() - t0) / 1000.0 / reps;
