@@ -147,7 +147,11 @@ static void check_mul_mat(ggml_backend_t backend_tgt, ggml_type type_a,
     for (size_t i = 0; i < got.size(); i++) {
         err = std::max(err, (double)std::abs(got[i] - ref[i]));
     }
-    const double tol = test_tolerance(type_a);
+    // The mat-mat path dequantizes to F16 and accumulates in F16, so the error grows
+    // with the accumulation length k (the vec path accumulates in F32). Scale the
+    // tolerance by k/256 so multi-block rows are not false positives; real bugs
+    // (wrong row/scale addressing) produce errors many orders of magnitude larger.
+    const double tol = test_tolerance(type_a) * std::max(1.0, (double)k / 256.0);
     if (err > tol) {
         fprintf(stderr, "FAIL %s: max abs diff = %g > %g\n", name, err, tol);
         for (size_t i = 0; i < got.size() && i < 16; i++) {
@@ -300,7 +304,8 @@ static void check_mul_mat_id(ggml_backend_t backend_tgt, ggml_type type_a,
     for (size_t i = 0; i < got.size(); i++) {
         err = std::max(err, (double)std::abs(got[i] - ref[i]));
     }
-    const double tol = test_tolerance(type_a);
+    // Same F16-accumulation scaling as check_mul_mat (k/256).
+    const double tol = test_tolerance(type_a) * std::max(1.0, (double)k / 256.0);
     if (err > tol) {
         fprintf(stderr, "FAIL %s: max abs diff = %g > %g\n", name, err, tol);
         for (size_t i = 0; i < got.size() && i < 16; i++) {
@@ -346,12 +351,16 @@ int main(int argc, char ** argv) {
         check_mul_mat(backend_tgt, type_a, 256, 512, 5);
         // larger K
         check_mul_mat(backend_tgt, type_a, 4096, 128, 1);
-        // multi-token (mat-mat path)
+        // multi-token (mat-mat path), single and multi-block rows (the dequant-to-F16
+        // kernels read the per-row scale header from the row start; k > 256 exercises
+        // the multi-block path that a single block never covers)
         check_mul_mat(backend_tgt, type_a, 256, 128, 32);
+        check_mul_mat(backend_tgt, type_a, 4096, 64, 16);
 
         // MoE single-token (vec-id path) and multi-token (mat-mat-id path)
         check_mul_mat_id(backend_tgt, type_a, 4, 2, 256, 256, 1);
         check_mul_mat_id(backend_tgt, type_a, 4, 2, 256, 256, 8);
+        check_mul_mat_id(backend_tgt, type_a, 4, 2, 256, 1024, 8);
 
         // GET_ROWS (quantized token embeddings): row lookup by id
         check_get_rows(backend_tgt, type_a, 256, 512, 17);
