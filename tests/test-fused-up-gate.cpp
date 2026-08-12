@@ -195,7 +195,8 @@ static void test_dense(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt,
     const bool cpu_ok = test_cpu_reference_ok(type_a);
     const double cpu_tol = type_a == GGML_TYPE_IQ4_XS ? 5.0 : 0.2; // f16acc precision (GPU dependent)
     if (cpu_ok) {
-        check(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, std::max(cpu_tol, test_iqk_tolerance(type_a)));
+        // The CPU-vs-target diff grows with the F16 accumulation length k, so scale by k/256
+        check(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, std::max(cpu_tol, test_iqk_tolerance(type_a)) * std::max(1.0, (double)k / 256.0));
     } else {
         ggml_cgraph * gf_tgt = ggml_new_graph(ctx_tgt);
         ggml_build_forward_expand(gf_tgt, out_t);
@@ -319,7 +320,8 @@ static void test_moe(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt,
     const bool cpu_ok = test_cpu_reference_ok(type_a);
     const double cpu_tol = type_a == GGML_TYPE_IQ4_XS ? 5.0 : 0.2; // f16acc precision (GPU dependent)
     if (cpu_ok) {
-        check(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, std::max(cpu_tol, test_iqk_tolerance(type_a)));
+        // The CPU-vs-target diff grows with the F16 accumulation length k, so scale by k/256
+        check(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, std::max(cpu_tol, test_iqk_tolerance(type_a)) * std::max(1.0, (double)k / 256.0));
     } else {
         ggml_cgraph * gf_tgt = ggml_new_graph(ctx_tgt);
         ggml_build_forward_expand(gf_tgt, out_t);
@@ -456,6 +458,9 @@ int main(int argc, char ** argv) {
     for (ggml_type type_a : types_iqk) {
         test_dense(backend_cpu, backend_tgt, type_a, 256, 512, 1, GGML_UNARY_OP_SILU);
         test_dense(backend_cpu, backend_tgt, type_a, 256, 512, 7, GGML_UNARY_OP_SILU);
+        // multi-block rows (k > 256) + mat-mat path (n > mul_mat_vec_max_cols = 8)
+        test_dense(backend_cpu, backend_tgt, type_a, 1024, 256, 9, GGML_UNARY_OP_SILU);
+        test_dense(backend_cpu, backend_tgt, type_a, 1024, 256, 1, GGML_UNARY_OP_SILU);
     }
 
     // MoE: fused and separate weights, with and without bias, single and multi token

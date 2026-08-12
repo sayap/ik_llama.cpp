@@ -268,6 +268,15 @@ out to be neither of the initially suspected GPU kernel costs:
   matching the pipeline denom, instead of 256 which under-launched for `k > 1024`) and
   the per-row scale header read (`block_byte - META` is only the row start for block 0;
   the header is now read from the explicit row byte offset).
+- **The dequant-to-F16 mat-mat kernels read the per-row scale header at
+  `block_byte - row_meta_size`, which is only the row start for block 0.** This silently
+  corrupted weights for any row with more than one 256-element block (`k > 256`), i.e.
+  every prompt with more than `mul_mat_vec_max_cols` (8) tokens: prompt processing takes
+  the mat-mat path (`dequant` + F16 matmul), and the FFN/output dequant produced garbage
+  logits — the model degenerated to repeating "!". Fixed in the 7 affected dequant
+  shaders (`iq1_kt`, `iq2_kt`, `iq3_kt`, `iq4_ks`, `iq4_kss`, `iq4_kt`, `iq5_ks`) by
+  reading the header from the row start (`row_bytes * (ib / nbpb)`). The vec
+  (`mul_mat_vec`) and `GET_ROWS` paths were unaffected (they already used the row start).
 
 After the fix, decode runs at ~17 tok/s and prompt processing at ~41 tok/s on the same
 machine — a ~28x / ~19x speedup — with the GPU doing the FFN work (the earlier ~80% GPU
