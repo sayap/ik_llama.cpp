@@ -510,14 +510,22 @@ void process_shaders() {
         }
     }
 
-    // IQK / KT quant families: mul_mat_vec (f32/f16 activations + MoE id) and dequant shaders
+    // IQK / KT quant families: mul_mat_vec (f32/f16 activations + MoE id) and dequant shaders.
+    // The hash byte-sum can use a hardware dot4 (GL_EXT_integer_dot_product): the _dot4
+    // variants are selected at runtime when the device has the extension.
     for (const auto& tname : iqk_type_names) {
         const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
         const std::string shader = "mul_mat_vec_" + tname + ".comp";
 
-        string_to_spv("mul_mat_vec_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}));
-        string_to_spv("mul_mat_vec_" + tname + "_f16_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}}));
-        string_to_spv("mul_mat_vec_id_" + tname + "_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}));
+        string_to_spv("mul_mat_vec_" + tname + "_f32_f32", shader, {{"FLOAT_TYPE", "float"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}, true, false, false, false);
+        string_to_spv("mul_mat_vec_" + tname + "_f16_f32", shader, {{"FLOAT_TYPE", "float"}, {data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}}, true, false, false, false);
+        string_to_spv("mul_mat_vec_id_" + tname + "_f32", shader, {{"FLOAT_TYPE", "float"}, {"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}, true, false, false, false);
+
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+        string_to_spv("mul_mat_vec_" + tname + "_f32_f32_dot4", shader, {{"FLOAT_TYPE", "float"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}, {"IQK_USE_DOT4", "1"}}, true, false, false, false);
+        string_to_spv("mul_mat_vec_" + tname + "_f16_f32_dot4", shader, {{"FLOAT_TYPE", "float"}, {data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}, {"IQK_USE_DOT4", "1"}}, true, false, false, false);
+        string_to_spv("mul_mat_vec_id_" + tname + "_f32_dot4", shader, {{"FLOAT_TYPE", "float"}, {"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}, {"IQK_USE_DOT4", "1"}}, true, false, false, false);
+#endif
 
         string_to_spv("dequant_" + tname, "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
 

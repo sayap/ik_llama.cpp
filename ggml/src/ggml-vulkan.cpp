@@ -2720,8 +2720,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
         // IQK / KT quant families (QK_K = 256, dequantized in-shader)
 #define CREATE_MMV_IQK(TYPE, NAMELC) \
-        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[TYPE][i], "mul_mat_vec_" #NAMELC "_f32_f32_"+std::to_string(i+1), mul_mat_vec_ ## NAMELC ## _f32_f32_len, mul_mat_vec_ ## NAMELC ## _f32_f32_data, "main", 3, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq, i+1}, 1, true); \
-        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[TYPE][i], "mul_mat_vec_" #NAMELC "_f16_f32_"+std::to_string(i+1), mul_mat_vec_ ## NAMELC ## _f16_f32_len, mul_mat_vec_ ## NAMELC ## _f16_f32_data, "main", 3, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq, i+1}, 1, true);
+        if (device->integer_dot_product) { \
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[TYPE][i], "mul_mat_vec_" #NAMELC "_f32_f32_"+std::to_string(i+1), mul_mat_vec_ ## NAMELC ## _f32_f32_dot4_len, mul_mat_vec_ ## NAMELC ## _f32_f32_dot4_data, "main", 3, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq, i+1}, 1, true); \
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[TYPE][i], "mul_mat_vec_" #NAMELC "_f16_f32_"+std::to_string(i+1), mul_mat_vec_ ## NAMELC ## _f16_f32_dot4_len, mul_mat_vec_ ## NAMELC ## _f16_f32_dot4_data, "main", 3, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq, i+1}, 1, true); \
+        } else { \
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[TYPE][i], "mul_mat_vec_" #NAMELC "_f32_f32_"+std::to_string(i+1), mul_mat_vec_ ## NAMELC ## _f32_f32_len, mul_mat_vec_ ## NAMELC ## _f32_f32_data, "main", 3, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq, i+1}, 1, true); \
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[TYPE][i], "mul_mat_vec_" #NAMELC "_f16_f32_"+std::to_string(i+1), mul_mat_vec_ ## NAMELC ## _f16_f32_len, mul_mat_vec_ ## NAMELC ## _f16_f32_data, "main", 3, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq, i+1}, 1, true); \
+        }
         CREATE_MMV_IQK(GGML_TYPE_IQ2_K, iq2_k)
         CREATE_MMV_IQK(GGML_TYPE_IQ3_K, iq3_k)
         CREATE_MMV_IQK(GGML_TYPE_IQ4_K, iq4_k)
@@ -2763,9 +2768,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[GGML_TYPE_IQ4_XS],  "mul_mat_vec_id_iq4_xs_f32",  mul_mat_vec_id_iq4_xs_f32_len,  mul_mat_vec_id_iq4_xs_f32_data,  "main", 4, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[GGML_TYPE_IQ4_NL],  "mul_mat_vec_id_iq4_nl_f32",  mul_mat_vec_id_iq4_nl_f32_len,  mul_mat_vec_id_iq4_nl_f32_data,  "main", 4, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq}, 1, true);
 
-    // IQK / KT quant families
+    // IQK / KT quant families (dot4 hash decode when the device has the extension)
 #define CREATE_MMV_ID_IQK(TYPE, NAMELC) \
-    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[TYPE], "mul_mat_vec_id_" #NAMELC "_f32", mul_mat_vec_id_ ## NAMELC ## _f32_len, mul_mat_vec_id_ ## NAMELC ## _f32_data, "main", 4, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq}, 1, true);
+    if (device->integer_dot_product) { \
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[TYPE], "mul_mat_vec_id_" #NAMELC "_f32", mul_mat_vec_id_ ## NAMELC ## _f32_dot4_len, mul_mat_vec_id_ ## NAMELC ## _f32_dot4_data, "main", 4, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq}, 1, true); \
+    } else { \
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[TYPE], "mul_mat_vec_id_" #NAMELC "_f32", mul_mat_vec_id_ ## NAMELC ## _f32_len, mul_mat_vec_id_ ## NAMELC ## _f32_data, "main", 4, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq}, 1, true); \
+    }
     CREATE_MMV_ID_IQK(GGML_TYPE_IQ2_K, iq2_k)
     CREATE_MMV_ID_IQK(GGML_TYPE_IQ3_K, iq3_k)
     CREATE_MMV_ID_IQK(GGML_TYPE_IQ4_K, iq4_k)
