@@ -34,10 +34,13 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -0.5f, float m
         ggml_backend_tensor_set(tensor, datab.data(), 0, size * sizeof(ggml_bf16_t));
     } else if (ggml_is_quantized(tensor->type)) {
         GGML_ASSERT(size % ggml_blck_size(tensor->type) == 0);
-        std::vector<uint8_t> dataq(ggml_row_size(tensor->type, size));
+        // rows may carry a per-row scale header (row_meta_size), so the total size is
+        // nrows * row_size(ne0), not ggml_row_size(type, nelements)
+        const size_t nrows = size / tensor->ne[0];
+        std::vector<uint8_t> dataq(nrows * ggml_row_size(tensor->type, tensor->ne[0]));
         std::vector<float> imatrix(tensor->ne[0], 1.0f);
         struct quantize_user_data qdata = { false, false };
-        ggml_quantize_chunk(tensor->type, data.data(), dataq.data(), 0, size/tensor->ne[0], tensor->ne[0], imatrix.data(), &qdata);
+        ggml_quantize_chunk(tensor->type, data.data(), dataq.data(), 0, nrows, tensor->ne[0], imatrix.data(), &qdata);
         ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
     } else {
         GGML_ABORT("unsupported test type");
@@ -64,6 +67,45 @@ static double max_abs_diff(const float * a, const float * b, size_t n) {
 }
 
 static int n_failures = 0;
+
+// The KT-family CPU vec_dot kernels carry a calibration factor (1.01/1.05) that
+// the other paths do not, so the CPU reference diverges for those types (same as
+// in test-iqk-quants).
+static double test_iqk_tolerance(ggml_type type_a) {
+    switch (type_a) {
+        case GGML_TYPE_IQ2_KT:
+        case GGML_TYPE_IQ3_KT:
+            return 5.0;
+        default:
+            return 0.0;
+    }
+}
+
+// The CPU reference is only trustworthy for a subset of the IQK/KT families:
+// - the CPU optimized iqk kernels diverge from the format's scalar dequant for several
+//   experimental types (see docs/Vulkan.md), so the CPU-vs-target comparison is restricted
+//   to the base IQK types (IQ2_K..IQ6_K, row_meta_size = 0) plus the well-established
+//   types; the KS/KL/KT row-meta types are only checked fused-vs-non-fused on the same
+//   target backend
+static bool test_cpu_reference_ok(ggml_type type_a) {
+    switch (type_a) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_IQ2_K:
+        case GGML_TYPE_IQ3_K:
+        case GGML_TYPE_IQ4_K:
+        case GGML_TYPE_IQ5_K:
+        case GGML_TYPE_IQ6_K:
+            return true;
+        default:
+            return false;
+    }
+}
 
 static void check(const char * name, ggml_backend_t backend_cpu, ggml_backend_t backend_tgt,
         ggml_context * ctx_cpu, ggml_context * ctx_tgt, ggml_tensor * out_cpu, ggml_tensor * out_tgt,
@@ -147,8 +189,26 @@ static void test_dense(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt,
         }
     }
 
+    // The CPU-vs-target comparison is only done when the CPU reference is trustworthy for
+    // the type; the fused graph is always computed on the target backend because the
+    // fused-vs-non-fused reference below needs the result.
+    const bool cpu_ok = test_cpu_reference_ok(type_a);
     const double cpu_tol = type_a == GGML_TYPE_IQ4_XS ? 5.0 : 0.2; // f16acc precision (GPU dependent)
-    check(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, cpu_tol);
+    if (cpu_ok) {
+        check(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, std::max(cpu_tol, test_iqk_tolerance(type_a)));
+    } else {
+        ggml_cgraph * gf_tgt = ggml_new_graph(ctx_tgt);
+        ggml_build_forward_expand(gf_tgt, out_t);
+        fprintf(stderr, "[check] computing %s with backend %s\n", name, ggml_backend_name(backend_tgt));
+        fflush(stderr);
+        if (ggml_backend_graph_compute(backend_tgt, gf_tgt) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "FAIL %s: backend compute failed\n", name);
+            n_failures++;
+            ggml_free(ctx_cpu);
+            ggml_free(ctx_tgt);
+            return;
+        }
+    }
 
     // reference: non-fused graph (mul_mat + fused_mul_unary) on the same target backend
     // -> should match the fused result to within ~1e-4 if the fused path is correct
@@ -253,8 +313,26 @@ static void test_moe(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt,
         }
     }
 
+    // The CPU-vs-target comparison is only done when the CPU reference is trustworthy for
+    // the type; the fused graph is always computed on the target backend because the
+    // fused-vs-non-fused reference below needs the result.
+    const bool cpu_ok = test_cpu_reference_ok(type_a);
     const double cpu_tol = type_a == GGML_TYPE_IQ4_XS ? 5.0 : 0.2; // f16acc precision (GPU dependent)
-    check(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, cpu_tol);
+    if (cpu_ok) {
+        check(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, std::max(cpu_tol, test_iqk_tolerance(type_a)));
+    } else {
+        ggml_cgraph * gf_tgt = ggml_new_graph(ctx_tgt);
+        ggml_build_forward_expand(gf_tgt, out_t);
+        fprintf(stderr, "[check] computing %s with backend %s\n", name, ggml_backend_name(backend_tgt));
+        fflush(stderr);
+        if (ggml_backend_graph_compute(backend_tgt, gf_tgt) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "FAIL %s: backend compute failed\n", name);
+            n_failures++;
+            ggml_free(ctx_cpu);
+            ggml_free(ctx_tgt);
+            return;
+        }
+    }
 
     // reference: non-fused graph (mul_mat_id + fused_mul_unary) on the same target backend.
     // Only valid without biases (the reference cannot easily add per-expert biases).
@@ -360,6 +438,13 @@ int main(int argc, char ** argv) {
     printf("target backend: %s\n", ggml_backend_name(backend_tgt));
 
     const ggml_type types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_F16, GGML_TYPE_BF16 };
+    // IQK/KT (QK_K = 256) families: exercised via the vec (mul_mat_vec) path for single
+    // token and the dequant-to-F16 path for batches
+    const ggml_type types_iqk[] = {
+        GGML_TYPE_IQ2_K, GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_K, GGML_TYPE_IQ5_K, GGML_TYPE_IQ6_K,
+        GGML_TYPE_IQ2_KS, GGML_TYPE_IQ3_KS, GGML_TYPE_IQ4_KS, GGML_TYPE_IQ4_KSS, GGML_TYPE_IQ5_KS,
+        GGML_TYPE_IQ2_KL, GGML_TYPE_IQ1_KT, GGML_TYPE_IQ2_KT, GGML_TYPE_IQ3_KT, GGML_TYPE_IQ4_KT,
+    };
 
     // dense: single-token decode and small batches
     for (ggml_type type_a : types) {
@@ -367,6 +452,10 @@ int main(int argc, char ** argv) {
             test_dense(backend_cpu, backend_tgt, type_a, 256, 512, 1, op);
             test_dense(backend_cpu, backend_tgt, type_a, 256, 512, 7, op);
         }
+    }
+    for (ggml_type type_a : types_iqk) {
+        test_dense(backend_cpu, backend_tgt, type_a, 256, 512, 1, GGML_UNARY_OP_SILU);
+        test_dense(backend_cpu, backend_tgt, type_a, 256, 512, 7, GGML_UNARY_OP_SILU);
     }
 
     // MoE: fused and separate weights, with and without bias, single and multi token
@@ -378,6 +467,12 @@ int main(int argc, char ** argv) {
                     test_moe(backend_cpu, backend_tgt, type_a, 8, 2, 256, 256, 5, fused, bias, op);
                 }
             }
+        }
+    }
+    for (ggml_type type_a : types_iqk) {
+        for (bool fused : { true, false }) {
+            test_moe(backend_cpu, backend_tgt, type_a, 8, 2, 256, 256, 1, fused, false, GGML_UNARY_OP_SILU);
+            test_moe(backend_cpu, backend_tgt, type_a, 8, 2, 256, 256, 5, fused, false, GGML_UNARY_OP_SILU);
         }
     }
 

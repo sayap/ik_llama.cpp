@@ -161,6 +161,76 @@ static void check_mul_mat(ggml_backend_t backend_tgt, ggml_type type_a,
     ggml_free(ctx);
 }
 
+static void check_get_rows(ggml_backend_t backend_tgt, ggml_type type_a, int64_t k, int64_t m, int64_t n) {
+    char name[256];
+    snprintf(name, sizeof(name), "get_rows %s k=%ld m=%ld n=%ld",
+            ggml_type_name(type_a), (long)k, (long)m, (long)n);
+
+    ggml_init_params params = { ggml_tensor_overhead()*16 + ggml_graph_overhead(), NULL, true };
+    ggml_context * ctx = ggml_init(params);
+
+    ggml_tensor * a   = ggml_new_tensor_2d(ctx, type_a, k, m);
+    ggml_set_name(a, "a");
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n, 1);
+    ggml_set_name(ids, "ids");
+    ggml_tensor * out = ggml_get_rows(ctx, a, ids);
+
+    ggml_backend_alloc_ctx_tensors(ctx, backend_tgt);
+
+    std::vector<float> a_f32;
+    init_tensor_quantized(a, a_f32);
+
+    // random row ids (may repeat), all in range
+    std::random_device rd;
+    std::default_random_engine rng(rd());
+    std::vector<int32_t> ids_data(n);
+    for (int64_t i = 0; i < n; i++) ids_data[i] = (int32_t)(rng() % (uint32_t)m);
+    ggml_backend_tensor_set(ids, ids_data.data(), 0, n * sizeof(int32_t));
+
+    // reference: out[:, i] = dequant(a)[:, ids[i]]
+    const size_t a_size = m * ggml_row_size(type_a, k);
+    std::vector<uint8_t> q(a_size);
+    ggml_backend_tensor_get(a, q.data(), 0, a_size);
+    const ggml_type_traits_t traits = ggml_internal_get_type_traits(type_a);
+    std::vector<float> row(k);
+    std::vector<float> ref(k * n);
+    for (int64_t i = 0; i < n; i++) {
+        traits.to_float(q.data() + ids_data[i] * ggml_row_size(type_a, k), row.data(), k);
+        for (int64_t j = 0; j < k; j++) ref[j + i * k] = row[j];
+    }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    if (ggml_backend_graph_compute(backend_tgt, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "FAIL %s: backend compute failed\n", name);
+        n_failures++;
+        ggml_free(ctx);
+        return;
+    }
+
+    // dst is F32 for this test graph; the backend may also emit F16, but get_rows
+    // on the CPU/GPU backends produces F32 for an F32 dst
+    std::vector<float> got(k * n);
+    ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(float));
+
+    double err = 0.0;
+    for (size_t i = 0; i < got.size(); i++) {
+        err = std::max(err, (double)std::abs(got[i] - ref[i]));
+    }
+    const double tol = std::max(0.05, test_tolerance(type_a)); // dequant accuracy only, no accumulation
+    if (err > tol) {
+        fprintf(stderr, "FAIL %s: max abs diff = %g > %g\n", name, err, tol);
+        for (size_t i = 0; i < got.size() && i < 16; i++) {
+            fprintf(stderr, "  [%zu] ref=%g tgt=%g\n", i, ref[i], got[i]);
+        }
+        n_failures++;
+    } else {
+        printf("OK   %s (max abs diff = %g)\n", name, err);
+    }
+    fflush(stdout);
+    ggml_free(ctx);
+}
+
 static void check_mul_mat_id(ggml_backend_t backend_tgt, ggml_type type_a,
         int n_mats, int n_used, int64_t m, int64_t k, int64_t n_tokens) {
     char name[256];
@@ -282,6 +352,10 @@ int main(int argc, char ** argv) {
         // MoE single-token (vec-id path) and multi-token (mat-mat-id path)
         check_mul_mat_id(backend_tgt, type_a, 4, 2, 256, 256, 1);
         check_mul_mat_id(backend_tgt, type_a, 4, 2, 256, 256, 8);
+
+        // GET_ROWS (quantized token embeddings): row lookup by id
+        check_get_rows(backend_tgt, type_a, 256, 512, 17);
+        check_get_rows(backend_tgt, type_a, 4096, 128, 5);
     }
 
     printf("%s: %d failures\n", tgt_name, n_failures);

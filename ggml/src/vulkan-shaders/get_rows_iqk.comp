@@ -1,0 +1,374 @@
+// GET_ROWS for the IQK / KT quant families. Rows carry an optional per-row
+// scale header (row_meta_size), so the src0 strides in the push constants are
+// BYTES for these types (ggml_vk_get_rows passes nb0..nb3 directly).
+//
+// Each thread dequantizes one element of the selected row and writes it out
+// (F16 or F32, D_TYPE). The workgroup size matches the pipeline's
+// elements-per-workgroup denom (1024): one thread per element.
+
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+
+#include "types.comp"
+#include "iqk_tables.comp"
+
+layout (push_constant) uniform parameter
+{
+    uint ne;
+    uint ne00; uint ne01; uint ne02; uint ne03; uint nb00; uint nb01; uint nb02; uint nb03;
+    uint ne10; uint ne11; uint ne12; uint ne13; uint nb10; uint nb11; uint nb12; uint nb13;
+    uint ne20; uint ne21; uint ne22; uint ne23; uint nb20; uint nb21; uint nb22; uint nb23;
+    uint misalign_offsets;
+    float param1; float param2; int param3;
+} p;
+
+layout (binding = 1) readonly buffer B {int data_b[];};
+layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+
+// ---- per-type element dequant -------------------------------------------
+
+#if defined(DATA_A_IQ2_K)
+#define BLOCK_BYTES 76
+#define META 0
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib32 = e / 32;
+    const uint j = e % 16;
+    const uint h = (e / 16) % 2;
+    const uint shift = 2 * (ib32 % 4);
+    const uint extra = iqk_load_u16(block_byte + 2);
+    const uint e_shift = extra >> (2 * ib32);
+    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+    const uint sc = data_a[block_byte + 4 + ib32];
+    const float dl = d * (float((sc >> (4 * h)) & 0xFu) - 8.0f);
+    const uint voff = ((h == 0 ? (e_shift & 1u) : (e_shift & 2u)) != 0) ? 4 : 0;
+    const uint qs = data_a[block_byte + 12 + (ib32 / 4) * 32 + h * 16 + j];
+    return dl * float(iq2nl_values[((qs >> shift) & 3) + voff]);
+}
+#elif defined(DATA_A_IQ3_K)
+#define BLOCK_BYTES 110
+#define META 0
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib32 = e / 32;
+    const uint j = e % 16;
+    const uint h = (e / 16) % 2;
+    const uint shift_l = 2 * (ib32 % 4);
+    const uint shift_h = ib32 % 8;
+    const uint extra = iqk_load_u16(block_byte + 2);
+    const uint sh = iqk_load_u16(block_byte + 4);
+    const uint e_shift = extra >> (2 * ib32);
+    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+    const uint sc = data_a[block_byte + 6 + ib32];
+    const float dl = d * (2.0f * float((sc >> (4 * h)) & 0xFu) + 1.0f) * (((sh >> (2 * ib32 + h)) & 1u) != 0 ? -1.0f : 1.0f);
+    const uint voff = ((h == 0 ? (e_shift & 1u) : (e_shift & 2u)) != 0) ? 8 : 0;
+    const uint q = (data_a[block_byte + 14 + (ib32 / 4) * 32 + h * 16 + j] >> shift_l) & 3u;
+    const uint hb = (data_a[block_byte + 78 + h * 16 + j] >> shift_h) & 1u;
+    return dl * float(iq3nl_values[(q | (hb << 2)) + voff]);
+}
+#elif defined(DATA_A_IQ4_K)
+#define BLOCK_BYTES 144
+#define META 0
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib32 = e / 32;
+    const uint j = e % 16;
+    const uint h = (e / 16) % 2;
+    const uint extra = iqk_load_u16(block_byte + 2);
+    const uint e_shift = extra >> (2 * ib32);
+    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+    const uint sh = data_a[block_byte + 4 + ib32 / 2] >> (4 * (ib32 % 2));
+    const uint sc = data_a[block_byte + 8 + ib32];
+    const float dl = d * (float(((sc >> (4 * h)) & 0xFu) | ((sh << (4 - 2 * h)) & 0x30u)) - 32.0f);
+    const uint voff = ((h == 0 ? (e_shift & 1u) : (e_shift & 2u)) != 0) ? 16 : 0;
+    const uint q = data_a[block_byte + 16 + 16 * ib32 + j];
+    return dl * float(iq4k_values[(h == 0 ? (q & 0xFu) : (q >> 4)) + voff]);
+}
+#elif defined(DATA_A_IQ5_K)
+#define BLOCK_BYTES 176
+#define META 0
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib64 = e / 64;
+    const uint j = e % 16;
+    const uint part = (e / 16) % 4;
+    const uint shift = 2 * ib64;
+    const uint extra = iqk_load_u16(block_byte + 2);
+    const uint e_shift = extra >> (4 * ib64);
+    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+    const uint sh = data_a[block_byte + 4 + ib64];
+    float dl;
+    uint v_off;
+    uint qs_off;
+    if (part < 2) {
+        const uint sl = data_a[block_byte + 8 + 2 * ib64];
+        dl = d * (float(((sl >> (4 * part)) & 0xFu) | ((sh << (4 - 2 * part)) & 0x30u)) - 32.0f);
+        v_off = ((e_shift & (1u << part)) != 0) ? 32 : 0;
+        qs_off = 16 + 32 * ib64 + 16 * (part & 1);
+    } else {
+        const uint sl = data_a[block_byte + 8 + 2 * ib64 + 1];
+        dl = d * (float(((sl >> (4 * (part - 2))) & 0xFu) | ((sh >> (2 * (part - 2))) & 0x30u)) - 32.0f);
+        v_off = ((e_shift & (1u << part)) != 0) ? 32 : 0;
+        qs_off = 16 + 32 * ib64 + 16 * (part & 1);
+    }
+    const uint q = data_a[block_byte + qs_off + j];
+    const uint hb = data_a[block_byte + 144 + 16 * (part & 1) + j];
+    const uint idx = (part < 2)
+        ? ((q & 0xFu) | (((hb >> shift) & 1u) << 4))
+        : ((q >> 4) | (((hb >> shift) & 2u) << 3));
+    return dl * float(iq5nl_values[idx + v_off]);
+}
+#elif defined(DATA_A_IQ6_K)
+#define BLOCK_BYTES 212
+#define META 0
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib64 = e / 64;
+    const uint j = e % 16;
+    const uint part = (e / 16) % 4;
+    const uint shift = 4 * (ib64 % 2);
+    const uint extra = iqk_load_u16(block_byte + 2);
+    const uint e_shift = extra >> (4 * ib64);
+    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+    const float dl = d * float(int8_t(data_a[block_byte + 4 + 4 * ib64 + part]));
+    const uint v_off = ((e_shift & (1u << part)) != 0) ? 64 : 0;
+    const uint q = data_a[block_byte + 20 + 32 * ib64 + 16 * (part & 1) + j];
+    const uint hb = data_a[block_byte + 148 + 32 * (ib64 / 2) + 16 * (part & 1) + j];
+    const uint idx = (part < 2)
+        ? ((q & 0xFu) | (((hb >> shift) & 0x3u) << 4))
+        : ((q >> 4) | (((hb >> shift) & 0xcu) << 2));
+    return dl * float(iq6nl_values[idx + v_off]);
+}
+#elif defined(DATA_A_IQ2_KS)
+#define BLOCK_BYTES 70
+#define META 2
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib64 = e / 64;
+    const uint j = e % 32;
+    const uint part = (e / 32) % 2;
+    const uint shift = 4 * (ib64 % 2);
+    const uint extra = iqk_load_u16(block_byte);
+    const uint e_shift = extra >> (2 * ib64);
+    const float d = iqk_f16_to_f32(iqk_load_u16(row_byte));
+    const uint sc = data_a[block_byte + 2 + ib64];
+    const float dl = d * (float(((part == 0 ? (sc & 0xFu) : (sc >> 4)) | ((extra >> (4 + 2 * ib64 + part)) & 0x10u))) - 16.0f);
+    const uint voff = ((part == 0 ? (e_shift & 1u) : (e_shift & 2u)) != 0) ? 4 : 0;
+    const uint q = data_a[block_byte + 6 + 32 * (ib64 / 2) + j];
+    return dl * float(iq2nl_values[((q >> (shift + 2 * part)) & 3) + voff]);
+}
+#elif defined(DATA_A_IQ3_KS)
+#define BLOCK_BYTES 102
+#define META 2
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint k = e / 32;
+    const uint j = e % 32;
+    const uint extra = iqk_load_u16(block_byte);
+    const float d = iqk_f16_to_f32(iqk_load_u16(row_byte));
+    const uint sc = data_a[block_byte + 2 + k % 4];
+    const float dl = d * (float(((sc >> (4 * (k / 4))) & 0xFu) | (((extra >> k) & 1u) << 4)) - 16.0f);
+    const uint v_off = ((extra >> (8 + k)) & 1u) != 0 ? 8 : 0;
+    const uint q = data_a[block_byte + 6 + 32 * (k / 4) + j];
+    const uint hb = data_a[block_byte + 70 + j];
+    const uint idx = ((q >> (2 * (k % 4))) & 3u) | (((hb >> k) & 1u) << 2);
+    return dl * float(iq3nl_values[idx + v_off]);
+}
+#elif defined(DATA_A_IQ4_KS)
+#define BLOCK_BYTES 136
+#define META 4
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib32 = e / 32;
+    const uint j = e % 16;
+    const uint h = (e / 16) % 2;
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    const uint sc = data_a[block_byte + ib32];
+    const float dl = d * (float(sc & 254u) - 127.0f);
+    const uint v_off = (sc & 1u) != 0 ? 16 : 0;
+    const uint q = data_a[block_byte + 8 + 16 * ib32 + j];
+    return dl * float(iq4k_values[(h == 0 ? (q & 0xFu) : (q >> 4)) + v_off]);
+}
+#elif defined(DATA_A_IQ4_KSS)
+#define BLOCK_BYTES 128
+#define META 4
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib32 = e / 32;
+    const uint j = e % 16;
+    const uint h = (e / 16) % 2;
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    uint ls = 0;
+    uint aux16[8];
+    const uint qs16_off = 16 * ib32;
+    for (uint k = 0; k < 8; ++k) {
+        const uint q16 = iqk_load_u16(block_byte + qs16_off + 2 * k);
+        uint a = q16 & 0xfffeu;
+        a ^= a >> 1;
+        aux16[k] = a;
+        ls |= (q16 & 1u) << k;
+    }
+    const float dl = d * (float(ls & 254u) - 127.0f);
+    const uint v_off = (ls & 1u) != 0 ? 16 : 0;
+    const uint a8 = (aux16[j / 2] >> (8 * (j & 1))) & 0xffu;
+    return dl * float(iq4k_values[(h == 0 ? (a8 & 0xFu) : (a8 >> 4)) + v_off]);
+}
+#elif defined(DATA_A_IQ5_KS)
+#define BLOCK_BYTES 168
+#define META 4
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib64 = e / 64;
+    const uint j = e % 32;
+    const uint part = (e / 32) % 2;
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    const uint sc = data_a[block_byte + 2 * ib64 + part];
+    const float dl = d * (float(sc & 254u) - 127.0f);
+    const uint v_off = (sc & 1u) != 0 ? 32 : 0;
+    const uint sft_h = 2 * ib64 + part;
+    const uint q = data_a[block_byte + 8 + 32 * ib64 + j];
+    const uint hb = data_a[block_byte + 136 + j];
+    const uint idx = (part == 0)
+        ? ((q & 0xFu) | (((hb >> sft_h) & 1u) << 4))
+        : ((q >> 4) | (((hb >> sft_h) & 1u) << 4));
+    return dl * float(iq5nl_values[idx + v_off]);
+}
+#elif defined(DATA_A_IQ2_KL)
+#define BLOCK_BYTES 86
+#define META 2
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib64 = e / 64;
+    const uint j = e % 16;
+    const uint part = (e / 32) % 2;
+    const uint m = e % 2;
+    const uint jj = (e % 32) / 2;
+    const float d = iqk_f16_to_f32(iqk_load_u16(row_byte));
+    const uint scales_h = iqk_load_u16(block_byte);
+    const uint sc = data_a[block_byte + 2 + (2 * ib64 + part) % 4];
+    const float dl = d * (float(((sc >> (4 * (ib64 / 2))) & 0xFu) | (((scales_h >> (4 * ib64 + 2 * part)) & 3u) << 4)) - 32.0f);
+    const uint sft_h = 2 * ib64 + part;
+    const uint q = data_a[block_byte + 6 + 16 * ib64 + jj];
+    const uint hb = data_a[block_byte + 70 + jj];
+    const uint idx = (part == 0)
+        ? ((q & 0xFu) | (((hb >> sft_h) & 1u) << 4))
+        : ((q >> 4) | (((hb >> sft_h) & 1u) << 4));
+    const uint v = iq2kl_values[idx];
+    return dl * float(int8_t(m == 0 ? (v & 0xffu) : (v >> 8)));
+}
+#elif defined(DATA_A_IQ1_KT)
+#define BLOCK_BYTES 56
+#define META 4
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib32 = e / 32;
+    const uint j = (e % 32) / 8;
+    const uint k = e % 8;
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    const uint sh_byte = data_a[block_byte + ib32];
+    const float dl = d * float(iq4k_values[sh_byte & 0xFu]);
+    const uint ql_off = 8 + 4 * ib32;
+    const uint qh_off = 40 + 4 * (ib32 % 4);
+    const uint sh_shift = 8 - 4 * (ib32 / 4);
+    uint x = uint(data_a[block_byte + ql_off + j])
+           + 4096u
+           + ((uint(data_a[block_byte + qh_off + j]) << sh_shift) & 0xf00u)
+           + ((sh_byte << (8 - j)) & 0x1000u);
+    // the k-th value of the 8-value group
+    for (uint r = 0; r <= k; ++r) {
+        x *= 0xCBAC1FEDu;
+    }
+    const uint s = x & 0x3F3F3F3Fu;
+    return dl * float(int((s & 0xffu) + ((s >> 8) & 0xffu) + ((s >> 16) & 0xffu) + ((s >> 24) & 0xffu)) - 126);
+}
+#elif defined(DATA_A_IQ2_KT)
+#define BLOCK_BYTES 68
+#define META 4
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib32 = e / 32;
+    const uint j = (e % 32) / 8;
+    const uint k = e % 8;
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    const uint sc = data_a[block_byte + ib32 % 4] >> (4 * (ib32 / 4));
+    const float dl = d * 1.05f * float(iq4k_values[sc & 0xFu]);
+    const uint ql_off = 4 + 8 * ib32;
+    uint x = iqk_load_u16(block_byte + ql_off + 2 * j) + 4096u;
+    for (uint r = 0; r <= k; ++r) {
+        x *= 0xCBAC1FEDu;
+    }
+    const uint s = x & 0x3F3F3F3Fu;
+    return dl * float(int((s & 0xffu) + ((s >> 8) & 0xffu) + ((s >> 16) & 0xffu) + ((s >> 24) & 0xffu)) - 126);
+}
+#elif defined(DATA_A_IQ3_KT)
+#define BLOCK_BYTES 100
+#define META 4
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib32 = e / 32;
+    const uint j = (e % 32) / 8;
+    const uint k = e % 8;
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    const uint sc = data_a[block_byte + ib32 % 4] >> (4 * (ib32 / 4));
+    const float dl = d * 1.01f * float(sc & 0xFu);
+    const uint ql_off = 4 + 8 * ib32;
+    uint x = iqk_load_u16(block_byte + ql_off + 2 * j) + 4096u;
+    for (uint r = 0; r <= k; ++r) {
+        x *= 0xCBAC1FEDu;
+    }
+    const uint s = x & 0x3F3F3F3Fu;
+    float v = float(int((s & 0xffu) + ((s >> 8) & 0xffu) + ((s >> 16) & 0xffu) + ((s >> 24) & 0xffu)) - 126);
+    v = v < 0 ? -v : v;
+    const uint hb = data_a[block_byte + 68 + 8 * j + k];
+    if (((hb >> ib32) & 1u) != 0) v = -v;
+    return dl * v;
+}
+#elif defined(DATA_A_IQ4_KT)
+#define BLOCK_BYTES 128
+#define META 4
+#define QUANT_K 256
+float dequant_element(uint block_byte, uint row_byte, uint e) {
+    const uint ib32 = e / 32;
+    const uint j = (e % 32) / 4;
+    const uint k = e % 4;
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    const uint qs32 = iqk_load_u32(block_byte + 4 * ib32);
+    const float dl = d * (float((qs32 & 0xffu) >> 1) - 64.0f);
+    const uint idx0 = ((qs32 & 1u) << 15) + 4096u;
+    const uint sh = qs32 >> (8 + 3 * j);
+    const uint ql_off = 32 + 8 * ib32;
+    const uint qh_off = 96 + 8 * (ib32 % 4);
+    const uint sh_shift = 8 - 4 * (ib32 / 4);
+    uint x = uint(data_a[block_byte + ql_off + j])
+           + ((uint(data_a[block_byte + qh_off + j]) << sh_shift) & 0xf00u)
+           + ((sh & 7u) << 12)
+           + idx0;
+    for (uint r = 0; r <= k; ++r) {
+        x *= 0xCBAC1FEDu;
+    }
+    const uint s = x & 0x3F3F3F3Fu;
+    return dl * float(int((s & 0xffu) + ((s >> 8) & 0xffu) + ((s >> 16) & 0xffu) + ((s >> 24) & 0xffu)) - 126);
+}
+#endif
+
+void main() {
+    const uint i00 = gl_GlobalInvocationID.x;
+    const uint i10 = gl_GlobalInvocationID.y;
+    const uint i11 = gl_GlobalInvocationID.z / p.ne12;
+    const uint i12 = gl_GlobalInvocationID.z % p.ne12;
+
+    if (i00 >= p.ne00) {
+        return;
+    }
+
+    const uint i01 = uint(data_b[i10*p.nb10 + i11*p.nb11 + i12*p.nb12]);
+    const uint row_byte = i01*p.nb01 + i11*p.nb02 + i12*p.nb03;
+    const uint a_byte = row_byte + META + (i00 / QUANT_K) * BLOCK_BYTES;
+    const uint d_offset = i10*p.nb21 + i11*p.nb22 + i12*p.nb23;
+
+    data_d[d_offset + i00] = D_TYPE(dequant_element(a_byte, row_byte, i00 % QUANT_K));
+}
