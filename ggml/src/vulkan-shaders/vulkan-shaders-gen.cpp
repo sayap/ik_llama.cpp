@@ -274,11 +274,10 @@ void string_to_spv_func(const std::string& _name, const std::string& in_fname, c
         execute_command(command, stdout_str, stderr_str);
         if (!stderr_str.empty()) {
             std::cerr << "cannot compile " << name << "\n\n" << command << "\n\n" << stderr_str << std::endl;
-            return;
+        } else {
+            std::lock_guard<std::mutex> guard(lock);
+            shader_fnames.push_back(std::make_pair(name, out_fname));
         }
-
-        std::lock_guard<std::mutex> guard(lock);
-        shader_fnames.push_back(std::make_pair(name, out_fname));
     } catch (const std::exception& e) {
         std::cerr << "Error executing command for " << name << ": " << e.what() << std::endl;
     }
@@ -411,6 +410,23 @@ void matmul_shaders(bool fp16, bool matmul_id, bool coopmat, bool coopmat2, bool
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
         }
 #endif
+    }
+
+    if (coopmat2 && !matmul_id) {
+        // IQK / KT quant families (QK_K = 256, byte-addressed with per-row META
+        // headers): coopmat2 tensor-core matmul with inline dequant. The A side
+        // is loaded one element at a time through a decode function that computes
+        // the absolute byte address from the push constants; B is F16 (the
+        // activations are converted by the caller). IQK_USE_DOT4 lets the KT hash
+        // byte-sum use one hardware dot4 per element.
+        for (const auto& tname : iqk_type_names) {
+            std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+            // One variant per call: matmul_shaders is invoked twice for coopmat2
+            // (f32acc then f16acc), so the f16acc flag selects which accumulator
+            // variant to emit (the CREATE_MM2 pipelines reference both).
+            string_to_spv(shader_name + "_" + tname + "_f16", source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("f16")}, {data_a_key, "1"}, {"LOAD_VEC_A", "1"}, {"LOAD_VEC_B", "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}, {"IQK_USE_DOT4", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(shader_name + "_" + tname + "_f16_aligned", source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE("f16")}, {data_a_key, "1"}, {"LOAD_VEC_A", load_vec}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"D_TYPE", "float"}, {"ALIGNED", "1"}, {"IQK_USE_DOT4", "1"}}), fp16, coopmat, coopmat2, f16acc);
+        }
     }
 }
 

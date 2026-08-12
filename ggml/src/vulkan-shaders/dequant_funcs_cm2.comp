@@ -697,3 +697,551 @@ float16_t dequantFuncIQ4_NL(const in decodeBufIQ4_NL bl, const in uint blockCoor
 #elif defined(DATA_A_IQ4_NL)
 #define dequantFuncA dequantFuncIQ4_NL
 #endif
+
+// ---------------------------------------------------------------------------
+// IQK (QK_K=256) and KT quant families: coopmat2 inline dequant.
+//
+// The cm2 tensor-core matmul (mul_mm_cm2.comp) loads the A matrix with a
+// decode function per element. These formats are byte-addressed (256-element
+// blocks of varying byte sizes, optionally with a per-row scale header), so
+// the decode functions compute the element's absolute byte address from the
+// push constants and the (absolute) block coordinates passed by the driver,
+// and read the quantized bytes through the global binding-0 buffer (which is
+// uint8_t for these types). `bl` is unused: the per-row META header means the
+// driver-computed block pointer cannot point at the true block start.
+//
+// Layout: row r starts at batch_off + r*row_bytes where
+//   row_bytes = META + nbpb*BLOCK_BYTES,  nbpb = p.K / 256
+// and the 256-element block b sits at row start + META + b*BLOCK_BYTES.
+// The base K family (IQ2_K..IQ6_K) has META=0 and each block carries its own
+// 2-byte f16 d; the KS/KL/KT families carry one per-row scale header (2-byte
+// f16 or 4-byte f32) at the row start.
+// ---------------------------------------------------------------------------
+#if defined(DATA_A_IQ2_K)   || defined(DATA_A_IQ3_K)   || defined(DATA_A_IQ4_K)   || \
+    defined(DATA_A_IQ5_K)   || defined(DATA_A_IQ6_K)   || defined(DATA_A_IQ2_KS)  || \
+    defined(DATA_A_IQ3_KS)  || defined(DATA_A_IQ4_KS)  || defined(DATA_A_IQ4_KSS) || \
+    defined(DATA_A_IQ5_KS)  || defined(DATA_A_IQ2_KL)  || defined(DATA_A_IQ1_KT)  || \
+    defined(DATA_A_IQ2_KT)  || defined(DATA_A_IQ3_KT)  || defined(DATA_A_IQ4_KT)
+
+#define IQK_CM2 1
+#define IQK_TABLES_NO_BINDING 1
+#include "iqk_tables.comp"
+#undef IQK_TABLES_NO_BINDING
+
+// Batch/expert index of A (src0) for this workgroup. Mirrors main()'s
+// batch_idx_a computation; the byte offsets are derived from p.M and p.K
+// because the per-row META headers are not accounted for by the element
+// strides.
+uint iqk_cm2_batch_idx() {
+#ifdef MUL_MAT_ID
+    return gl_GlobalInvocationID.z;
+#else
+    const uint batch_idx = gl_GlobalInvocationID.z;
+    const uint i13 = batch_idx / p.ne12;
+    const uint i12 = batch_idx % p.ne12;
+    const uint i03 = i13 / p.broadcast3;
+    const uint i02 = i12 / p.broadcast2;
+    return i03 * p.ne02 + i02;
+#endif
+}
+
+// KT-family multiplicative-hash powers C^r (C = 0xCBAC1FED), so the value of
+// hash round r can be computed with a single multiply instead of r chained
+// multiplies (the vec/dequant kernels amortize the chain over 8 values; the
+// cm2 decode is one element per call).
+const uint iqk_cm2_hash_pow[8] = {
+    0xCBAC1FEDu, 0xC8734169u, 0xBD2B4535u, 0xE50C7D11u,
+    0x1220D7BDu, 0x94839CF9u, 0x58267985u, 0x60B19B21u,
+};
+
+// Value of hash round `round` (1..8) of the KT decode, starting from x0.
+// Mirrors iqk_hash_values (x *= C, byte sum of x&0x3F3F3F3F minus 126, then
+// optional abs and sign flip).
+float iqk_cm2_hash_round(const uint x0, const uint round, const bool is_abs, const uint sign_mask) {
+    const uint x = x0 * iqk_cm2_hash_pow[round - 1];
+    const uint s = x & 0x3F3F3F3Fu;
+#ifdef IQK_USE_DOT4
+    float v = float(dotPacked4x8EXT(int(s), 0x01010101) - 126);
+#else
+    float v = float(int((s & 0xffu) + ((s >> 8) & 0xffu) + ((s >> 16) & 0xffu) + ((s >> 24) & 0xffu)) - 126);
+#endif
+    if (is_abs) v = abs(v);
+    // sign bit index is the within-call value index (the KT decode calls the
+    // 4-value hash twice per chain; rounds 5..8 reuse bits 0..3 of mask 2)
+    if (((sign_mask >> ((round - 1) & 3u)) & 1u) != 0u) v = -v;
+    return v;
+}
+
+#if defined(DATA_A_IQ2_K)
+#define IQK_BLOCK_BYTES 76
+#define IQK_META 0
+
+float16_t dequantFuncIQ2_K(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib32 = coordInBlock[1] / 32;
+    const uint j = coordInBlock[1] % 32;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = nbpb * 76;
+    const uint block_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes + blockCoords[1] * 76;
+
+    const uint extra = iqk_load_u16(block_byte + 2);
+    const uint e_shift = extra >> (2 * ib32);
+    const uint v1_off = (e_shift & 1u) != 0 ? 4 : 0;
+    const uint v2_off = (e_shift & 2u) != 0 ? 4 : 0;
+
+    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+    const uint sc = data_a[block_byte + 4 + ib32];
+    const float dl = d * (float(j < 16 ? (sc & 0xFu) : (sc >> 4)) - 8.0f);
+    const uint v_off = j < 16 ? v1_off : v2_off;
+
+    const uint qs_off = 12 + (ib32 / 4) * 32;
+    const uint q = (data_a[block_byte + qs_off + j] >> (2 * (ib32 % 4))) & 3u;
+    return float16_t(dl * float(iq2nl_values[q + v_off]));
+}
+#endif
+
+#if defined(DATA_A_IQ3_K)
+#define IQK_BLOCK_BYTES 110
+#define IQK_META 0
+
+float16_t dequantFuncIQ3_K(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib32 = coordInBlock[1] / 32;
+    const uint j = coordInBlock[1] % 32;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = nbpb * 110;
+    const uint block_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes + blockCoords[1] * 110;
+
+    const uint extra = iqk_load_u16(block_byte + 2);
+    const uint sh = iqk_load_u16(block_byte + 4);
+    const uint e_shift = extra >> (2 * ib32);
+    const uint v1_off = (e_shift & 1u) != 0 ? 8 : 0;
+    const uint v2_off = (e_shift & 2u) != 0 ? 8 : 0;
+
+    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+    const uint sc = data_a[block_byte + 6 + ib32];
+    const float dl = d * (2.0f * float(j < 16 ? (sc & 0xFu) : (sc >> 4)) + 1.0f)
+                    * (((sh >> (2 * ib32 + (j < 16 ? 0 : 1))) & 1u) != 0 ? -1.0f : 1.0f);
+    const uint v_off = j < 16 ? v1_off : v2_off;
+
+    const uint q = (data_a[block_byte + 14 + (ib32 / 4) * 32 + j] >> (2 * (ib32 % 4))) & 3u;
+    const uint h = (data_a[block_byte + 78 + j] >> (ib32 % 8)) & 1u;
+    return float16_t(dl * float(iq3nl_values[(q | (h << 2)) + v_off]));
+}
+#endif
+
+#if defined(DATA_A_IQ4_K)
+#define IQK_BLOCK_BYTES 144
+#define IQK_META 0
+
+float16_t dequantFuncIQ4_K(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib32 = coordInBlock[1] / 32;
+    const uint j = coordInBlock[1] % 32;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = nbpb * 144;
+    const uint block_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes + blockCoords[1] * 144;
+
+    const uint extra = iqk_load_u16(block_byte + 2);
+    const uint e_shift = extra >> (2 * ib32);
+    const uint v1_off = (e_shift & 1u) != 0 ? 16 : 0;
+    const uint v2_off = (e_shift & 2u) != 0 ? 16 : 0;
+
+    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+    const uint sh = data_a[block_byte + 4 + ib32 / 2] >> (4 * (ib32 % 2));
+    const uint sc = data_a[block_byte + 8 + ib32];
+    const uint s = j < 16 ? (sc & 0xFu) | ((sh << 4) & 0x30u) : (sc >> 4) | ((sh << 2) & 0x30u);
+    const float dl = d * (float(s) - 32.0f);
+    const uint v_off = j < 16 ? v1_off : v2_off;
+
+    const uint q = data_a[block_byte + 16 + 16 * ib32 + (j & 15)];
+    return float16_t(dl * float(iq4k_values[(j < 16 ? (q & 0xFu) : (q >> 4)) + v_off]));
+}
+#endif
+
+#if defined(DATA_A_IQ5_K)
+#define IQK_BLOCK_BYTES 176
+#define IQK_META 0
+
+float16_t dequantFuncIQ5_K(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib64 = coordInBlock[1] / 64;
+    const uint part = (coordInBlock[1] % 64) / 32;
+    const uint j = coordInBlock[1] % 32;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = nbpb * 176;
+    const uint block_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes + blockCoords[1] * 176;
+
+    const uint shift = 2 * ib64;
+    const uint extra = iqk_load_u16(block_byte + 2);
+    const uint e_shift = extra >> (4 * ib64);
+    const uint v1_off = (e_shift & (1u << (2 * part))) != 0 ? 32 : 0;
+    const uint v2_off = (e_shift & (2u << (2 * part))) != 0 ? 32 : 0;
+
+    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+    const uint sh = data_a[block_byte + 4 + ib64];
+    const uint sl = data_a[block_byte + 8 + 2 * ib64 + part];
+    const uint s = (part == 0)
+        ? (j < 16 ? ((sl & 0xFu) | ((sh << 4) & 0x30u)) : ((sl >> 4) | ((sh << 2) & 0x30u)))
+        : (j < 16 ? ((sl & 0xFu) | (sh & 0x30u))      : ((sl >> 4) | ((sh >> 2) & 0x30u)));
+    const float dl = d * (float(s) - 32.0f);
+    const uint v_off = j < 16 ? v1_off : v2_off;
+
+    const uint q = data_a[block_byte + 16 + 32 * ib64 + j];
+    const uint hb = data_a[block_byte + 144 + j];
+    const uint qv = (part == 0)
+        ? ((q & 0xFu) | (((hb >> shift) & 1u) << 4))
+        : ((q >> 4) | (((hb >> shift) & 2u) << 3));
+    return float16_t(dl * float(iq5nl_values[qv + v_off]));
+}
+#endif
+
+#if defined(DATA_A_IQ6_K)
+#define IQK_BLOCK_BYTES 212
+#define IQK_META 0
+
+float16_t dequantFuncIQ6_K(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib64 = coordInBlock[1] / 64;
+    const uint part = (coordInBlock[1] % 64) / 32;
+    const uint j = coordInBlock[1] % 32;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = nbpb * 212;
+    const uint block_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes + blockCoords[1] * 212;
+
+    const uint shift = 4 * (ib64 % 2);
+    const uint extra = iqk_load_u16(block_byte + 2);
+    const uint e_shift = extra >> (4 * ib64);
+    const uint v1_off = (e_shift & (1u << (2 * part))) != 0 ? 64 : 0;
+    const uint v2_off = (e_shift & (2u << (2 * part))) != 0 ? 64 : 0;
+
+    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+    const float dl = d * float(int8_t(data_a[block_byte + 4 + 4 * ib64 + part * 2 + (j < 16 ? 0 : 1)]));
+    const uint v_off = j < 16 ? v1_off : v2_off;
+
+    const uint q = data_a[block_byte + 20 + 32 * ib64 + j];
+    const uint hb = data_a[block_byte + 148 + 32 * (ib64 / 2) + j];
+    const uint qv = (part == 0)
+        ? ((q & 0xFu) | (((hb >> shift) & 0x3u) << 4))
+        : ((q >> 4) | (((hb >> shift) & 0xCu) << 2));
+    return float16_t(dl * float(iq6nl_values[qv + v_off]));
+}
+#endif
+
+#if defined(DATA_A_IQ2_KS)
+#define IQK_BLOCK_BYTES 70
+#define IQK_META 2
+
+float16_t dequantFuncIQ2_KS(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib64 = coordInBlock[1] / 64;
+    const uint part = (coordInBlock[1] % 64) / 32;
+    const uint j = coordInBlock[1] % 32;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = 2 + nbpb * 70;
+    const uint row_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes;
+    const uint block_byte = row_byte + 2 + blockCoords[1] * 70;
+
+    const uint shift = 4 * (ib64 % 2);
+    const uint extra = iqk_load_u16(block_byte);
+    const uint e_shift = extra >> (2 * ib64);
+
+    const float d = iqk_f16_to_f32(iqk_load_u16(row_byte));
+    const uint sc = data_a[block_byte + 2 + ib64];
+    const uint v_off = ((part == 0 ? (e_shift & 1u) : (e_shift & 2u)) != 0) ? 4 : 0;
+    const float dl = d * (float((part == 0 ? (sc & 0xFu) : (sc >> 4)) | ((extra >> (4 + 2 * ib64 + part)) & 0x10u)) - 16.0f);
+
+    const uint q = (data_a[block_byte + 6 + 32 * (ib64 / 2) + j] >> (shift + 2 * part)) & 3u;
+    return float16_t(dl * float(iq2nl_values[q + v_off]));
+}
+#endif
+
+#if defined(DATA_A_IQ3_KS)
+#define IQK_BLOCK_BYTES 102
+#define IQK_META 2
+
+float16_t dequantFuncIQ3_KS(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint k = coordInBlock[1] / 32;
+    const uint j = coordInBlock[1] % 32;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = 2 + nbpb * 102;
+    const uint row_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes;
+    const uint block_byte = row_byte + 2 + blockCoords[1] * 102;
+
+    const uint extra = iqk_load_u16(block_byte);
+    const float d = iqk_f16_to_f32(iqk_load_u16(row_byte));
+    const uint sc = data_a[block_byte + 2 + k % 4];
+    const float dl = d * (float(((sc >> (4 * (k / 4))) & 0xFu) | (((extra >> k) & 1u) << 4)) - 16.0f);
+    const uint v_off = ((extra >> (8 + k)) & 1u) != 0 ? 8 : 0;
+
+    const uint q = (data_a[block_byte + 6 + 32 * (k / 4) + j] >> (2 * (k % 4))) & 3u;
+    const uint hb = (data_a[block_byte + 70 + j] >> k) & 1u;
+    return float16_t(dl * float(iq3nl_values[(q | (hb << 2)) + v_off]));
+}
+#endif
+
+#if defined(DATA_A_IQ4_KS)
+#define IQK_BLOCK_BYTES 136
+#define IQK_META 4
+
+float16_t dequantFuncIQ4_KS(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib32 = coordInBlock[1] / 32;
+    const uint j = coordInBlock[1] % 32;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = 4 + nbpb * 136;
+    const uint row_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes;
+    const uint block_byte = row_byte + 4 + blockCoords[1] * 136;
+
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    const uint sc = data_a[block_byte + ib32];
+    const float dl = d * (float(sc & 254u) - 127.0f);
+    const uint v_off = (sc & 1u) != 0 ? 16 : 0;
+
+    const uint q = data_a[block_byte + 8 + 16 * ib32 + (j & 15)];
+    return float16_t(dl * float(iq4k_values[(j < 16 ? (q & 0xFu) : (q >> 4)) + v_off]));
+}
+#endif
+
+#if defined(DATA_A_IQ4_KSS)
+#define IQK_BLOCK_BYTES 128
+#define IQK_META 4
+
+float16_t dequantFuncIQ4_KSS(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib32 = coordInBlock[1] / 32;
+    const uint jj = coordInBlock[1] % 16;        // 0..15, pairs of elements share one aux16 value
+    const bool lo = (coordInBlock[1] % 32) < 16; // low or high nibble of a8
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = 4 + nbpb * 128;
+    const uint row_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes;
+    const uint block_byte = row_byte + 4 + blockCoords[1] * 128;
+
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    // The sub-block's 8 packed 16-bit values are xored (a ^= a>>1); the low bit
+    // of each feeds the scale ls and the value table selector v_off.
+    const uint qs16_off = 16 * ib32;
+    uint ls = 0;
+    uint a8 = 0;
+    [[unroll]] for (uint k = 0; k < 8; ++k) {
+        const uint q16 = iqk_load_u16(block_byte + qs16_off + 2 * k);
+        uint a = q16 & 0xfffeu;
+        a ^= a >> 1;
+        if (k == jj / 2) {
+            a8 = (a >> (8 * (jj & 1))) & 0xffu;
+        }
+        ls |= (q16 & 1u) << k;
+    }
+    const float dl = d * (float(ls & 254u) - 127.0f);
+    const uint v_off = (ls & 1u) != 0 ? 16 : 0;
+
+    return float16_t(dl * float(iq4k_values[(lo ? (a8 & 0xFu) : (a8 >> 4)) + v_off]));
+}
+#endif
+
+#if defined(DATA_A_IQ5_KS)
+#define IQK_BLOCK_BYTES 168
+#define IQK_META 4
+
+float16_t dequantFuncIQ5_KS(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib64 = coordInBlock[1] / 64;
+    const uint part = (coordInBlock[1] % 64) / 32;
+    const uint j = coordInBlock[1] % 32;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = 4 + nbpb * 168;
+    const uint row_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes;
+    const uint block_byte = row_byte + 4 + blockCoords[1] * 168;
+
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    const uint sc = data_a[block_byte + 2 * ib64 + part];
+    const float dl = d * (float(sc & 254u) - 127.0f);
+    const uint v_off = (sc & 1u) != 0 ? 32 : 0;
+    const uint sft_h = 2 * ib64 + part;
+
+    const uint q = data_a[block_byte + 8 + 32 * ib64 + j];
+    const uint hb = data_a[block_byte + 136 + j];
+    const uint qv = (part == 0)
+        ? ((q & 0xFu) | (((hb >> sft_h) & 1u) << 4))
+        : ((q >> 4) | (((hb >> sft_h) & 1u) << 4));
+    return float16_t(dl * float(iq5nl_values[qv + v_off]));
+}
+#endif
+
+#if defined(DATA_A_IQ2_KL)
+#define IQK_BLOCK_BYTES 86
+#define IQK_META 2
+
+float16_t dequantFuncIQ2_KL(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib64 = coordInBlock[1] / 64;
+    const uint part = (coordInBlock[1] % 64) / 32;
+    const uint j = coordInBlock[1] % 32;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = 2 + nbpb * 86;
+    const uint row_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes;
+    const uint block_byte = row_byte + 2 + blockCoords[1] * 86;
+
+    const float d = iqk_f16_to_f32(iqk_load_u16(row_byte));
+    const uint scales_h = iqk_load_u16(block_byte);
+    const uint sc = data_a[block_byte + 2 + (2 * ib64 + part) % 4];
+    const float dl = d * (float(((sc >> (4 * (ib64 / 2))) & 0xFu) | (((scales_h >> (4 * ib64 + 2 * part)) & 3u) << 4)) - 32.0f);
+    const uint sft_h = 2 * ib64 + part;
+
+    const uint q = data_a[block_byte + 6 + 16 * ib64 + (j / 2)];
+    const uint hb = data_a[block_byte + 70 + (j / 2)];
+    const uint qv = (part == 0)
+        ? ((q & 0xFu) | (((hb >> sft_h) & 1u) << 4))
+        : ((q >> 4) | (((hb >> sft_h) & 1u) << 4));
+    const uint v = iq2kl_values[qv];
+    return float16_t(dl * float(int8_t((j & 1) != 0 ? (v >> 8) : (v & 0xffu))));
+}
+#endif
+
+#if defined(DATA_A_IQ1_KT)
+#define IQK_BLOCK_BYTES 56
+#define IQK_META 4
+
+float16_t dequantFuncIQ1_KT(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib32 = coordInBlock[1] / 32;
+    const uint j = (coordInBlock[1] % 32) / 8;
+    const uint k = coordInBlock[1] % 8;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = 4 + nbpb * 56;
+    const uint row_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes;
+    const uint block_byte = row_byte + 4 + blockCoords[1] * 56;
+
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    const uint sh_byte = data_a[block_byte + ib32];
+    const float dl = d * float(iq4k_values[sh_byte & 0xFu]);
+
+    const uint ql_off = 8 + 4 * ib32;
+    const uint qh_off = 40 + 4 * (ib32 % 4);
+    const uint sh_shift = 8 - 4 * (ib32 / 4);
+    uint x = uint(data_a[block_byte + ql_off + j])
+           + 4096u
+           + ((uint(data_a[block_byte + qh_off + j]) << sh_shift) & 0xf00u)
+           + ((sh_byte << (8 - j)) & 0x1000u);
+    return float16_t(dl * iqk_cm2_hash_round(x, k + 1, false, 0u));
+}
+#endif
+
+#if defined(DATA_A_IQ2_KT)
+#define IQK_BLOCK_BYTES 68
+#define IQK_META 4
+
+float16_t dequantFuncIQ2_KT(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib32 = coordInBlock[1] / 32;
+    const uint j = (coordInBlock[1] % 32) / 8;
+    const uint k = coordInBlock[1] % 8;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = 4 + nbpb * 68;
+    const uint row_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes;
+    const uint block_byte = row_byte + 4 + blockCoords[1] * 68;
+
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    const uint sc = data_a[block_byte + ib32 % 4] >> (4 * (ib32 / 4));
+    const float dl = d * 1.05f * float(iq4k_values[sc & 0xFu]);
+
+    uint x = iqk_load_u16(block_byte + 4 + 8 * ib32 + 2 * j) + 4096u;
+    return float16_t(dl * iqk_cm2_hash_round(x, k + 1, false, 0u));
+}
+#endif
+
+#if defined(DATA_A_IQ3_KT)
+#define IQK_BLOCK_BYTES 100
+#define IQK_META 4
+
+float16_t dequantFuncIQ3_KT(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib32 = coordInBlock[1] / 32;
+    const uint j = (coordInBlock[1] % 32) / 8;
+    const uint k = coordInBlock[1] % 8;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = 4 + nbpb * 100;
+    const uint row_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes;
+    const uint block_byte = row_byte + 4 + blockCoords[1] * 100;
+
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    const uint sc = data_a[block_byte + ib32 % 4] >> (4 * (ib32 / 4));
+    const float dl = d * 1.01f * float(sc & 0xFu);
+
+    const uint qh_off = 68;
+    uint sign_mask = 0;
+    [[unroll]] for (uint t = 0; t < 4; ++t) {
+        sign_mask |= ((data_a[block_byte + qh_off + 8 * j + (k < 4 ? 0 : 4) + t] >> ib32) & 1u) << t;
+    }
+    uint x = iqk_load_u16(block_byte + 4 + 8 * ib32 + 2 * j) + 4096u;
+    return float16_t(dl * iqk_cm2_hash_round(x, k + 1, true, sign_mask));
+}
+#endif
+
+#if defined(DATA_A_IQ4_KT)
+#define IQK_BLOCK_BYTES 128
+#define IQK_META 4
+
+float16_t dequantFuncIQ4_KT(const in decodeBufQ4_0 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint ib32 = coordInBlock[1] / 32;
+    const uint j = (coordInBlock[1] % 32) / 4;
+    const uint k = coordInBlock[1] % 4;
+    const uint nbpb = p.K / 256;
+    const uint row_bytes = 4 + nbpb * 128;
+    const uint row_byte = (iqk_cm2_batch_idx() * p.M + blockCoords[0]) * row_bytes;
+    const uint block_byte = row_byte + 4 + blockCoords[1] * 128;
+
+    const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+    const uint qs32 = iqk_load_u32(block_byte + 4 * ib32);
+    const float dl = d * (float((qs32 & 0xffu) >> 1) - 64.0f);
+    const uint idx0 = ((qs32 & 1u) << 15) + 4096u;
+
+    const uint ql_off = 32 + 8 * ib32;
+    const uint qh_off = 96 + 8 * (ib32 % 4);
+    const uint sh_shift = 8 - 4 * (ib32 / 4);
+    const uint sh = qs32 >> (8 + 3 * j);
+    uint x = uint(data_a[block_byte + ql_off + j])
+           + ((uint(data_a[block_byte + qh_off + j]) << sh_shift) & 0xf00u)
+           + ((sh & 7u) << 12)
+           + idx0;
+    return float16_t(dl * iqk_cm2_hash_round(x, k + 1, false, 0u));
+}
+#endif
+
+#undef IQK_BLOCK_BYTES
+#undef IQK_META
+#endif  // IQK_CM2
+
+#if defined(DATA_A_IQ2_K)
+#define dequantFuncA dequantFuncIQ2_K
+#elif defined(DATA_A_IQ3_K)
+#define dequantFuncA dequantFuncIQ3_K
+#elif defined(DATA_A_IQ4_K)
+#define dequantFuncA dequantFuncIQ4_K
+#elif defined(DATA_A_IQ5_K)
+#define dequantFuncA dequantFuncIQ5_K
+#elif defined(DATA_A_IQ6_K)
+#define dequantFuncA dequantFuncIQ6_K
+#elif defined(DATA_A_IQ2_KS)
+#define dequantFuncA dequantFuncIQ2_KS
+#elif defined(DATA_A_IQ3_KS)
+#define dequantFuncA dequantFuncIQ3_KS
+#elif defined(DATA_A_IQ4_KS)
+#define dequantFuncA dequantFuncIQ4_KS
+#elif defined(DATA_A_IQ4_KSS)
+#define dequantFuncA dequantFuncIQ4_KSS
+#elif defined(DATA_A_IQ5_KS)
+#define dequantFuncA dequantFuncIQ5_KS
+#elif defined(DATA_A_IQ2_KL)
+#define dequantFuncA dequantFuncIQ2_KL
+#elif defined(DATA_A_IQ1_KT)
+#define dequantFuncA dequantFuncIQ1_KT
+#elif defined(DATA_A_IQ2_KT)
+#define dequantFuncA dequantFuncIQ2_KT
+#elif defined(DATA_A_IQ3_KT)
+#define dequantFuncA dequantFuncIQ3_KT
+#elif defined(DATA_A_IQ4_KT)
+#define dequantFuncA dequantFuncIQ4_KT
+#endif

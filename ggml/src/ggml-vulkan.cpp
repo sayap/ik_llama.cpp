@@ -2281,6 +2281,37 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_XS],  matmul_iq4_xs_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_NL],  matmul_iq4_nl_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
 
+        // IQK / KT quant families: byte-addressed inline dequant (see
+        // dequant_funcs_cm2.comp). Only the large pipeline is usable (the
+        // NV_coopmat2 driver only hands per-element coordinates to the decode
+        // function for the large tile config; ggml_vk_guess_matmul_pipeline
+        // forces it). Same tile config as Q2_K..Q6_K.
+#define CREATE_MM_L(PIPELINE_NAME, NAMELC, F16ACC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT) \
+        ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC #F16ACC "_l", NAMELC ## F16ACC ## _cm2_len, NAMELC ## F16ACC ## _cm2_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, 1);   \
+        ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC #F16ACC "_aligned_l", NAMELC ## _aligned ## F16ACC ## _cm2_len, NAMELC ## _aligned ## F16ACC ## _cm2_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, l_align);   \
+
+#define CREATE_MM2_L(PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT) \
+        CREATE_MM_L(PIPELINE_NAME . f16acc, NAMELC, _f16acc, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT)   \
+        CREATE_MM_L(PIPELINE_NAME . f32acc, NAMELC, , WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT)   \
+
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ2_K],   matmul_iq2_k_f16,   mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ3_K],   matmul_iq3_k_f16,   mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_K],   matmul_iq4_k_f16,   mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ5_K],   matmul_iq5_k_f16,   mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ6_K],   matmul_iq6_k_f16,   mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ2_KS],  matmul_iq2_ks_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ3_KS],  matmul_iq3_ks_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_KS],  matmul_iq4_ks_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_KSS], matmul_iq4_kss_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ5_KS],  matmul_iq5_ks_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ2_KL],  matmul_iq2_kl_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ1_KT],  matmul_iq1_kt_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ2_KT],  matmul_iq2_kt_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ3_KT],  matmul_iq3_kt_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+        CREATE_MM2_L(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_KT],  matmul_iq4_kt_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
+#undef CREATE_MM_L
+#undef CREATE_MM2_L
+
         CREATE_MM2(pipeline_matmul_id_f16, matmul_id_f16, wg_denoms, warptile, vk_mat_mat_id_push_constants, 4)
 #if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
         if (device->coopmat_bf16_support) {
@@ -2306,6 +2337,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_MM(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_S].f16acc,   matmul_id_iq3_s_f16,   , mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 4)
         CREATE_MM(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS].f16acc,  matmul_id_iq4_xs_f16,  , mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 4)
         CREATE_MM(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL].f16acc,  matmul_id_iq4_nl_f16,  , mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 4)
+
+        // NOTE: the IQK/KT types are intentionally not wired into the coopmat2
+        // matmul_id path: on NV_coopmat2 the driver invokes the decode function
+        // once per 4-element group (coordInBlock[1] = col/4, no per-element
+        // offset), so a per-element byte-addressed decode cannot work. They keep
+        // the dequant-to-F16 fallback (ggml_vk_get_mul_mat_mat_id_pipeline
+        // returns nullptr for them).
 #undef CREATE_MM
 #undef CREATE_MM2
     } else
@@ -4305,6 +4343,21 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ2_K:
+        case GGML_TYPE_IQ3_K:
+        case GGML_TYPE_IQ4_K:
+        case GGML_TYPE_IQ5_K:
+        case GGML_TYPE_IQ6_K:
+        case GGML_TYPE_IQ2_KS:
+        case GGML_TYPE_IQ3_KS:
+        case GGML_TYPE_IQ4_KS:
+        case GGML_TYPE_IQ4_KSS:
+        case GGML_TYPE_IQ5_KS:
+        case GGML_TYPE_IQ2_KL:
+        case GGML_TYPE_IQ1_KT:
+        case GGML_TYPE_IQ2_KT:
+        case GGML_TYPE_IQ3_KT:
+        case GGML_TYPE_IQ4_KT:
             break;
         default:
             return nullptr;
@@ -5104,6 +5157,14 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
 
     if (ctx->device->coopmat2) {
+        // IQK/KT inline dequant: only the large tile config receives per-element
+        // coordinates from the NV_coopmat2 driver (the small/medium configs
+        // collapse coordInBlock for part of the tile, so the byte-addressed
+        // decode reads the wrong elements). Force the large pipeline for these
+        // types; only its l/a_l variants are created.
+        if (ggml_vk_is_iqk_type(src0_type)) {
+            return aligned ? mmp->a_l : mmp->l;
+        }
         // Use large shader when the N dimension is greater than the medium shader's tile size
         uint32_t crossover_large = mmp->m->wg_denoms[1];
         if ((ctx->device->mul_mat_l[src0_type] && (n > crossover_large)) || (!ctx->device->mul_mat_m[src0_type] && !ctx->device->mul_mat_s[src0_type])) {

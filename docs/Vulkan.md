@@ -15,9 +15,10 @@ ik_llama.cpp, what has been fixed, how to get good performance, and what is stil
 - The imatrix quant types from the IQK/K-family (`IQ2_K`...`IQ6_K`, `IQ4_KS`, `IQ2_KS`,
   `IQ4_KSS`, `IQ5_KS`, `IQ3_KS`, `IQ2_KL`) and the KT-family (`IQ1_KT`...`IQ4_KT`) are **now
   supported** by the Vulkan backend (see "What we fixed"): single-token decode runs a native
-  `mul_mat_vec` kernel per type and prompt processing runs a native dequant-to-F16 step followed
-  by the F16 matmul. The `*_R4` repack variants and `Q6_0`, `MXFP4`, `IQ1_BN`, `IQ2_BN` are
-  still not supported and fall back to the CPU backend.
+  `mul_mat_vec` kernel per type and prompt processing runs a coopmat2 tensor-core matmul with
+  inline dequant (the quantized weights are read once; see "vs CUDA" for the measured result).
+  The `*_R4` repack variants and `Q6_0`, `MXFP4`, `IQ1_BN`, `IQ2_BN` are still not supported
+  and fall back to the CPU backend.
 
 ## What we fixed
 
@@ -33,10 +34,14 @@ and `GET_ROWS`:
   dots against the F32/F16 activations. On devices with `VK_KHR_shader_integer_dot_product`
   the KT-family hash decode's 4-shift + 3-add byte sum is replaced by one `dotPacked4x8EXT`
   (a `_dot4` shader variant is selected at pipeline creation; the scalar fallback remains).
-- **prompt processing (mul_mat)**: a dequant-to-F16 kernel per type (`dequant_iqX_*`) feeding the
-  existing F16 matmul. The flat dequant shaders are row-meta aware (blocks-per-row and meta size
-  are passed in the push constants) and the dispatch passes the tensor's full byte size (the
-  per-row scale headers must be included in the source subbuffer).
+- **prompt processing (mul_mat)**: on NV_coopmat2 devices the mat-mat path runs the
+  **coopmat2 tensor-core matmul with inline dequant** (`mul_mm_cm2.comp` + per-type decode
+  functions in `dequant_funcs_cm2.comp`; see "vs CUDA" below for the details and the measured
+  result). The dequant-to-F16 kernels (`dequant_iqX_*`) feeding the F16 matmul remain as the
+  fallback for the `MUL_MAT_ID` (MoE) mat-mat path and for non-coopmat2 devices. The flat
+  dequant shaders are row-meta aware (blocks-per-row and meta size are passed in the push
+  constants) and the dispatch passes the tensor's full byte size (the per-row scale headers
+  must be included in the source subbuffer).
 
   `IQ4_KT` additionally has a native Q8_1 integer-dot mmq (`mul_mmq.comp`): a byte-addressed
   tile loader runs the hash decode with `dot4` and packs the values as signed int8, then the
@@ -210,8 +215,10 @@ The Vulkan `MUL_MAT` supports `F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_
 Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL` plus
 the full **IQK/K-family** (`IQ2_K, IQ3_K, IQ4_K, IQ5_K, IQ6_K, IQ2_KS, IQ3_KS, IQ4_KS, IQ4_KSS,
 IQ5_KS, IQ2_KL`) and **KT-family** (`IQ1_KT, IQ2_KT, IQ3_KT, IQ4_KT`). The decode path uses
-native per-type `mul_mat_vec` kernels; prompt processing dequantizes to F16 on the GPU and uses
-the F16 matmul (correct, and on-GPU, but not as fast as a native quantized matmul kernel).
+native per-type `mul_mat_vec` kernels; prompt processing uses a coopmat2 tensor-core matmul
+with per-element inline dequant (`mul_mm_cm2.comp`). On the RTX 3090 it is currently on par
+with the dequant+F16 path (the decode-per-element overhead offsets reading the weights once),
+so the flat dequant path remains the fallback for MoE (`MUL_MAT_ID`).
 
 The `*_R4` repack variants (`IQ2_K_R4, IQ3_K_R4, IQ4_K_R4, IQ5_K_R4, IQ4_KS_R4, IQ5_KS_R4`)
 and the remaining CUDA-supported types (`Q6_0, MXFP4, IQ1_BN, IQ2_BN, IQ1_S_R4, IQ1_M_R4`)
@@ -329,13 +336,32 @@ running many iterations) shows both remaining gaps are dominated by the FFN:
     earlier reverted attempt. It is therefore enabled only on devices without cooperative
     matrices (AMD/Intel), where the F16 matmul has no tensor cores and reading the
     quantized weights once can win.
-  * **The coopmat2 tensor-core mmq (`mul_mm_cm2.comp`, the fast path for q4_0 at
-    ~1.26 ms)** cannot currently load IQK tiles: `coopMatLoadTensorNV` addresses the A
-    matrix by element stride, but the IQK layout is byte-addressed with per-row scale
-    headers and 256-element blocks of varying byte sizes. Reworking the cm2 tensor-load to
-    handle byte-addressed IQK rows is the principled fix and should bring the FFN matmul
-    to ~1.5-2 ms (2-3x prompt speedup), but it is a substantial change to the NV
-    cooperative-matrix2 loader.
+  * **The coopmat2 tensor-core inline dequant (`mul_mm_cm2.comp`) is now implemented for
+    all 15 IQK/KT types**: the A matrix is loaded one element at a time through a decode
+    function (`dequantFuncIQ*` in `dequant_funcs_cm2.comp`) that computes the element's
+    absolute byte address from the push constants (`blockCoords[1]` is the 256-element
+    block index, `coordInBlock[1]` the element within it) and reads the quantized bytes
+    through the byte view of binding 0. The KT hash uses one multiply per element via
+    precomputed powers of `0xCBAC1FED` (and a hardware `dot4` for the byte sum). The
+    mat-mat path (`MUL_MAT`) now uses these pipelines directly instead of dequant-to-F16.
+    Two NV_coopmat2 driver behaviors required workarounds: the decode only receives
+    per-element coordinates on the **large** tile config (small/medium configs collapse
+    `coordInBlock` for part of the tile, so the pipelines are forced to large and only the
+    `l`/`a_l` variants are created), and the `MUL_MAT_ID` path invokes the decode once per
+    4-element group (`coordInBlock[1] = col/4`, no per-element offset), so the IQK types
+    are kept off the coopmat2 matmul_id path and retain the dequant-to-F16 fallback there.
+    Correctness is covered by `tests/test-iqk-quants.cpp` (multi-token mat-mat cases now
+    exercise the cm2 path).
+
+    Performance reality check: on the RTX 3090 the FFN-shaped matmul
+    `[152064, 5120] x [152064, 512]` measures ~26 ms with both the cm2 inline-dequant and
+    the old dequant+F16 path, and model-level prompt processing is unchanged (~513 tok/s
+    at batch 2048 on the 32B IQ4_KT model). The per-element decode invocation (driver
+    overhead + re-reading the per-row scale header and block selectors for every element)
+    offsets the benefit of reading the quantized weights once, so this does **not** yet
+    deliver the hoped-for 2-3x prompt speedup; the decode-side bottleneck would need to be
+    reduced (e.g. caching the row/block headers across a tile) for the tensor cores to
+    become the limiter.
 - The base IQK types (IQ2_K..IQ6_K) have per-16-element dequant scales, which fit neither
   the SIMT mmq's per-32-group scale nor a simple cm2 tile without per-16 handling.
 

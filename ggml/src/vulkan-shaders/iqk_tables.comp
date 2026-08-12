@@ -10,8 +10,13 @@
 #extension GL_EXT_integer_dot_product : require
 #endif
 
-// Byte-addressed weight buffer shared by the IQK/KT dequant and mul_mat_vec shaders
+// Byte-addressed weight buffer shared by the IQK/KT dequant and mul_mat_vec shaders.
+// The coopmat2 matmul (mul_mm_cm2.comp) declares its own binding-0 buffer (as
+// uint8_t for the IQK types), so it defines IQK_TABLES_NO_BINDING before including
+// this file.
+#ifndef IQK_TABLES_NO_BINDING
 layout (binding = 0) readonly buffer A {uint8_t data_a[];};
+#endif
 
 // Unpack a 16-bit IEEE half to float (helper for byte-addressed blocks)
 float iqk_f16_to_f32(uint u) {
