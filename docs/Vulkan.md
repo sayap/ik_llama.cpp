@@ -8,19 +8,39 @@ ik_llama.cpp, what has been fixed, how to get good performance, and what is stil
 - The Vulkan backend is **correct** for the ops it supports, but its **op/type coverage is
   far behind the CUDA backend and behind ik_llama's own graph builder**.
 - The single biggest performance trap: ik_llama fuses the FFN `up`+`gate` matmuls into
-  `GGML_OP_FUSED_UP_GATE` (and MoE models into `MOE_FUSED_UP_GATE`) **by default**, but the
-  Vulkan backend does not implement those ops. Every layer's FFN then runs on the **CPU
-  backend** with expensive GPU↔CPU copies per split, which both tanks throughput and burns
-  CPU cores.
-- Immediate workaround: run with `-no-fug` (and `-no-fmoe` for MoE models) to make the
-  graph use plain `MUL_MAT`s, which the Vulkan backend executes on the GPU. On an RTX 3090
-  this goes from ~17 tok/s to ~400 tok/s for a small dense Q8_0 model (~CUDA speed).
+  `GGML_OP_FUSED_UP_GATE` (and MoE models into `MOE_FUSED_UP_GATE`) **by default**. The Vulkan
+  backend now implements both ops (as two matmuls into the destination and a temporary buffer,
+  followed by the fused activation combine), so dense and MoE FFNs run on the GPU without the
+  `-no-fug` / `-no-fmoe` workarounds.
 - Quant types from the IQK family (`IQ4_KT`, ...) are **not** in the Vulkan backend's
   `supports_op` list, so models quantized with those types run all their matmuls on CPU
-  regardless of `-no-fug`. Use a supported type (`Q8_0`, `Q6_K`, `Q4_K`, `Q4_0`, ...) or
-  the CUDA backend.
+  regardless. Use a supported type (`Q8_0`, `Q6_K`, `Q4_K`, `Q4_0`, ...) or the CUDA backend.
 
 ## What we fixed
+
+### 0. Fused up-gate / MoE fused up-gate (`-fug` / `-fmoe`)
+
+`GGML_OP_FUSED_UP_GATE` and `GGML_OP_MOE_FUSED_UP_GATE` are now implemented:
+
+- Dense: two `MUL_MAT`s (gate into the destination, up into a temp buffer) + the fused
+  activation combine (`silu/gelu/relu/swiglu_oai`).
+- MoE with separate up/gate weights: two `MUL_MAT_ID`s + per-expert bias adds (via a small
+  `add_bias_id` kernel that gathers the bias by expert id) + the combine.
+- MoE with fused gate+up weights (`as_gate == nullptr`, first half of the rows are gate,
+  second half up): one `MUL_MAT_ID` of the full `[k, 2*n_ff, n_expert]` matrix into a temp
+  buffer, optional bias adds on each half, then a split combine kernel that reads both halves.
+- The activation "limit" (`op_params[1]`, step35/deepseek4 style models) is honored: the
+  existing `fused_mul_*` shaders clamp when the limit is non-zero, and a new
+  `fused_mul_swiglu_oai` shader implements the OAI variant.
+- `supports_op` accepts the ops when the weight type is one the matmul path supports (F32/F16/
+  BF16 and the supported quant types), the activations are F32 and the unary op is one of the
+  four supported ones; anything else falls back to the CPU backend as before.
+
+A work-size bug in `ggml_graph_plan` was fixed along the way: the `MOE_FUSED_UP_GATE` plan
+skipped the quantized-activation work buffer when the gate weights are fused (`src[1] == NULL`),
+which made the CPU reference compute overflow its work buffer (heap corruption). The dense
+`FUSED_UP_GATE` plan also sized the work buffer from the weights instead of the activations.
+Both now size it from `src[2]` (the activations).
 
 ### 1. Synchronization: one wait per graph instead of per batch
 
@@ -77,13 +97,18 @@ Qwen2.5-Coder-0.5B-Instruct-Q8_0 (dense, `-c 2048`, single token batch):
 
 | configuration | tokens/s |
 |---|---|
-| before the sync fix (fused FFN on CPU) | ~17 |
-| after sync fix, still fused | ~17 (CPU fallback dominates) |
-| after sync fix, `-no-fug` | ~400 |
-| CUDA backend, same model | ~440 |
+| before the fused up-gate support (FFN on CPU) | ~17 |
+| fused up-gate on Vulkan (default) | ~420 |
+| `-no-fug` | ~430 |
+| CUDA backend, same model | ~600 |
 
 The GPU kernels themselves are fast (single-digit to tens of µs per op); the wall-clock
-cost was the CPU-fallback splits and their data movement.
+cost before was the CPU-fallback splits and their data movement.
+
+The fused up-gate result is bit-identical to the `-no-fug` path on Vulkan (both use the same
+matmul pipelines; only the kernel dispatch differs), and `tests/test-fused-up-gate` checks
+this for dense and MoE (fused and separate weights, with and without per-expert biases) across
+several quant types and batch sizes.
 
 ## What we learned (architecture notes)
 
@@ -110,15 +135,18 @@ cost was the CPU-fallback splits and their data movement.
 These ops are produced by ik_llama's graph builder but are **not implemented** in the
 Vulkan backend, so they fall back to the CPU backend with expensive copies:
 
-- `GGML_OP_FUSED_UP_GATE` (dense FFN up+gate fusion, default on) — workaround: `-no-fug`
-- `GGML_OP_MOE_FUSED_UP_GATE` (MoE up+gate fusion, default on) — workaround: `-no-fmoe`
 - `GGML_OP_SSM_CONV`, `GGML_OP_DELTA_NET` and friends (recurrent / hybrid models)
 - `GGML_OP_L2_NORM` (and possibly other norm variants)
 - `GGML_OP_MULTI_ADD` exists but check the specific fused-mul-multiadd variants
   (`fused_mmad`); `-no-mmad` disables them
 
-To close this, implement the missing ops as Vulkan kernels (a fused two-matmul + activation
-shader for the up/gate family) and extend `ggml_backend_vk_supports_op` / `build_graph`.
+`GGML_OP_FUSED_UP_GATE` and `GGML_OP_MOE_FUSED_UP_GATE` are now implemented (see
+"What we fixed"). Note that the fused up-gate is implemented as two matmuls + a combine
+kernel rather than a single fused kernel, so on Vulkan it is roughly on par with the
+`-no-fug` path rather than faster.
+
+To close the remaining gaps, implement the missing ops as Vulkan kernels and extend
+`ggml_backend_vk_supports_op` / `build_graph`.
 
 ### Quant type coverage
 
@@ -150,6 +178,11 @@ dequant/mul_mat shaders and pipeline variants.
 - Only NVIDIA (RTX 3090, `NV_coopmat2`) and AMD (Strix Halo iGPU, RADV, `KHR_coopmat`)
   have been exercised. Intel, Apple (Metal is separate), and other AMD parts are untested
   in this codebase.
-- The correctness of the `-no-fug` path has been spot-checked against the CUDA backend;
-  a broader op-by-op comparison (e.g. `test-backend-ops`) would be valuable, but that test
-  does not currently compile against this fork's headers.
+- `tests/test-fused-up-gate.cpp` compares the fused up-gate ops (dense and MoE: fused and
+  separate weights, with/without per-expert biases, single and multi token, several weight
+  types) against the CPU reference on a target backend, and additionally checks that the
+  fused path is bit-identical to the equivalent non-fused graph on the same backend.
+  Run as `test-fused-up-gate CPU|Vulkan0|CUDA0`. Note that the IQ4_XS CPU-vs-GPU comparison
+  has a large pre-existing gap (visible even in plain `MUL_MAT`), so that type is allowed a
+  looser tolerance.
+- `test-backend-ops` does not currently compile against this fork's headers.

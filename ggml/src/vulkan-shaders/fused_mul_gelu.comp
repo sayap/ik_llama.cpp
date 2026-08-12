@@ -23,5 +23,13 @@ void main() {
     const float xi = float(data_a[i]);
     const float yi = float(data_b[i]);
     const float val = SQRT_2_OVER_PI*xi*(1.0f + GELU_COEF_A*xi*xi);
-    data_d[i] = D_TYPE(0.5f*xi*yi*(2.0f - 2.0f / (exp(2 * val) + 1)));
+    const float act = 0.5f*xi*(1.0f + tanh(val));
+
+    if (p.param1 > 1e-6f) {
+        // limit clamping (used by the fused up-gate op for step35/deepseek4 style models)
+        const float limit = p.param1;
+        data_d[i] = D_TYPE(min(act, limit) * clamp(yi, -limit, limit));
+    } else {
+        data_d[i] = D_TYPE(act * yi);
+    }
 }

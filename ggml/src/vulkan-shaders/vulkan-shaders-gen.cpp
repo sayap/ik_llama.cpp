@@ -666,6 +666,18 @@ void process_shaders() {
     string_to_spv("fused_mul_relu_f16",   "fused_mul_relu.comp",   {{"A_TYPE", "float16_t"},   {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
     string_to_spv("fused_mul_relu_f32",   "fused_mul_relu.comp",   {{"A_TYPE", "float"},       {"B_TYPE", "float"},     {"D_TYPE", "float"}});
 
+    string_to_spv("fused_mul_swiglu_oai_f16", "fused_mul_swiglu_oai.comp", {{"A_TYPE", "float16_t"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+    string_to_spv("fused_mul_swiglu_oai_f32", "fused_mul_swiglu_oai.comp", {{"A_TYPE", "float"},     {"B_TYPE", "float"},     {"D_TYPE", "float"}});
+
+    // Fused up-gate combine for fused (gate+up) MoE weights: reads both halves of one buffer
+    string_to_spv("fused_up_gate_split_silu_f32",       "fused_up_gate_split.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FUG_SILU", "1"}});
+    string_to_spv("fused_up_gate_split_gelu_f32",       "fused_up_gate_split.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FUG_GELU", "1"}});
+    string_to_spv("fused_up_gate_split_relu_f32",       "fused_up_gate_split.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FUG_RELU", "1"}});
+    string_to_spv("fused_up_gate_split_swiglu_oai_f32", "fused_up_gate_split.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FUG_SWIGLU_OAI", "1"}});
+
+    // Per-expert bias add for MoE matmul results (in-place)
+    string_to_spv("add_bias_id_f32", "add_bias_id.comp", {});
+
     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     //
     // ============================== end ik_llama.cpp
