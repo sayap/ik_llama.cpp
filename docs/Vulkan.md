@@ -34,6 +34,11 @@ and `GET_ROWS`:
   dots against the F32/F16 activations. On devices with `VK_KHR_shader_integer_dot_product`
   the KT-family hash decode's 4-shift + 3-add byte sum is replaced by one `dotPacked4x8EXT`
   (a `_dot4` shader variant is selected at pipeline creation; the scalar fallback remains).
+- **decode Q8_1 activations (KT family)**: on integer-dot devices the KT-family decode
+  (`mul_mat_vec`) path now quantizes the F32 activations to Q8_1 and the
+  `mul_mat_vec_iq{1,2,3,4}_kt_q8_1` shaders dot the packed-int8 hash decode against the Q8_1
+  blocks with `dotPacked4x8EXT`, mirroring CUDA's `vec_dot_iq{1,2,3,4}_kt_q8_1`. This removes
+  the scalar-FMA activation dot from the decode FFN (selected for contiguous F32 activations).
 - **prompt processing (mul_mat)**: on NV_coopmat2 devices the mat-mat path runs the
   **coopmat2 tensor-core matmul with inline dequant** (`mul_mm_cm2.comp` + per-type decode
   functions in `dequant_funcs_cm2.comp`; see "vs CUDA" below for the details and the measured
@@ -282,11 +287,22 @@ Still not supported (their matmuls run on CPU), in priority order:
   embeddings, both single-block and multi-block rows). Run as
   `test-iqk-quants CPU|Vulkan0|CUDA0`. The KT family is allowed a looser tolerance because
   of its calibration factor (see above). Note: on `Vulkan0` the multi-token `MUL_MAT`
-  cases take the coopmat2 cm2 path, so the flat dequant kernels are exercised there via
-  the multi-token `MUL_MAT_ID` cases; on `Vulkan1` (KHR_coopmat) the multi-token `MUL_MAT`
-  cases exercise the flat dequant path directly. The single-token KS/KL/KT cases currently
-  fail on `Vulkan1` (a pre-existing `mul_mat_vec` row-meta issue on that device, unrelated
-  to the dequant kernels).
+  cases take the dequant-to-F16 path on both `Vulkan0` and `Vulkan1` (the cm2 inline-dequant
+  path is no longer used for the IQK/KT types), so both `MUL_MAT` and `MUL_MAT_ID` exercise
+  the flat dequant kernels. The single-token KS/KL/KT cases currently fail on `Vulkan1`
+  (a pre-existing `mul_mat_vec` row-meta issue on that device, unrelated to the dequant
+  kernels).
+- End-to-end benchmark (RTX 3090, Qwen2.5-Coder-32B-Instruct-IQ4_KT):
+  `llama-server -m <model> -dev Vulkan0 -c 8192 -ub 2048 -b 2048 -n 128 --host 127.0.0.1`
+  (`-c 8192` is the max on this 3090; see below). Send a tiny warmup prompt first — the
+  first prompt compiles the Vulkan pipelines — then measure via `/completion` with
+  `{"prompt": ..., "n_predict": N, "temperature": 0.0, "stream": false}` and read
+  `timings.prompt_per_second` / `timings.predicted_per_second` from the response. The
+  ~4400-token benchmark prompt is generated from a fixed seed (20-word vocabulary, 4000
+  words) for reproducibility. Decode-only measurements use
+  `llama-cli ... -n 64 --temp 0` and the `eval time` line (use 64+ tokens; a 4-token
+  server `tg` over-reports because the first token's decode is counted against the prompt
+  eval). CUDA reference: the same server command with `-dev CUDA0`.
 - `test-backend-ops` does not currently compile against this fork's headers.
 
 ### Fixed: large IQK/KT models were slow on Vulkan
@@ -352,8 +368,10 @@ remaining gaps are dominated by the FFN:
   (~320 GB/s weight reads, well below peak). Replacing the per-round byte sum with one
   `dot4` (`dotPacked4x8EXT`) cut the fused gate+up from ~441 us to ~258 us and the FFN
   down from ~237 us to ~138 us per layer, taking decode from ~17.7 to ~27 tok/s. The
-  activation dot is still scalar FMA; quantizing the activations to Q8_1 (like CUDA's
-  `vec_dot_iq4_kt_q8_1`) would let that use `dot4` too and should close the remaining gap.
+  activation dot is now also `dot4`: the decode path quantizes the F32 activations to Q8_1
+  and the KT-family `mul_mat_vec` kernels dot the packed-int8 hash values against the Q8_1
+  blocks (mirroring CUDA's `vec_dot_iq{1,2,3,4}_kt_q8_1`), removing the remaining scalar-FMA
+  activation dot.
 - **Prompt** (3x gap): prompt processing takes the mat-mat path for IQK/KT types, which
   dequantizes each weight matrix to F16 on the GPU and runs the F16 matmul (~4.4 ms per
   FFN matmul: ~1.5 ms dequant + ~2.9 ms tensor-core matmul). CUDA has a native quantized
