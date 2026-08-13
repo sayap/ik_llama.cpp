@@ -1,0 +1,137 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+#include "mul_mat_vec_iqk_base_q8_1.comp"
+#include "iq2k_table.comp"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// uint32 view of the byte-addressed weight buffer. IQ2_KS has a 2-byte row
+// scale header and 70-byte blocks (2-byte aligned only), so fields are read
+// through an unaligned-safe loader.
+layout (binding = 0) readonly buffer A32 { uint data_a32[]; };
+
+uint iq2ks_load_u32(uint byte_off) {
+    const uint dw = byte_off >> 2;
+    const uint sh = (byte_off & 3u) * 8u;
+    if (sh == 0u) return data_a32[dw];
+    return (data_a32[dw] >> sh) | (data_a32[dw + 1u] << (32u - sh));
+}
+
+#define QUANT_K 256
+#define BLOCK_BYTES 70
+#define META 2
+
+shared uint iq2k_shmem[2][256];
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, const uint i,
+                     const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    // 8 threads per block, CUDA-style vec_dot_iq2_ks_q8_1: each thread handles
+    // 8 values in each of four consecutive Q8_1 blocks (sub-blocks 4*group+0..3).
+    const uint group = itid / 4;
+    const uint sub = itid % 4;
+
+    const uint row_bytes = p.stride_a + num_blocks_per_row * BLOCK_BYTES;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint row_byte = a_byte + (first_row + n) * row_bytes;
+        const uint block_byte = row_byte + META + i * BLOCK_BYTES;
+
+        const float d = iqk_f16_to_f32(iqk_load_u16(row_byte));
+
+        // extra (2 bytes) at offset 0, then scales[0..3] at offset 2.
+        const uint head = iq2ks_load_u32(block_byte);
+        const uint extra16 = head & 0xffffu;
+        const uint scales01 = head >> 16;
+        const uint scales23 = iq2ks_load_u32(block_byte + 4) & 0xffffu;
+        const uint scales_all = scales01 | (scales23 << 16);
+
+        // qs starts at offset 6; each thread reads 8 bytes.
+        const uint qs_dw = block_byte + 6 + 32 * group + 8 * sub;
+        const uint w0 = iq2ks_load_u32(qs_dw);
+        const uint w1 = iq2ks_load_u32(qs_dw + 4);
+
+        // scales bytes for this thread's four sub-blocks (scales[2*group] and [2*group+1]).
+        const uint sc0 = (scales_all >> (16 * group)) & 0xffu;
+        const uint sc1 = (scales_all >> (16 * group + 8)) & 0xffu;
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint q = 0; q < 4; ++q) {
+                const uint s = 4 * group + q;
+                const uint b8 = (j * p.batch_stride_b + b_offset + i * QUANT_K) / 32 + s;
+                const vec2 ds = vec2(data_b[b8].ds);
+                const float d8 = ds.x;
+
+                const int qb0 = data_b[b8].qs[2 * sub + 0];
+                const int qb1 = data_b[b8].qs[2 * sub + 1];
+
+                // Four 2-bit indices for this Q8_1 block (field q of each byte).
+                const int packed_idx0 = int((w0 >> (2 * q)) & 0x03030303u);
+                const int packed_idx1 = int((w1 >> (2 * q)) & 0x03030303u);
+                const int off0 = dotPacked4x8EXT(packed_idx0, 0x40100401);
+                const int off1 = dotPacked4x8EXT(packed_idx1, 0x40100401);
+                const uint vsel = ((extra16 >> s) & 1u) != 0 ? 1 : 0;
+
+                const int packed0 = int(iq2k_shmem[vsel][off0]);
+                const int packed1 = int(iq2k_shmem[vsel][off1]);
+
+                int dot = dotPacked4x8EXT(packed0, qb0);
+                dot += dotPacked4x8EXT(packed1, qb1);
+
+                // sub-block scale: 4-bit scales nibble + 1 extra bit (bit s+8), minus 16.
+                const uint sc = (q < 2) ? sc0 : sc1;
+                const uint nib = (sc >> (4 * (q & 1))) & 0xFu;
+                const int ls = int(nib | (((extra16 >> (s + 8)) & 1u) << 4)) - 16;
+                const float dl = d * float(ls);
+
+                temp[j][n] = fma(dl * d8, float(dot), temp[j][n]);
+            }
+        }
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_byte, b_offset, d_offset;
+    get_offsets(a_byte, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+
+    const uint blocks_per_wg = gl_WorkGroupSize.x / 8;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid % 8;
+    const uint ix = tid / 8;
+
+    [[unroll]] for (uint idx = tid; idx < 256; idx += BLOCK_SIZE) {
+        iq2k_shmem[0][idx] = iq2k_table[idx];
+        iq2k_shmem[1][idx] = iq2k_table[256 + idx];
+    }
+    barrier();
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg)
+        calc_superblock(a_byte, b_offset, itid, i, num_blocks_per_row, first_row, num_rows);
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}
