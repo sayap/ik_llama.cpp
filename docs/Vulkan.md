@@ -293,16 +293,18 @@ Still not supported (their matmuls run on CPU), in priority order:
   (a pre-existing `mul_mat_vec` row-meta issue on that device, unrelated to the dequant
   kernels).
 - End-to-end benchmark (RTX 3090, Qwen2.5-Coder-32B-Instruct-IQ4_KT):
-  `llama-server -m <model> -dev Vulkan0 -c 8192 -ub 2048 -b 2048 -n 128 --host 127.0.0.1`
-  (`-c 8192` is the max on this 3090; see below). Send a tiny warmup prompt first — the
-  first prompt compiles the Vulkan pipelines — then measure via `/completion` with
-  `{"prompt": ..., "n_predict": N, "temperature": 0.0, "stream": false}` and read
-  `timings.prompt_per_second` / `timings.predicted_per_second` from the response. The
-  ~4400-token benchmark prompt is generated from a fixed seed (20-word vocabulary, 4000
-  words) for reproducibility. Decode-only measurements use
-  `llama-cli ... -n 64 --temp 0` and the `eval time` line (use 64+ tokens; a 4-token
-  server `tg` over-reports because the first token's decode is counted against the prompt
-  eval). CUDA reference: the same server command with `-dev CUDA0`.
+  `llama-server -m <model> -dev Vulkan0 -c 4096 -ub 2048 -b 2048 -n 256 -nocb --host 127.0.0.1`
+  Send a tiny warmup prompt first — the first prompt compiles the Vulkan pipelines — then
+  send one measurement request to `/completion` with
+  `{"prompt": ..., "n_predict": 256, "temperature": 0.0, "stream": false}` and read
+  `timings.prompt_per_second` / `timings.predicted_per_second` from the response (do not
+  send the big prompt twice; the prompt cache makes the second request report only 1
+  prompt token). The ~3000-token prompt is generated from a fixed seed 12345 (20-word
+  vocabulary, 2600 words). `-nocb` avoids a continuous-batching `vk::DeviceLostError`
+  during prompt processing on this model. On driver 610.57.04, with the Q8_1 decode fix
+  this measures ~1110 tok/s prompt / ~24.9 tok/s generation; without it ~1105 tok/s
+  prompt / ~23.6 tok/s generation. Decode-only measurements use `llama-cli ... -n 64 --temp 0`
+  and the `eval time` line. CUDA reference: the same server command with `-dev CUDA0`.
 - `test-backend-ops` does not currently compile against this fork's headers.
 
 ### Fixed: large IQK/KT models were slow on Vulkan
@@ -351,28 +353,29 @@ Remaining performance notes:
 
 ### vs CUDA: the prompt-processing gap and the paths to close it
 
-On the same RTX 3090 the IQ4_KT model now runs at ~1070 tok/s prompt (`-ub 2048`) and
-~23-24 tok/s decode on Vulkan, vs ~1240 / ~30 on CUDA (prompt gap ~1.16x, decode gap
-~1.25x). The decode (TG) gap is mostly *fixed*, not context-dependent: measured
+On the same RTX 3090 (driver 610.57.04) the IQ4_KT model now runs at ~1110 tok/s prompt
+(`-ub 2048`, fixed-seed 3001-token prompt) and ~24.9 tok/s decode on Vulkan, vs
+~1240 / ~30 on CUDA (prompt gap ~1.12x, decode gap ~1.20x). The decode (TG) gap is mostly *fixed*, not context-dependent: measured
 40.7 ms/token at 17-token context vs 42.5 ms/token at 4399-token context (~0.4 us per
 context token). The small growth is the KV-cache read in the decode flash-attention
 path, which uses the scalar shader for single-token queries (`N == 1` falls back from
 coopmat2 to FA_SCALAR). Note: a 4-token server timing can read ~31 tok/s because the
 first token's decode is counted against the prompt eval; 64+ tokens (llama-cli "eval
-time" and server "tg") agree at ~23-24 tok/s.
+time" and server "tg") agree at ~24.9 tok/s.
 
 Steady-state per-op profiling (GPU clocks locked by running many iterations) shows both
 remaining gaps are dominated by the FFN:
 
-- **Decode** (1.15x gap): the `mul_mat_vec` FFN was ALU-bound on the KT hash decode
+- **Decode** (1.20x gap): the `mul_mat_vec` FFN was ALU-bound on the KT hash decode
   (~320 GB/s weight reads, well below peak). Replacing the per-round byte sum with one
   `dot4` (`dotPacked4x8EXT`) cut the fused gate+up from ~441 us to ~258 us and the FFN
-  down from ~237 us to ~138 us per layer, taking decode from ~17.7 to ~27 tok/s. The
+  down from ~237 us to ~138 us per layer, taking decode from ~17.7 to ~23 tok/s. The
   activation dot is now also `dot4`: the decode path quantizes the F32 activations to Q8_1
   and the KT-family `mul_mat_vec` kernels dot the packed-int8 hash values against the Q8_1
   blocks (mirroring CUDA's `vec_dot_iq{1,2,3,4}_kt_q8_1`), removing the remaining scalar-FMA
-  activation dot.
-- **Prompt** (3x gap): prompt processing takes the mat-mat path for IQK/KT types, which
+  activation dot; end-to-end decode is now ~24.9 tok/s (vs ~23.6 without the Q8_1 activation
+  dot).
+- **Prompt** (1.12x gap): prompt processing takes the mat-mat path for IQK/KT types, which
   dequantizes each weight matrix to F16 on the GPU and runs the F16 matmul (~4.4 ms per
   FFN matmul: ~1.5 ms dequant + ~2.9 ms tensor-core matmul). CUDA has a native quantized
   matmul (`mmq`) that reads the quantized weights once. Two approaches were explored for
