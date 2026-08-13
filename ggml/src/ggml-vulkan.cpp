@@ -2804,32 +2804,6 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_MM(GGML_TYPE_IQ4_XS,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS].f32acc,  matmul_id_iq4_xs_f32,  , mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, 4, _id);
         CREATE_MM(GGML_TYPE_IQ4_NL,  pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL].f32acc,  matmul_id_iq4_nl_f32,  , mmq_wg_denoms, warptile_mmq, vk_mat_mat_id_push_constants, 4, _id);
     }
-#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-    // IQ4_KT Q8_1 SIMT mmq (dot4). Only for pure-SIMT devices (no coopmat): on
-    // tensor-core (coopmat2/coopmat) GPUs the SIMT mmq is slower than the
-    // dequant->F16 tensor-core matmul (measured: 261 vs 489 tok/s PP on RTX 3090),
-    // so it is not created there and IQ4_KT keeps the fast path. The 256-element
-    // block / per-row META layout is handled by a custom byte-addressed load in
-    // mul_mmq.comp.
-    if (device->integer_dot_product && !device->coopmat2 && !device->coopmat_support) {
-        const std::array<uint32_t,3> l_wd_iqkt = {128,128,1}, m_wd_iqkt = {64,64,1}, s_wd_iqkt = {32,32,1};
-        const std::vector<uint32_t> l_wt_iqkt = { 128, 128, 128, 32, subgroup_size_8*2, 64, 2, 4, 4, 1, subgroup_size_8 };
-        const std::vector<uint32_t> m_wt_iqkt = { 128,  64,  64, 32, subgroup_size_8,     32, 2, 2, 2, 1, subgroup_size_8 };
-        const std::vector<uint32_t> s_wt_iqkt = { subgroup_size_32, 32, 32, 32, 32,       32, 2, 2, 1, 1, subgroup_size_8 };
-        if (device->mul_mat_l[GGML_TYPE_IQ4_KT]) {
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT].f16acc->l, "matmul_iq4_kt_q8_1_f16acc_l", matmul_iq4_kt_q8_1_f16acc_len, matmul_iq4_kt_q8_1_f16acc_data, "main", 3, sizeof(vk_mat_mat_push_constants), l_wd_iqkt, l_wt_iqkt, 1);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT].f32acc->l, "matmul_iq4_kt_q8_1_l",        matmul_iq4_kt_q8_1_len,        matmul_iq4_kt_q8_1_data,        "main", 3, sizeof(vk_mat_mat_push_constants), l_wd_iqkt, l_wt_iqkt, 1);
-        }
-        if (device->mul_mat_m[GGML_TYPE_IQ4_KT]) {
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT].f16acc->m, "matmul_iq4_kt_q8_1_f16acc_m", matmul_iq4_kt_q8_1_f16acc_len, matmul_iq4_kt_q8_1_f16acc_data, "main", 3, sizeof(vk_mat_mat_push_constants), m_wd_iqkt, m_wt_iqkt, 1);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT].f32acc->m, "matmul_iq4_kt_q8_1_m",        matmul_iq4_kt_q8_1_len,        matmul_iq4_kt_q8_1_data,        "main", 3, sizeof(vk_mat_mat_push_constants), m_wd_iqkt, m_wt_iqkt, 1);
-        }
-        if (device->mul_mat_s[GGML_TYPE_IQ4_KT]) {
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT].f16acc->s, "matmul_iq4_kt_q8_1_f16acc_s", matmul_iq4_kt_q8_1_f16acc_len, matmul_iq4_kt_q8_1_f16acc_data, "main", 3, sizeof(vk_mat_mat_push_constants), s_wd_iqkt, s_wt_iqkt, 1);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT].f32acc->s, "matmul_iq4_kt_q8_1_s",        matmul_iq4_kt_q8_1_len,        matmul_iq4_kt_q8_1_data,        "main", 3, sizeof(vk_mat_mat_push_constants), s_wd_iqkt, s_wt_iqkt, 1);
-        }
-    }
-#endif
     // reusing CREATE_MM from the fp32 path
     if ((device->coopmat2 || device->coopmat_support)
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
