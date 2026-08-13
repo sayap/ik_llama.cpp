@@ -174,6 +174,16 @@ The four recurrent ops are now implemented on Vulkan (see "Op coverage"):
 multi-token, both repeat types, several head sizes) on a target backend, and passes on
 `Vulkan0` and `Vulkan1`. A Qwen3.6-27B IQ4_KS model now runs end-to-end on `Vulkan0`.
 
+### 8. Flash-attention precision for qwen35/qwen3next in dynamic builds
+
+The qwen35/qwen3next full-attention layers were missing from the
+`should_use_f32_precision` arch list in `llm_build_kqv()` / `build_std_attention()`, so
+they ran flash attention with `GGML_PREC_F16` and produced garbage logits (`"!!!!"`,
+NaN, "Failed to sample token"). Static Vulkan builds mask this (`GGML_USE_VULKAN`
+forces F32 for every arch), so it only surfaced with `GGML_BACKEND_DL=ON`, where the
+arch list is the only thing forcing F32. Added `LLM_ARCH_QWEN3NEXT`,
+`LLM_ARCH_QWEN35` and `LLM_ARCH_QWEN35MOE` to both lists.
+
 ## Benchmarks (RTX 3090, Vulkan0)
 
 Qwen2.5-Coder-0.5B-Instruct-Q8_0 (dense, `-c 2048`, single token batch):
