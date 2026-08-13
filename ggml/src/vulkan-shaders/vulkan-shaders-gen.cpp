@@ -565,7 +565,7 @@ void process_shaders() {
     // Q8_1 activation mul_mat_vec: decode the quantized values to packed int8 and dot
     // them against block_q8_1 activations with dotPacked4x8EXT. The KT family uses the
     // multiplicative-hash decode; IQ4_KS uses the 4-bit iq4k_values table decode.
-    for (const auto& tname : std::vector<std::string>{ "iq1_kt", "iq2_kt", "iq3_kt", "iq4_kt", "iq2_k", "iq3_k", "iq3_ks", "iq4_kss", "iq4_ks", "iq4_k", "iq5_k", "iq5_ks" }) {
+    for (const auto& tname : std::vector<std::string>{ "iq1_kt", "iq2_kt", "iq3_kt", "iq4_kt", "iq2_k", "iq2_kl", "iq3_k", "iq3_ks", "iq4_kss", "iq4_ks", "iq4_k", "iq5_k", "iq5_ks" }) {
         const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
         string_to_spv("mul_mat_vec_" + tname + "_q8_1", "mul_mat_vec_" + tname + "_q8_1.comp", {{"FLOAT_TYPE", "float"}, {data_a_key, "1"}, {"D_TYPE", "float"}});
     }

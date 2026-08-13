@@ -1,0 +1,152 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+#include "mul_mat_vec_iqk_base_q8_1.comp"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// uint32 view of the byte-addressed weight buffer. IQ2_KL has a 2-byte row
+// scale header and 86-byte blocks (2-byte aligned only), so fields are read
+// through an unaligned-safe loader.
+layout (binding = 0) readonly buffer A32 { uint data_a32[]; };
+
+uint iq2kl_load_u32(uint byte_off) {
+    const uint dw = byte_off >> 2;
+    const uint sh = (byte_off & 3u) * 8u;
+    if (sh == 0u) return data_a32[dw];
+    return (data_a32[dw] >> sh) | (data_a32[dw + 1u] << (32u - sh));
+}
+
+#define QUANT_K 256
+#define BLOCK_BYTES 86
+#define META 2
+
+// iq2kl_values: 32 uint16 entries, each packing two int8 values.
+shared uint iq2kl_shmem[32];
+
+// Look up two 5-bit indices and pack their 2-int8 results into one int32.
+int iq2kl_lookup2(uint a, uint b) {
+    return int(iq2kl_shmem[a] | (iq2kl_shmem[b] << 16));
+}
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, const uint i,
+                     const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    // 8 threads per block, CUDA-style vec_dot_iq2_kl_q8_1: thread (ib64, il16)
+    // handles 16 elements in each of two Q8_1 blocks (sub-blocks 2*ib64 and
+    // 2*ib64+1). Each 5-bit index maps to two int8 values.
+    const uint ib64 = itid / 2;   // 0..3
+    const uint il16 = itid % 2;   // 0..1
+
+    const uint row_bytes = p.stride_a + num_blocks_per_row * BLOCK_BYTES;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint row_byte = a_byte + (first_row + n) * row_bytes;
+        const uint block_byte = row_byte + META + i * BLOCK_BYTES;
+
+        const float d = iqk_f16_to_f32(iqk_load_u16(row_byte));
+
+        // scales_h (2 bytes) at offset 0, then scales_l[0..3] at offset 2.
+        const uint head = iq2kl_load_u32(block_byte);
+        const uint scales_h16 = head & 0xffffu;
+        const uint scales_l01 = head >> 16;
+        const uint scales_l23 = iq2kl_load_u32(block_byte + 4) & 0xffffu;
+        const uint scales_all = scales_l01 | (scales_l23 << 16);
+
+        // qs bytes [16*ib64 + 8*il16, +8), qh bytes [8*il16, +8)
+        const uint qs_w0 = iq2kl_load_u32(block_byte + 6 + 16 * ib64 + 8 * il16);
+        const uint qs_w1 = iq2kl_load_u32(block_byte + 10 + 16 * ib64 + 8 * il16);
+        const uint qh_w0 = iq2kl_load_u32(block_byte + 70 + 8 * il16);
+        const uint qh_w1 = iq2kl_load_u32(block_byte + 74 + 8 * il16);
+
+        // sub-block scales: 4-bit scales_l nibble + 2-bit scales_h, minus 32.
+        const uint sl_base = 2 * (ib64 & 1);
+        const uint sl_shift = 4 * (ib64 >> 1);
+        const uint sl1 = (scales_all >> (8 * sl_base)) & 0xffu;
+        const uint sl2 = (scales_all >> (8 * (sl_base + 1))) & 0xffu;
+        const uint sh_bits1 = (scales_h16 >> (4 * ib64)) & 3u;
+        const uint sh_bits2 = (scales_h16 >> (4 * ib64 + 2)) & 3u;
+        const int ls1 = int(((sl1 >> sl_shift) & 0xFu) | (sh_bits1 << 4)) - 32;
+        const int ls2 = int(((sl2 >> sl_shift) & 0xFu) | (sh_bits2 << 4)) - 32;
+        const float dl1 = d * float(ls1);
+        const float dl2 = d * float(ls2);
+
+        const uint sh0 = 2 * ib64;
+        const uint sh1 = 2 * ib64 + 1;
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint base_b8 = (j * p.batch_stride_b + b_offset + i * QUANT_K) / 32;
+            const uint b8a = base_b8 + 2 * ib64;
+            const uint b8b = base_b8 + 2 * ib64 + 1;
+            const vec2 dsa = vec2(data_b[b8a].ds);
+            const vec2 dsb = vec2(data_b[b8b].ds);
+            const float d8a = dsa.x;
+            const float d8b = dsb.x;
+
+            // sub-block 0: qs low nibbles + qh bit sh0; sub-block 1: high nibbles + sh1.
+            const uint lo0 = (qs_w0 & 0x0f0f0f0fu) | (((qh_w0 >> sh0) & 0x01010101u) << 4);
+            const uint lo1 = (qs_w1 & 0x0f0f0f0fu) | (((qh_w1 >> sh0) & 0x01010101u) << 4);
+            const uint hi0 = ((qs_w0 >> 4) & 0x0f0f0f0fu) | (((qh_w0 >> sh1) & 0x01010101u) << 4);
+            const uint hi1 = ((qs_w1 >> 4) & 0x0f0f0f0fu) | (((qh_w1 >> sh1) & 0x01010101u) << 4);
+
+            int sumi1 = 0;
+            sumi1 += dotPacked4x8EXT(iq2kl_lookup2(lo0 & 0x1fu, (lo0 >> 8) & 0x1fu), data_b[b8a].qs[4 * il16 + 0]);
+            sumi1 += dotPacked4x8EXT(iq2kl_lookup2((lo0 >> 16) & 0x1fu, (lo0 >> 24) & 0x1fu), data_b[b8a].qs[4 * il16 + 1]);
+            sumi1 += dotPacked4x8EXT(iq2kl_lookup2(lo1 & 0x1fu, (lo1 >> 8) & 0x1fu), data_b[b8a].qs[4 * il16 + 2]);
+            sumi1 += dotPacked4x8EXT(iq2kl_lookup2((lo1 >> 16) & 0x1fu, (lo1 >> 24) & 0x1fu), data_b[b8a].qs[4 * il16 + 3]);
+
+            int sumi2 = 0;
+            sumi2 += dotPacked4x8EXT(iq2kl_lookup2(hi0 & 0x1fu, (hi0 >> 8) & 0x1fu), data_b[b8b].qs[4 * il16 + 0]);
+            sumi2 += dotPacked4x8EXT(iq2kl_lookup2((hi0 >> 16) & 0x1fu, (hi0 >> 24) & 0x1fu), data_b[b8b].qs[4 * il16 + 1]);
+            sumi2 += dotPacked4x8EXT(iq2kl_lookup2(hi1 & 0x1fu, (hi1 >> 8) & 0x1fu), data_b[b8b].qs[4 * il16 + 2]);
+            sumi2 += dotPacked4x8EXT(iq2kl_lookup2((hi1 >> 16) & 0x1fu, (hi1 >> 24) & 0x1fu), data_b[b8b].qs[4 * il16 + 3]);
+
+            temp[j][n] = fma(dl1 * d8a, float(sumi1), temp[j][n]);
+            temp[j][n] = fma(dl2 * d8b, float(sumi2), temp[j][n]);
+        }
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_byte, b_offset, d_offset;
+    get_offsets(a_byte, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+
+    const uint blocks_per_wg = gl_WorkGroupSize.x / 8;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid % 8;
+    const uint ix = tid / 8;
+
+    [[unroll]] for (uint idx = tid; idx < 32; idx += BLOCK_SIZE) {
+        iq2kl_shmem[idx] = uint(iq2kl_values[idx]);
+    }
+    barrier();
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg)
+        calc_superblock(a_byte, b_offset, itid, i, num_blocks_per_row, first_row, num_rows);
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}
