@@ -8,7 +8,7 @@
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 #define QUANT_K 256
-#define BLOCK_BYTES 136
+#define BLOCK_BYTES 128
 #define META 4
 
 shared uint iq4k_byte_shmem[2][128];
@@ -33,16 +33,22 @@ void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, co
         const uint block_byte = row_byte + META + i * BLOCK_BYTES;
 
         const float d = uintBitsToFloat(iqk_load_u32(row_byte));
-        const uint sc = data_a[block_byte + ib32];
-        const float dl = d * (float(sc & 254u) - 127.0f);
-        const uint v_sel = (sc & 1u) != 0 ? 1 : 0;
 
-        const uint qs_off = 8 + 16 * ib32;
-
-        const uint w0 = iqk_load_u32(block_byte + qs_off + 0);
-        const uint w1 = iqk_load_u32(block_byte + qs_off + 4);
-        const uint w2 = iqk_load_u32(block_byte + qs_off + 8);
-        const uint w3 = iqk_load_u32(block_byte + qs_off + 12);
+        // Decode the 8 packed 16-bit values of this 32-element sub-block into 16
+        // nibble-pair bytes. The scale/table-selector bits are the LSBs.
+        uint ls = 0;
+        uint a8[16];
+        const uint qs16_off = 16 * ib32;
+        [[unroll]] for (uint k = 0; k < 8; ++k) {
+            const uint q16 = iqk_load_u16(block_byte + qs16_off + 2 * k);
+            uint a = q16 & 0xfffeu;
+            a ^= a >> 1;
+            a8[2 * k + 0] = a & 0xffu;
+            a8[2 * k + 1] = (a >> 8) & 0xffu;
+            ls |= (q16 & 1u) << k;
+        }
+        const float dl = d * (float(ls & 254u) - 127.0f);
+        const uint v_sel = (ls & 1u) != 0 ? 1 : 0;
 
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             const uint b8 = (j * p.batch_stride_b + b_offset + y_idx) / 32;
@@ -51,11 +57,10 @@ void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, co
 
             int sumi = 0;
             [[unroll]] for (uint g = 0; g < 4; ++g) {
-                const uint w = (g == 0) ? w0 : (g == 1) ? w1 : (g == 2) ? w2 : w3;
                 int packed_lo = 0;
                 int packed_hi = 0;
                 [[unroll]] for (uint k = 0; k < 4; ++k) {
-                    const uint q = (w >> (8 * k)) & 0xffu;
+                    const uint q = a8[4 * g + k];
                     const uint entry = iq4k_byte_entry(v_sel, q);
                     packed_lo |= int(entry & 0xffu) << (8 * k);
                     packed_hi |= int((entry >> 8) & 0xffu) << (8 * k);
