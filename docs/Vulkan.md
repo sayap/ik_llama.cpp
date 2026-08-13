@@ -384,8 +384,11 @@ running many iterations) shows both remaining gaps are dominated by the FFN:
     (n=32) from ~3.8 ms, now faster than the scalar cm2 inline dequant (~3.1 ms). The
     dense `MUL_MAT` path therefore falls back to dequant+F16 for the IQK/KT families
     (cm2 is kept only on decode-vector-capable GPUs). End-to-end prompt processing on the
-    32B IQ4_KT model improves from ~500 tok/s to ~850 tok/s (batch ~512); the remaining
-    gap to CUDA (~1240 tok/s) is the tensor-core F16 matmul itself.
+    32B IQ4_KT model improves from ~500 tok/s to ~850 tok/s at the default ubatch (512);
+    with `-ub 2048` (or `-ub 4096`) it reaches ~1090-1110 tok/s, within ~1.1x of CUDA
+    (~1240 tok/s), because the larger batch uses the tensor cores more efficiently and
+    dequantizes the weights fewer times. The remaining gap is the F16 tensor-core matmul
+    itself (running at ~75% of the FP16 peak).
 
     Note that the earlier ~15-17 ms cm2 / ~16-23 ms flat-dequant numbers above were
     cold-clock artifacts; with 20-iteration warmup the cm2 FFN matmul is ~3.1 ms (n=32)
