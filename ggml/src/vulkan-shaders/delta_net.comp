@@ -14,6 +14,7 @@ layout(push_constant) uniform PC {
     uint repeat_type;
     uint v_nb1, v_nb2, v_nb3;
     float scale;
+    uint has_saved;
 } p;
 
 layout(binding = 0) readonly buffer Q { float q[]; };
@@ -23,6 +24,7 @@ layout(binding = 3) readonly buffer G { float g[]; };
 layout(binding = 4) readonly buffer B { float b[]; };
 layout(binding = 5) readonly buffer S { float state_in[]; };
 layout(binding = 6) buffer D { float dst[]; };
+layout(binding = 7) buffer SAVED { float saved[]; };
 
 shared float s_k[S_V];
 shared float s_q[S_V];
@@ -107,6 +109,13 @@ void main() {
         for (uint c = 0; c < S_V; ++c) {
             const float s_new = decay * state_row[c] + v_new * (s_k[c] * k_norm_inv);
             state_row[c] = clamp(s_new, -1e6f, 1e6f);
+        }
+
+        if (p.has_saved != 0u && t + 1u < p.n_tokens) {
+            const uint saved_base = t * (S_V * S_V * p.H_v * p.n_seqs) + state_base;
+            for (uint c = 0; c < S_V; ++c) {
+                saved[saved_base + c * S_V + row] = state_row[c];
+            }
         }
 
         barrier();
