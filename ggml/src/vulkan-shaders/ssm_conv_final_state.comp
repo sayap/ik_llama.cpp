@@ -1,0 +1,36 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint nc;
+    uint nr;
+    uint n_t;
+    uint src0_nb1;
+    uint src1_nb1;
+} p;
+
+layout(binding = 0) readonly buffer S0 { float s0[]; };
+layout(binding = 1) readonly buffer X  { float x[]; };
+layout(binding = 2) buffer DST { float dst[]; };
+
+void main() {
+    const uint row = gl_GlobalInvocationID.x;
+    if (row >= p.nr) {
+        return;
+    }
+
+    const uint state_base = row * p.src0_nb1;
+    const uint dst_base = p.nr * p.n_t + row * p.nc;
+
+    for (uint j = 0; j < p.nc; ++j) {
+        const uint idx = p.n_t - 1u + j;
+        dst[dst_base + j] = idx < p.nc - 1u
+            ? s0[state_base + idx]
+            : x[row + (idx - (p.nc - 1u)) * p.src1_nb1];
+    }
+}

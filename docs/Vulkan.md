@@ -151,6 +151,29 @@ makes a device like the AMD Radeon 8060S show up as `Vulkan1` and selectable via
 `-dev CUDA0`, `-dev Vulkan1`, `-dev CUDA0,Vulkan1` etc. select devices from the ggml
 backend registry. See `docs/build.md` and the `-dev` commit for details.
 
+### 7. Gated delta-net (`qwen35` / `qwen3next`)
+
+The four recurrent ops are now implemented on Vulkan (see "Op coverage"):
+
+- **`SSM_CONV`**: a single-sequence fast path (`ssm_conv.comp`, parallel over rows and
+  32-token blocks) plus a `ssm_conv_final_state.comp` kernel. This covers the qwen35/
+  qwen3next graph (the builder always uses `n_kv == 1`); multi-sequence routing and
+  per-step conv checkpointing fall back to CPU.
+- **`L2_NORM`**: wired in and made stride-aware. The pre-existing shader assumed a
+  contiguous `[ne0, rows]` layout (q/k are permuted views for prompt batches) and used
+  `inversesqrt(max(sum, eps))` instead of the CPU's `1/max(sqrt(sum), eps)`.
+- **`SOFTPLUS`**: new `softplus.comp` shader (f32/f16) matching `ggml_compute_softplus_f32`.
+- **`DELTA_NET`**: new `delta_net.comp` shader. One workgroup per (head, seq), `S_V`
+  threads (spec constant, 16/32/64/128); each thread owns one output row and keeps the
+  state row in registers. q/k addressing matches the graph layout (contiguous for prompt,
+  head-strided for decode); v/g/beta use the permuted-view strides from the tensors. The
+  new state is written into the result tail and the existing `CPY` node persists it, so
+  the CPU-side src[7] fused-copy optimization is not needed.
+
+`tests/test-delta-net.cpp` checks all four ops against the CPU reference (single- and
+multi-token, both repeat types, several head sizes) on a target backend, and passes on
+`Vulkan0` and `Vulkan1`. A Qwen3.6-27B IQ4_KS model now runs end-to-end on `Vulkan0`.
+
 ## Benchmarks (RTX 3090, Vulkan0)
 
 Qwen2.5-Coder-0.5B-Instruct-Q8_0 (dense, `-c 2048`, single token batch):
@@ -192,17 +215,14 @@ several quant types and batch sizes.
 
 ### Priority (highest first)
 
-1. **Gated delta-net** (`qwen35` / `qwen3next`): `SSM_CONV`, `L2_NORM`, `SOFTPLUS`,
-   `DELTA_NET`. Stateful, so CPU fallback produces garbage logits — these models cannot
-   run on Vulkan at all today.
-2. **`Q6_0`** — the only legacy 6-bit quant still missing from `MUL_MAT`.
-3. **`MXFP4`** — the micro-scaling 4-bit format.
-4. **Indexer / DSA / CSA / HCA / GLM-DSA**: `INDEXER_TOPK`, `MASK_TOPK`, `MASK_TO_IDX`,
+1. **`Q6_0`** — the only legacy 6-bit quant still missing from `MUL_MAT`.
+2. **`MXFP4`** — the micro-scaling 4-bit format.
+3. **Indexer / DSA / CSA / HCA / GLM-DSA**: `INDEXER_TOPK`, `MASK_TOPK`, `MASK_TO_IDX`,
    `SINKHORN`, `HC_PRE`, `HC_POST`, `LATENT_ATTN`, `DS4_COMP`. Stateful sparse-attention
    ops (DeepSeek2/4, OpenPangu, GLM-4.5-Air, GLM-DSA).
-5. **`--fit` with `GGML_BACKEND_DL`** — per-device memory reports 0 MiB.
-6. **`-sm graph` / `-sm attn`** split modes.
-7. Everything else: Mamba `SSM_SCAN`, the `*_R4` repacks and `IQ1_BN`/`IQ2_BN`, async
+4. **`--fit` with `GGML_BACKEND_DL`** — per-device memory reports 0 MiB.
+5. **`-sm graph` / `-sm attn`** split modes.
+6. Everything else: Mamba `SSM_SCAN`, the `*_R4` repacks and `IQ1_BN`/`IQ2_BN`, async
    tensor copies/events, the fence busy-wait, and the remaining training/vision ops
    (`GLU`, `RWKV_WKV6/7`, `CONV_2D_DW`, `SIN`/`COS`, ...).
 
@@ -211,19 +231,17 @@ several quant types and batch sizes.
 These ops are produced by ik_llama's graph builder but are **not implemented** in the
 Vulkan backend, so they fall back to the CPU backend with expensive copies:
 
-- **Gated delta-net** (`qwen35` / `qwen3next` recurrent layers; e.g. Qwen3.5-0.8B): the
-  recurrent layer builds `GGML_OP_SSM_CONV` (causal conv over the qkv projection, with a
-  per-sequence conv state and per-step state save), `GGML_OP_L2_NORM` (q/k normalization;
-  the `l2_norm.comp` shader exists but is not wired in), `GGML_UNARY_OP_SOFTPLUS` (gate
-  `softplus(alpha+dt)*A`) and `GGML_OP_DELTA_NET` (the fused recurrent op
-  `f(q,k,v,g,beta,state) -> [output | new_state]`). `GGML_OP_REDUCE` is only needed for
-  multi-device splits of the layer. Unlike the fused up-gate, these ops are **stateful**
-  (they read and write the KV-cache state every step), so CPU fallback is not merely slow:
-  the per-step GPU<->CPU state round-trip currently produces garbage logits (NaN /
-  "Failed to sample token"). Implementing them requires new shaders + pipeline variants
-  and `supports_op` / `build_graph` entries; `DELTA_NET` is the large one (a fused,
-  flash-attention-style recurrent kernel; it is ik_llama-specific, so there is no upstream
-  Vulkan implementation to port).
+- **Gated delta-net** (`qwen35` / `qwen3next` recurrent layers) is now implemented on
+  Vulkan: `GGML_OP_SSM_CONV` (single-sequence fast path: parallel over rows and tokens,
+  plus a separate final-state kernel), `GGML_OP_L2_NORM` (stride-aware; the shader was
+  unwired and had an eps bug), `GGML_UNARY_OP_SOFTPLUS` and `GGML_OP_DELTA_NET` (a fused
+  recurrent kernel, one workgroup per (head, seq), S_V ∈ {16,32,64,128} via spec
+  constants, with the state row kept in registers). The delta-net op writes the new state
+  into the result tail and lets the existing state-copy node persist it (the CPU-style
+  src[7] fused-copy optimization is not used). Not yet supported (falls back to CPU):
+  per-step conv/state checkpointing (`src[4]`/`src[6]` non-null) and multi-sequence
+  `SSM_CONV` routing (`n_kv > 1`). `GGML_OP_REDUCE` is only needed for multi-device
+  splits of the layer.
 - **Indexer / DSA / CSA / HCA / GLM-DSA** (DeepSeek2/4, OpenPangu, GLM-4.5-Air, GLM-DSA
   sparse attention): `GGML_OP_INDEXER_TOPK`, `GGML_OP_MASK_TOPK`, `GGML_OP_MASK_TO_IDX`,
   `GGML_OP_SINKHORN`, `GGML_OP_HC_PRE`, `GGML_OP_HC_POST`, `GGML_OP_LATENT_ATTN`,
@@ -286,6 +304,11 @@ Still not supported (their matmuls run on CPU), in priority order:
   Run as `test-fused-up-gate CPU|Vulkan0|CUDA0`. Note that the IQ4_XS CPU-vs-GPU comparison
   has a large pre-existing gap (visible even in plain `MUL_MAT`), so that type is allowed a
   looser tolerance.
+- `tests/test-delta-net.cpp` validates `SSM_CONV`, `L2_NORM`, `SOFTPLUS` and `DELTA_NET`
+  against the CPU reference on a target backend: single- and multi-token delta-net, both
+  repeat types, several head sizes (the multi-token CPU reference is only trustworthy for
+  head_dim 64/128 where `iqk_fused_delta_net` handles the v strides). Run as
+  `test-delta-net CPU|Vulkan0|CUDA0`.
 - `tests/test-iqk-quants.cpp` validates the 15 IQK/KT types against the scalar dequant
   reference (the format definition): single-token decode, small batches, larger K,
   multi-token (dequant-to-F16 path), MoE (`MUL_MAT_ID`) and `GET_ROWS` (quantized token

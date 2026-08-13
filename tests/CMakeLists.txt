@@ -214,6 +214,9 @@ llama_build_and_test(test-fused-up-gate.cpp LABEL "main" ARGS Vulkan0)
 llama_build_and_test(test-iqk-quants.cpp LABEL "main" ARGS Vulkan0)
 llama_build_and_test(test-iqk-cm2-time.cpp LABEL "main")
 
+# gated delta-net recurrent op correctness (CPU vs backend comparison)
+llama_build_and_test(test-delta-net.cpp LABEL "main" ARGS Vulkan0)
+
 
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
