@@ -7,6 +7,11 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
+// uint32 view of the byte-addressed weight buffer (IQ2_KT has a 4-byte row
+// scale header and 68-byte blocks, so every row/block/field offset here is
+// 4-byte aligned).
+layout (binding = 0) readonly buffer A32 { uint data_a32[]; };
+
 #define QUANT_K 256
 #define BLOCK_BYTES 68
 #define META 4
@@ -15,48 +20,55 @@ FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
 void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, const uint i,
                      const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
-    // 16 threads per block: ib32 = itid/2 (0..7), half = itid%2.
-    // Each thread handles 16 elements = 2 groups of 8 values.
-    const uint ib32 = itid / 2;
-    const uint h = itid % 2;
-    const uint e = 32 * ib32 + 16 * h;
+    // 8 threads per block, CUDA-style vec_dot_iq2_kt_q8_1: thread ib32 handles
+    // a full 32-element Q8_1 block — four uint16 ql values, eight hash rounds
+    // (two per uint16) dotted against the block's eight int32 words.
+    const uint ib32 = itid;    // 0..7
 
-    const uint y_idx = i * QUANT_K + e;
     const uint row_bytes = p.stride_a + num_blocks_per_row * BLOCK_BYTES;
 
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const uint row_byte = a_byte + (first_row + n) * row_bytes;
-        const uint block_byte = row_byte + META + i * BLOCK_BYTES;
+        const uint block_dw = (row_byte + META + i * BLOCK_BYTES) >> 2;
 
-        const float d = uintBitsToFloat(iqk_load_u32(row_byte));
-        const uint sc = data_a[block_byte + ib32 % 4] >> (4 * (ib32 / 4));
-        const float dl = d * 1.05f * float(iq4k_values[sc & 0xFu]);
+        const float d = uintBitsToFloat(data_a32[row_byte >> 2]);
 
-        const uint ql_off = 4 + 8 * ib32 + 4 * h;
+        // scales[4] at block offset 0: 4-bit nibble + iq4k_values lookup.
+        const uint sc = (data_a32[block_dw] >> (8 * (ib32 % 4))) & 0xffu;
+        const float dl = d * 1.05f * float(iq4k_values[(sc >> (4 * (ib32 / 4))) & 0xFu]);
+
+        // ql starts at block offset 4 (64 bytes = 32 uint16); four uint16 per thread.
+        const uint ql_dw = block_dw + 1 + 2 * ib32;
+        const uint ql0 = data_a32[ql_dw];
+        const uint ql1 = data_a32[ql_dw + 1];
 
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            const uint b8 = (j * p.batch_stride_b + b_offset + y_idx) / 32;
+            const uint b8 = (j * p.batch_stride_b + b_offset + i * QUANT_K) / 32 + ib32;
             const vec2 ds = vec2(data_b[b8].ds);
             const float d8 = ds.x;
 
-            const int q0 = data_b[b8].qs[4 * h + 0];
-            const int q1 = data_b[b8].qs[4 * h + 1];
-            const int q2 = data_b[b8].qs[4 * h + 2];
-            const int q3 = data_b[b8].qs[4 * h + 3];
-
-            uint x0 = iqk_load_u16(block_byte + ql_off + 0) + 4096u;
+            uint x0 = (ql0 & 0xffffu) + 4096u;
             const int v00 = iqk_hash_values_packed(x0, false, 0u);
             const int v01 = iqk_hash_values_packed(x0, false, 0u);
-
-            uint x1 = iqk_load_u16(block_byte + ql_off + 2) + 4096u;
+            uint x1 = (ql0 >> 16) + 4096u;
             const int v10 = iqk_hash_values_packed(x1, false, 0u);
             const int v11 = iqk_hash_values_packed(x1, false, 0u);
+            uint x2 = (ql1 & 0xffffu) + 4096u;
+            const int v20 = iqk_hash_values_packed(x2, false, 0u);
+            const int v21 = iqk_hash_values_packed(x2, false, 0u);
+            uint x3 = (ql1 >> 16) + 4096u;
+            const int v30 = iqk_hash_values_packed(x3, false, 0u);
+            const int v31 = iqk_hash_values_packed(x3, false, 0u);
 
             int sumi = 0;
-            sumi += dotPacked4x8EXT(v00, q0);
-            sumi += dotPacked4x8EXT(v01, q1);
-            sumi += dotPacked4x8EXT(v10, q2);
-            sumi += dotPacked4x8EXT(v11, q3);
+            sumi += dotPacked4x8EXT(v00, data_b[b8].qs[0]);
+            sumi += dotPacked4x8EXT(v01, data_b[b8].qs[1]);
+            sumi += dotPacked4x8EXT(v10, data_b[b8].qs[2]);
+            sumi += dotPacked4x8EXT(v11, data_b[b8].qs[3]);
+            sumi += dotPacked4x8EXT(v20, data_b[b8].qs[4]);
+            sumi += dotPacked4x8EXT(v21, data_b[b8].qs[5]);
+            sumi += dotPacked4x8EXT(v30, data_b[b8].qs[6]);
+            sumi += dotPacked4x8EXT(v31, data_b[b8].qs[7]);
 
             temp[j][n] = fma(dl * d8, float(sumi), temp[j][n]);
         }
@@ -69,10 +81,10 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
 
-    const uint blocks_per_wg = gl_WorkGroupSize.x / 16;
+    const uint blocks_per_wg = gl_WorkGroupSize.x / 8;
     const uint tid = gl_LocalInvocationID.x;
-    const uint itid = tid % 16;
-    const uint ix = tid / 16;
+    const uint itid = tid % 8;
+    const uint ix = tid / 8;
 
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
