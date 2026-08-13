@@ -38,9 +38,9 @@ and `GET_ROWS`:
   `mul_mat_vec` path now quantizes the F32 activations to Q8_1 and dots packed-int8 decodes
   against them with `dotPacked4x8EXT`. The Trellis types (`IQ1_KT`..`IQ4_KT`) use the
   multiplicative-hash decode (mirroring CUDA's `vec_dot_iq{1,2,3,4}_kt_q8_1`); `IQ4_KS`
-  (IQK family) uses the 4-bit `iq4k_values` table decode, packed four int8 values per `uint32`
-  to cut the scalar table-lookup cost. This removes the scalar-FMA activation dot from the
-  decode FFN (selected for contiguous F32 activations).
+  (IQK family) uses the 4-bit `iq4k_values` table decode with a shared byte-pair lookup
+  table and an 8-threads-per-block mapping, which removes the scalar-FMA activation dot and
+  makes decode slightly faster than IQ4_KT.
 - **prompt processing (mul_mat)**: on NV_coopmat2 devices the mat-mat path runs the
   **coopmat2 tensor-core matmul with inline dequant** (`mul_mm_cm2.comp` + per-type decode
   functions in `dequant_funcs_cm2.comp`; see "vs CUDA" below for the details and the measured
@@ -305,10 +305,10 @@ Still not supported (their matmuls run on CPU), in priority order:
   vocabulary, 2600 words). `-nocb` avoids a continuous-batching `vk::DeviceLostError`
   during prompt processing on this model. On driver 610.57.04, with the Q8_1 decode fix
   IQ4_KT measures ~1110 tok/s prompt / ~24.9 tok/s generation (without it ~1105 tok/s
-  prompt / ~23.6 tok/s generation); IQ4_KS measures ~1042 tok/s prompt / ~9.4 tok/s
-  generation with the Q8_1 + packed-table decode (vs ~4.1 tok/s before). Decode-only
-  measurements use `llama-cli ... -n 64 --temp 0` and the `eval time` line. CUDA reference:
-  the same server command with `-dev CUDA0`.
+  prompt / ~23.6 tok/s generation); IQ4_KS measures ~1042 tok/s prompt / ~25.3 tok/s
+  generation with the Q8_1 + shared byte-pair table decode (vs ~4.1 tok/s before).
+  Decode-only measurements use `llama-cli ... -n 64 --temp 0` and the `eval time` line.
+  CUDA reference: the same server command with `-dev CUDA0`.
 - `test-backend-ops` does not currently compile against this fork's headers.
 
 ### Fixed: large IQK/KT models were slow on Vulkan
