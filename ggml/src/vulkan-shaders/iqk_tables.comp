@@ -112,6 +112,16 @@ const int8_t iq3nl_values[16] = {
     int8_t(-59), int8_t(-36), int8_t(-19), int8_t(-6),  int8_t(5),  int8_t(17), int8_t(32), int8_t(51),
 };
 
+// Packed iq3nl_values: 4 int8 entries per uint32 (low byte first).
+const uint iq3nl_values_packed[4] = {
+    uint(0xf6e9d8c1u), uint(0x2f1c0d01u), uint(0xfaeddcc5u), uint(0x33201105u),
+};
+
+int iq3nl_value_packed(uint index) {
+    const int v = int((iq3nl_values_packed[index / 4u] >> (8u * (index % 4u))) & 0xffu);
+    return v >= 128 ? v - 256 : v;
+}
+
 // 4-bit nonlinear values (two 16-entry tables)
 const int8_t iq4k_values[32] = {
     int8_t(-127), int8_t(-104), int8_t(-83), int8_t(-65), int8_t(-49), int8_t(-35), int8_t(-22), int8_t(-10),
