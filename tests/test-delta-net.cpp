@@ -365,6 +365,9 @@ int main(int argc, char ** argv) {
     test_ssm_conv(backend_cpu, backend_tgt, 4, 256, 1);
     test_ssm_conv(backend_cpu, backend_tgt, 4, 256, 5);
 
+    // the qwen35 delta-net decode shape: H_k=16, H_v=48, gqa=3, repeat_type=1
+    test_delta_net(backend_cpu, backend_tgt, 128, 16, 48, 1, 1);
+
     for (int repeat_type : { 0, 1 }) {
         test_delta_net(backend_cpu, backend_tgt, 16, 2, 4, 1, repeat_type);
         test_delta_net(backend_cpu, backend_tgt, 32, 2, 4, 1, repeat_type);

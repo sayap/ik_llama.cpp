@@ -2046,6 +2046,9 @@ static ggml_tensor * llm_build_kqv(
                                   || model.arch == LLM_ARCH_PHI3
                                   || model.arch == LLM_ARCH_GPTNEOX
                                   || model.arch == LLM_ARCH_QWEN2
+                                  || model.arch == LLM_ARCH_QWEN3NEXT
+                                  || model.arch == LLM_ARCH_QWEN35
+                                  || model.arch == LLM_ARCH_QWEN35MOE
                                   || model.arch == LLM_ARCH_COHERE2
                                   || model.arch == LLM_ARCH_COHERE2_MOE
                                   || model.arch == LLM_ARCH_COMMAND_R
@@ -3098,6 +3101,9 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                                   || model.arch == LLM_ARCH_PHI3
                                   || model.arch == LLM_ARCH_GPTNEOX
                                   || model.arch == LLM_ARCH_QWEN2
+                                  || model.arch == LLM_ARCH_QWEN3NEXT
+                                  || model.arch == LLM_ARCH_QWEN35
+                                  || model.arch == LLM_ARCH_QWEN35MOE
                                   || model.arch == LLM_ARCH_COHERE2
                                   || model.arch == LLM_ARCH_COHERE2_MOE
                                   || model.arch == LLM_ARCH_COMMAND_R
