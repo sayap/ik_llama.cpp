@@ -368,7 +368,10 @@ Remaining performance notes:
   `-c 4096`, `-n 128 --temp 0`): IQ3_K ~25.3 tok/s, IQ5_K ~25.5 tok/s, IQ4_K ~28.2 tok/s,
   IQ2_K ~33.4 tok/s (its attn_output/attn_v are IQ3_K/IQ4_K), IQ4_KSS ~33.7 tok/s.
   IQ3_K's 110-byte block is only 2-byte aligned, so it uses an unaligned-safe uint32 loader
-  and stays slightly behind the 4-byte-aligned quants. Dump a model's per-tensor types with
+  and stays slightly behind the 4-byte-aligned quants. (Alternatives were tried and regressed:
+  a branchless select load and a 3-aligned-word pair loader both measured slower than the
+  plain 1-or-2-load branch — the divergence is cheap and the extra always-on loads/shifts are
+  not.) Dump a model's per-tensor types with
   `gguf-py/scripts/gguf_dump.py <model.gguf>` (the IQ*_K models mix a few higher-precision
   attention tensors and an output tensor, e.g. IQ3_K keeps attn_v as IQ4_K and output as Q5_K,
   IQ4_K keeps attn_v as IQ5_K and output as Q6_K).
