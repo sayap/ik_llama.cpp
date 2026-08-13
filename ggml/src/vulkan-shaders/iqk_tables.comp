@@ -207,6 +207,19 @@ const int8_t iq5nl_values[64] = {
     int8_t(53),   int8_t(61),   int8_t(70),   int8_t(79),  int8_t(89),  int8_t(99),  int8_t(111), int8_t(123),
 };
 
+// Packed iq5nl_values: 4 int8 entries per uint32 (low byte first).
+const uint iq5nl_values_packed[16] = {
+    uint(0xa4998e82u), uint(0xc7bfb6adu), uint(0xe2dcd5ceu), uint(0xfaf4eee8u),
+    uint(0x110b05ffu), uint(0x2b241d17u), uint(0x4d443b33u), uint(0x796d6157u),
+    uint(0xa69b9084u), uint(0xc9c1b8afu), uint(0xe4ded7d0u), uint(0xfcf6f0eau),
+    uint(0x130d0701u), uint(0x2d261f19u), uint(0x4f463d35u), uint(0x7b6f6359u),
+};
+
+int iq5nl_value_packed(uint index) {
+    const int v = int((iq5nl_values_packed[index / 4u] >> (8u * (index % 4u))) & 0xffu);
+    return v >= 128 ? v - 256 : v;
+}
+
 // 6-bit nonlinear values (two 64-entry tables)
 const int8_t iq6nl_values[128] = {
     int8_t(-127), int8_t(-121), int8_t(-115), int8_t(-109), int8_t(-104), int8_t(-98),  int8_t(-93),  int8_t(-88),

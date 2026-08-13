@@ -34,13 +34,13 @@ and `GET_ROWS`:
   dots against the F32/F16 activations. On devices with `VK_KHR_shader_integer_dot_product`
   the KT-family hash decode's 4-shift + 3-add byte sum is replaced by one `dotPacked4x8EXT`
   (a `_dot4` shader variant is selected at pipeline creation; the scalar fallback remains).
-- **decode Q8_1 activations (Trellis KT + IQ4_KS)**: on integer-dot devices the
+- **decode Q8_1 activations (Trellis KT + IQK)**: on integer-dot devices the
   `mul_mat_vec` path now quantizes the F32 activations to Q8_1 and dots packed-int8 decodes
   against them with `dotPacked4x8EXT`. The Trellis types (`IQ1_KT`..`IQ4_KT`) use the
-  multiplicative-hash decode (mirroring CUDA's `vec_dot_iq{1,2,3,4}_kt_q8_1`); `IQ4_KS`
-  (IQK family) uses the 4-bit `iq4k_values` table decode with a shared byte-pair lookup
-  table and an 8-threads-per-block mapping, which removes the scalar-FMA activation dot and
-  makes decode slightly faster than IQ4_KT.
+  multiplicative-hash decode (mirroring CUDA's `vec_dot_iq{1,2,3,4}_kt_q8_1`). The IQK types
+  use shared table decodes: `IQ4_KS`/`IQ4_KSS` use the 4-bit `iq4k_values` byte-pair table
+  with an 8-threads-per-block mapping, and `IQ5_K` uses the 5-bit `iq5nl_values` packed table.
+  This removes the scalar-FMA activation dot from the decode FFN and attention projections.
 - **prompt processing (mul_mat)**: on NV_coopmat2 devices the mat-mat path runs the
   **coopmat2 tensor-core matmul with inline dequant** (`mul_mm_cm2.comp` + per-type decode
   functions in `dequant_funcs_cm2.comp`; see "vs CUDA" below for the details and the measured
@@ -305,8 +305,9 @@ Still not supported (their matmuls run on CPU), in priority order:
   vocabulary, 2600 words). `-nocb` avoids a continuous-batching `vk::DeviceLostError`
   during prompt processing on this model. On driver 610.57.04, with the Q8_1 decode fix
   IQ4_KT measures ~1110 tok/s prompt / ~24.9 tok/s generation (without it ~1105 tok/s
-  prompt / ~23.6 tok/s generation); IQ4_KS measures ~1042 tok/s prompt / ~25.3 tok/s
-  generation with the Q8_1 + shared byte-pair table decode (vs ~4.1 tok/s before).
+  prompt / ~23.6 tok/s generation); IQ4_KS measures ~1042 tok/s prompt / ~27.2 tok/s
+  generation with the Q8_1 + shared table decodes for IQ4_KS and its IQ5_K attention-v
+  tensors (vs ~4.1 tok/s before).
   Decode-only measurements use `llama-cli ... -n 64 --temp 0` and the `eval time` line.
   CUDA reference: the same server command with `-dev CUDA0`.
 - `test-backend-ops` does not currently compile against this fork's headers.
