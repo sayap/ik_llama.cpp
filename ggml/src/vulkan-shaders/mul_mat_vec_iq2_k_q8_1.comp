@@ -8,6 +8,10 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
+// uint32 view of the byte-addressed weight buffer (IQ2_K has no row meta and a
+// 76-byte block, so every block/field offset here is 4-byte aligned).
+layout (binding = 0) readonly buffer A32 { uint data_a32[]; };
+
 #define QUANT_K 256
 #define BLOCK_BYTES 76
 
@@ -25,17 +29,18 @@ void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, co
     const uint row_bytes = p.stride_a + num_blocks_per_row * BLOCK_BYTES;
 
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const uint block_byte = a_byte + (first_row + n) * row_bytes + p.stride_a + i * BLOCK_BYTES;
+        const uint block_dw = (a_byte + (first_row + n) * row_bytes + p.stride_a + i * BLOCK_BYTES) >> 2;
 
-        const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
-        const uint extra16 = iqk_load_u16(block_byte + 2);
+        const uint head = data_a32[block_dw];
+        const float d = iqk_f16_to_f32(head & 0xffffu);
+        const uint extra16 = head >> 16;
         const uint extra_word = extra16 >> (8 * group + sub / 2);
 
-        const uint qs_byte = block_byte + 12 + 32 * group + 8 * sub;
-        const uint w0 = iqk_load_u32(qs_byte + 0);
-        const uint w1 = iqk_load_u32(qs_byte + 4);
+        const uint qs_dw = block_dw + 3 + 8 * group + 2 * sub;
+        const uint w0 = data_a32[qs_dw + 0];
+        const uint w1 = data_a32[qs_dw + 1];
 
-        const uint scales = iqk_load_u32(block_byte + 4 + 4 * group);
+        const uint scales = data_a32[block_dw + 1 + group];
         int s[4];
         [[unroll]] for (uint k = 0; k < 4; ++k) {
             s[k] = int((scales >> (8 * k + 4 * (sub / 2))) & 0xFu) - 8;
@@ -50,12 +55,10 @@ void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, co
                 const int qb0 = data_b[b8].qs[2 * sub + 0];
                 const int qb1 = data_b[b8].qs[2 * sub + 1];
 
-                int packed_idx0 = 0;
-                int packed_idx1 = 0;
-                [[unroll]] for (uint k = 0; k < 4; ++k) {
-                    packed_idx0 |= int((w0 >> (8 * k + 2 * q)) & 3u) << (8 * k);
-                    packed_idx1 |= int((w1 >> (8 * k + 2 * q)) & 3u) << (8 * k);
-                }
+                // Extract the four 2-bit indices for this Q8_1 block with one
+                // shift+mask: byte b of (w >> 2q) holds w bits 8b+2q..8b+2q+1.
+                const int packed_idx0 = int((w0 >> (2 * q)) & 0x03030303u);
+                const int packed_idx1 = int((w1 >> (2 * q)) & 0x03030303u);
                 const int off0 = dotPacked4x8EXT(packed_idx0, 0x40100401);
                 const int off1 = dotPacked4x8EXT(packed_idx1, 0x40100401);
                 const uint vsel = ((extra_word >> (2 * q)) & 1u) != 0 ? 1 : 0;

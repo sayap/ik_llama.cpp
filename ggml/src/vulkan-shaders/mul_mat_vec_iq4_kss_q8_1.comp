@@ -7,6 +7,11 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
+// uint32 view of the byte-addressed weight buffer (IQ4_KSS has a 4-byte row
+// meta header and 128-byte blocks, so every row/block/field offset is 4-byte
+// aligned).
+layout (binding = 0) readonly buffer A32 { uint data_a32[]; };
+
 #define QUANT_K 256
 #define BLOCK_BYTES 128
 #define META 4
@@ -32,20 +37,26 @@ void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, co
         const uint row_byte = a_byte + (first_row + n) * row_bytes;
         const uint block_byte = row_byte + META + i * BLOCK_BYTES;
 
-        const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+        const uint row_dw = row_byte >> 2;
+        const uint block_dw = (row_byte + META + i * BLOCK_BYTES) >> 2;
+
+        const float d = uintBitsToFloat(data_a32[row_dw]);
 
         // Decode the 8 packed 16-bit values of this 32-element sub-block into 16
         // nibble-pair bytes. The scale/table-selector bits are the LSBs.
         uint ls = 0;
         uint a8[16];
-        const uint qs16_off = 16 * ib32;
-        [[unroll]] for (uint k = 0; k < 8; ++k) {
-            const uint q16 = iqk_load_u16(block_byte + qs16_off + 2 * k);
-            uint a = q16 & 0xfffeu;
-            a ^= a >> 1;
-            a8[2 * k + 0] = a & 0xffu;
-            a8[2 * k + 1] = (a >> 8) & 0xffu;
-            ls |= (q16 & 1u) << k;
+        const uint qs_dw = block_dw + 4 * ib32;
+        [[unroll]] for (uint m = 0; m < 4; ++m) {
+            const uint w = data_a32[qs_dw + m];
+            [[unroll]] for (uint h = 0; h < 2; ++h) {
+                const uint q16 = (w >> (16 * h)) & 0xffffu;
+                uint a = q16 & 0xfffeu;
+                a ^= a >> 1;
+                a8[4 * m + 2 * h + 0] = a & 0xffu;
+                a8[4 * m + 2 * h + 1] = (a >> 8) & 0xffu;
+                ls |= (q16 & 1u) << (2 * m + h);
+            }
         }
         const float dl = d * (float(ls & 254u) - 127.0f);
         const uint v_sel = (ls & 1u) != 0 ? 1 : 0;
