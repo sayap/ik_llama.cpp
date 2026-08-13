@@ -11,21 +11,92 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 #define BLOCK_BYTES 136
 #define META 4
 
-FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+// iq4k_values byte-pair lookup: for a quantized byte q, the low 16 bits of the
+// entry are (low-nibble value | high-nibble value << 8) for v_off = 0, and the
+// next 128 entries are the same for v_off = 16.
+const uint iq4k_values_byte_0[128] = {
+    uint(0x81988181u), uint(0x81bf81adu), uint(0x81dd81cfu), uint(0x81f681eau),
+    uint(0x810d8101u), uint(0x81268119u), uint(0x81458135u), uint(0x81718159u),
+    uint(0x98989881u), uint(0x98bf98adu), uint(0x98dd98cfu), uint(0x98f698eau),
+    uint(0x980d9801u), uint(0x98269819u), uint(0x98459835u), uint(0x98719859u),
+    uint(0xad98ad81u), uint(0xadbfadadu), uint(0xadddadcfu), uint(0xadf6adeau),
+    uint(0xad0dad01u), uint(0xad26ad19u), uint(0xad45ad35u), uint(0xad71ad59u),
+    uint(0xbf98bf81u), uint(0xbfbfbfadu), uint(0xbfddbfcfu), uint(0xbff6bfeau),
+    uint(0xbf0dbf01u), uint(0xbf26bf19u), uint(0xbf45bf35u), uint(0xbf71bf59u),
+    uint(0xcf98cf81u), uint(0xcfbfcfadu), uint(0xcfddcfcfu), uint(0xcff6cfeau),
+    uint(0xcf0dcf01u), uint(0xcf26cf19u), uint(0xcf45cf35u), uint(0xcf71cf59u),
+    uint(0xdd98dd81u), uint(0xddbfddadu), uint(0xddddddcfu), uint(0xddf6ddeau),
+    uint(0xdd0ddd01u), uint(0xdd26dd19u), uint(0xdd45dd35u), uint(0xdd71dd59u),
+    uint(0xea98ea81u), uint(0xeabfeaadu), uint(0xeaddeacfu), uint(0xeaf6eaeau),
+    uint(0xea0dea01u), uint(0xea26ea19u), uint(0xea45ea35u), uint(0xea71ea59u),
+    uint(0xf698f681u), uint(0xf6bff6adu), uint(0xf6ddf6cfu), uint(0xf6f6f6eau),
+    uint(0xf60df601u), uint(0xf626f619u), uint(0xf645f635u), uint(0xf671f659u),
+    uint(0x01980181u), uint(0x01bf01adu), uint(0x01dd01cfu), uint(0x01f601eau),
+    uint(0x010d0101u), uint(0x01260119u), uint(0x01450135u), uint(0x01710159u),
+    uint(0x0d980d81u), uint(0x0dbf0dadu), uint(0x0ddd0dcfu), uint(0x0df60deau),
+    uint(0x0d0d0d01u), uint(0x0d260d19u), uint(0x0d450d35u), uint(0x0d710d59u),
+    uint(0x19981981u), uint(0x19bf19adu), uint(0x19dd19cfu), uint(0x19f619eau),
+    uint(0x190d1901u), uint(0x19261919u), uint(0x19451935u), uint(0x19711959u),
+    uint(0x26982681u), uint(0x26bf26adu), uint(0x26dd26cfu), uint(0x26f626eau),
+    uint(0x260d2601u), uint(0x26262619u), uint(0x26452635u), uint(0x26712659u),
+    uint(0x35983581u), uint(0x35bf35adu), uint(0x35dd35cfu), uint(0x35f635eau),
+    uint(0x350d3501u), uint(0x35263519u), uint(0x35453535u), uint(0x35713559u),
+    uint(0x45984581u), uint(0x45bf45adu), uint(0x45dd45cfu), uint(0x45f645eau),
+    uint(0x450d4501u), uint(0x45264519u), uint(0x45454535u), uint(0x45714559u),
+    uint(0x59985981u), uint(0x59bf59adu), uint(0x59dd59cfu), uint(0x59f659eau),
+    uint(0x590d5901u), uint(0x59265919u), uint(0x59455935u), uint(0x59715959u),
+    uint(0x71987181u), uint(0x71bf71adu), uint(0x71dd71cfu), uint(0x71f671eau),
+    uint(0x710d7101u), uint(0x71267119u), uint(0x71457135u), uint(0x71717159u),
+};
 
-shared uint iq4k_shmem[8];
+const uint iq4k_values_byte_16[128] = {
+    uint(0x859c8585u), uint(0x85c385b1u), uint(0x85e185d3u), uint(0x85fa85eeu),
+    uint(0x85118505u), uint(0x852a851du), uint(0x85498539u), uint(0x8575855du),
+    uint(0x9c9c9c85u), uint(0x9cc39cb1u), uint(0x9ce19cd3u), uint(0x9cfa9ceeu),
+    uint(0x9c119c05u), uint(0x9c2a9c1du), uint(0x9c499c39u), uint(0x9c759c5du),
+    uint(0xb19cb185u), uint(0xb1c3b1b1u), uint(0xb1e1b1d3u), uint(0xb1fab1eeu),
+    uint(0xb111b105u), uint(0xb12ab11du), uint(0xb149b139u), uint(0xb175b15du),
+    uint(0xc39cc385u), uint(0xc3c3c3b1u), uint(0xc3e1c3d3u), uint(0xc3fac3eeu),
+    uint(0xc311c305u), uint(0xc32ac31du), uint(0xc349c339u), uint(0xc375c35du),
+    uint(0xd39cd385u), uint(0xd3c3d3b1u), uint(0xd3e1d3d3u), uint(0xd3fad3eeu),
+    uint(0xd311d305u), uint(0xd32ad31du), uint(0xd349d339u), uint(0xd375d35du),
+    uint(0xe19ce185u), uint(0xe1c3e1b1u), uint(0xe1e1e1d3u), uint(0xe1fae1eeu),
+    uint(0xe111e105u), uint(0xe12ae11du), uint(0xe149e139u), uint(0xe175e15du),
+    uint(0xee9cee85u), uint(0xeec3eeb1u), uint(0xeee1eed3u), uint(0xeefaeeeeu),
+    uint(0xee11ee05u), uint(0xee2aee1du), uint(0xee49ee39u), uint(0xee75ee5du),
+    uint(0xfa9cfa85u), uint(0xfac3fab1u), uint(0xfae1fad3u), uint(0xfafafaeeu),
+    uint(0xfa11fa05u), uint(0xfa2afa1du), uint(0xfa49fa39u), uint(0xfa75fa5du),
+    uint(0x059c0585u), uint(0x05c305b1u), uint(0x05e105d3u), uint(0x05fa05eeu),
+    uint(0x05110505u), uint(0x052a051du), uint(0x05490539u), uint(0x0575055du),
+    uint(0x119c1185u), uint(0x11c311b1u), uint(0x11e111d3u), uint(0x11fa11eeu),
+    uint(0x11111105u), uint(0x112a111du), uint(0x11491139u), uint(0x1175115du),
+    uint(0x1d9c1d85u), uint(0x1dc31db1u), uint(0x1de11dd3u), uint(0x1dfa1deeu),
+    uint(0x1d111d05u), uint(0x1d2a1d1du), uint(0x1d491d39u), uint(0x1d751d5du),
+    uint(0x2a9c2a85u), uint(0x2ac32ab1u), uint(0x2ae12ad3u), uint(0x2afa2aeeu),
+    uint(0x2a112a05u), uint(0x2a2a2a1du), uint(0x2a492a39u), uint(0x2a752a5du),
+    uint(0x399c3985u), uint(0x39c339b1u), uint(0x39e139d3u), uint(0x39fa39eeu),
+    uint(0x39113905u), uint(0x392a391du), uint(0x39493939u), uint(0x3975395du),
+    uint(0x499c4985u), uint(0x49c349b1u), uint(0x49e149d3u), uint(0x49fa49eeu),
+    uint(0x49114905u), uint(0x492a491du), uint(0x49494939u), uint(0x4975495du),
+    uint(0x5d9c5d85u), uint(0x5dc35db1u), uint(0x5de15dd3u), uint(0x5dfa5deeu),
+    uint(0x5d115d05u), uint(0x5d2a5d1du), uint(0x5d495d39u), uint(0x5d755d5du),
+    uint(0x759c7585u), uint(0x75c375b1u), uint(0x75e175d3u), uint(0x75fa75eeu),
+    uint(0x75117505u), uint(0x752a751du), uint(0x75497539u), uint(0x7575755du),
+};
 
-int iq4k_value_shmem(uint index) {
-    const int v = int((iq4k_shmem[index / 4u] >> (8u * (index % 4u))) & 0xffu);
-    return v >= 128 ? v - 256 : v;
+shared uint iq4k_byte_shmem[2][128];
+
+uint iq4k_byte_entry(uint v, uint q) {
+    return iq4k_byte_shmem[v][q / 2u] >> (16u * (q % 2u));
 }
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
 void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, const uint i,
                      const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
-    // 16 threads per block: ib32 = itid/2 (0..7), half = itid%2 (16 elements each)
-    const uint ib32 = itid / 2;
-    const uint h = itid % 2;
-    const uint e = 32 * ib32 + 16 * h;
+    // 8 threads per block: each thread handles one 32-element group of a block.
+    const uint ib32 = itid;
+    const uint e = 32 * ib32;
 
     const uint y_idx = i * QUANT_K + e;
     const uint row_bytes = p.stride_a + num_blocks_per_row * BLOCK_BYTES;
@@ -37,30 +108,33 @@ void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, co
         const float d = uintBitsToFloat(iqk_load_u32(row_byte));
         const uint sc = data_a[block_byte + ib32];
         const float dl = d * (float(sc & 254u) - 127.0f);
-        const uint v_off = (sc & 1u) != 0 ? 16 : 0;
+        const uint v_sel = (sc & 1u) != 0 ? 1 : 0;
 
         const uint qs_off = 8 + 16 * ib32;
+
+        const uint w0 = iqk_load_u32(block_byte + qs_off + 0);
+        const uint w1 = iqk_load_u32(block_byte + qs_off + 4);
+        const uint w2 = iqk_load_u32(block_byte + qs_off + 8);
+        const uint w3 = iqk_load_u32(block_byte + qs_off + 12);
 
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             const uint b8 = (j * p.batch_stride_b + b_offset + y_idx) / 32;
             const vec2 ds = vec2(data_b[b8].ds);
             const float d8 = ds.x;
 
-            const int q0 = data_b[b8].qs[4 * h + 0];
-            const int q1 = data_b[b8].qs[4 * h + 1];
-            const int q2 = data_b[b8].qs[4 * h + 2];
-            const int q3 = data_b[b8].qs[4 * h + 3];
-
             int sumi = 0;
             [[unroll]] for (uint g = 0; g < 4; ++g) {
-                int packed = 0;
+                const uint w = (g == 0) ? w0 : (g == 1) ? w1 : (g == 2) ? w2 : w3;
+                int packed_lo = 0;
+                int packed_hi = 0;
                 [[unroll]] for (uint k = 0; k < 4; ++k) {
-                    const uint q = data_a[block_byte + qs_off + 4 * g + k];
-                    const int v = iq4k_value_shmem((h == 0 ? (q & 0xFu) : (q >> 4)) + v_off);
-                    packed |= (v & 0xff) << (8 * k);
+                    const uint q = (w >> (8 * k)) & 0xffu;
+                    const uint entry = iq4k_byte_entry(v_sel, q);
+                    packed_lo |= int(entry & 0xffu) << (8 * k);
+                    packed_hi |= int((entry >> 8) & 0xffu) << (8 * k);
                 }
-                const int qb = (g == 0) ? q0 : (g == 1) ? q1 : (g == 2) ? q2 : q3;
-                sumi += dotPacked4x8EXT(packed, qb);
+                sumi += dotPacked4x8EXT(packed_lo, data_b[b8].qs[g]);
+                sumi += dotPacked4x8EXT(packed_hi, data_b[b8].qs[g + 4]);
             }
 
             temp[j][n] = fma(dl * d8, float(sumi), temp[j][n]);
@@ -74,13 +148,14 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
 
-    const uint blocks_per_wg = gl_WorkGroupSize.x / 16;
+    const uint blocks_per_wg = gl_WorkGroupSize.x / 8;
     const uint tid = gl_LocalInvocationID.x;
-    const uint itid = tid % 16;
-    const uint ix = tid / 16;
+    const uint itid = tid % 8;
+    const uint ix = tid / 8;
 
-    if (tid < 8) {
-        iq4k_shmem[tid] = iq4k_values_packed[tid];
+    [[unroll]] for (uint idx = tid; idx < 128; idx += BLOCK_SIZE) {
+        iq4k_byte_shmem[0][idx] = iq4k_values_byte_0[idx];
+        iq4k_byte_shmem[1][idx] = iq4k_values_byte_16[idx];
     }
     barrier();
 
