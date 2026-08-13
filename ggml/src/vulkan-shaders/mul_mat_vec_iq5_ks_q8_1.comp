@@ -1,0 +1,149 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+#include "mul_mat_vec_iqk_base_q8_1.comp"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// uint32 view of the byte-addressed weight buffer (IQ5_KS has a 4-byte row
+// scale header and 168-byte blocks, so every row/block/field offset here is
+// 4-byte aligned).
+layout (binding = 0) readonly buffer A32 { uint data_a32[]; };
+
+#define QUANT_K 256
+#define BLOCK_BYTES 168
+#define META 4
+
+// 64 sign-extended int32 entries (one per iq5nl table value), so the hot-loop
+// lookup is a single shared-memory load with no division/modulo/shift/mask.
+shared int iq5nl_shmem[64];
+
+// Look up four 5-bit indices packed in the low 5 bits of each byte of
+// idx_packed, offset into one of the two 32-entry iq5nl value tables, and pack
+// the four int8 results into one int32 for dotPacked4x8EXT.
+int iq5nl_lookup4(uint idx_packed, uint table_off) {
+    int res = 0;
+    [[unroll]] for (int b = 0; b < 4; ++b) {
+        const uint idx = ((idx_packed >> (8 * b)) & 0x1fu) + table_off;
+        res |= (iq5nl_shmem[idx] & 0xff) << (8 * b);
+    }
+    return res;
+}
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, const uint i,
+                     const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    // 8 threads per block, CUDA-style vec_dot_iq5_ks_q8_1: thread i4 handles two
+    // 32-element sub-blocks. The low-nibble qs values (sub-block 2*(i4/2)) dot
+    // against Q8_1 block 2*(i4/2), the high-nibble qs values (sub-block
+    // 2*(i4/2)+1) dot against Q8_1 block 2*(i4/2)+1.
+    const uint i4 = itid;      // 0..7
+    const uint ih = i4 / 2;    // 0..3
+    const uint il = i4 % 2;    // 0..1
+
+    const uint row_bytes = p.stride_a + num_blocks_per_row * BLOCK_BYTES;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint row_byte = a_byte + (first_row + n) * row_bytes;
+        const uint block_dw = (row_byte + META + i * BLOCK_BYTES) >> 2;
+
+        const float row_d = uintBitsToFloat(data_a32[row_byte >> 2]);
+
+        // scales: 8 bytes at block offset 0. sc0 = scales[2*ih] (low group),
+        // sc1 = scales[2*ih+1]; the LSB is the value-table selector, bits 1-7
+        // are the signed scale.
+        const uint sc_word = data_a32[block_dw + (ih >> 1)];
+        const uint sc_shift = 16 * (ih & 1);
+        const uint sc0 = (sc_word >> sc_shift) & 0xffu;
+        const uint sc1 = (sc_word >> (sc_shift + 8)) & 0xffu;
+        const float dl1 = row_d * (float(sc0 & 254u) - 127.0f);
+        const float dl2 = row_d * (float(sc1 & 254u) - 127.0f);
+        const uint v1_off = (sc0 & 1u) != 0 ? 32u : 0u;
+        const uint v2_off = (sc1 & 1u) != 0 ? 32u : 0u;
+
+        // qs starts at offset 8, qh at offset 136.
+        const uint qs_dw = block_dw + 2 + 8 * ih + 4 * il;
+        const uint qh_dw = block_dw + 34 + 4 * il;
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint base_b8 = (j * p.batch_stride_b + b_offset + i * QUANT_K) / 32;
+            const uint b8a = base_b8 + 2 * ih;
+            const uint b8b = base_b8 + 2 * ih + 1;
+
+            const vec2 dsa = vec2(data_b[b8a].ds);
+            const vec2 dsb = vec2(data_b[b8b].ds);
+            const float d8a = dsa.x;
+            const float d8b = dsb.x;
+
+            int sumi1 = 0;
+            int sumi2 = 0;
+            [[unroll]] for (uint g = 0; g < 4; ++g) {
+                const uint q4v = data_a32[qs_dw + g];
+                const uint qhv = data_a32[qh_dw + g];
+                const uint h = qhv >> (2 * ih);
+
+                const uint idx1 = ((q4v >> 0) & 0x0f0f0f0fu) | ((h << 4) & 0x10101010u);
+                const uint idx2 = ((q4v >> 4) & 0x0f0f0f0fu) | ((h << 3) & 0x10101010u);
+
+                const int v1 = iq5nl_lookup4(idx1, v1_off);
+                const int v2 = iq5nl_lookup4(idx2, v2_off);
+
+                const int qb1 = data_b[b8a].qs[4 * il + g];
+                const int qb2 = data_b[b8b].qs[4 * il + g];
+
+                sumi1 += dotPacked4x8EXT(v1, qb1);
+                sumi2 += dotPacked4x8EXT(v2, qb2);
+            }
+
+            temp[j][n] = fma(dl1 * d8a, float(sumi1), temp[j][n]);
+            temp[j][n] = fma(dl2 * d8b, float(sumi2), temp[j][n]);
+        }
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_byte, b_offset, d_offset;
+    get_offsets(a_byte, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+
+    const uint blocks_per_wg = gl_WorkGroupSize.x / 8;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid % 8;
+    const uint ix = tid / 8;
+
+    [[unroll]] for (uint idx = tid; idx < 64; idx += BLOCK_SIZE) {
+        const uint packed = iq5nl_values_packed[idx / 4u];
+        int v = int((packed >> (8u * (idx % 4u))) & 0xffu);
+        if (v >= 128) v -= 256;
+        iq5nl_shmem[idx] = v;
+    }
+    barrier();
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg)
+        calc_superblock(a_byte, b_offset, itid, i, num_blocks_per_row, first_row, num_rows);
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}
