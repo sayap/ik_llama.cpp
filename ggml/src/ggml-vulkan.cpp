@@ -740,6 +740,7 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t src0_nb1;
     uint32_t src1_nb1;
     uint32_t c_nb1;
+    uint32_t has_saved;
 };
 
 struct vk_op_ssm_conv_final_push_constants {
@@ -758,6 +759,7 @@ struct vk_op_delta_net_push_constants {
     uint32_t repeat_type;
     uint32_t v_nb1, v_nb2, v_nb3;
     float scale;
+    uint32_t has_saved;
 };
 
 struct vk_op_unary_push_constants {
@@ -3147,14 +3149,14 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
 
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {256, 32}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 5, sizeof(vk_op_ssm_conv_push_constants), {256, 1, 1}, {256, 32}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_final_state_f32, "ssm_conv_final_state_f32", ssm_conv_final_state_f32_len, ssm_conv_final_state_f32_data, "main", 3, sizeof(vk_op_ssm_conv_final_push_constants), {256, 1, 1}, {256}, 1);
 
     {
         const uint32_t delta_net_sizes[] = { 16, 32, 64, 128 };
         for (uint32_t i = 0; i < 4; ++i) {
             const uint32_t S_V = delta_net_sizes[i];
-            ggml_vk_create_pipeline(device, device->pipeline_delta_net[i], "delta_net_f32_d" + std::to_string(S_V), delta_net_f32_len, delta_net_f32_data, "main", 7, sizeof(vk_op_delta_net_push_constants), {1, 1, 1}, {S_V}, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_delta_net[i], "delta_net_f32_d" + std::to_string(S_V), delta_net_f32_len, delta_net_f32_data, "main", 8, sizeof(vk_op_delta_net_push_constants), {1, 1, 1}, {S_V}, 1);
         }
     }
 
@@ -8726,7 +8728,7 @@ static void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, c
     ggml_vk_op_f32<vk_op_unary_push_constants>(ctx, subctx, src0, nullptr, nullptr, dst, GGML_OP_L2_NORM, std::move(pc), dryrun);
 }
 
-static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst, bool dryrun = false) {
+static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, const ggml_tensor * src4, ggml_tensor * dst, bool dryrun = false) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(src2->type == GGML_TYPE_F32);
@@ -8741,6 +8743,7 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const uint32_t nc = (uint32_t)src2->ne[0];
     const uint32_t nr = (uint32_t)src0->ne[1];
     const uint32_t n_t = (uint32_t)src1->ne[1];
+    const bool has_saved = src4 != nullptr;
 
     if (dryrun) {
         ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_ssm_conv_f32, 1);
@@ -8762,11 +8765,20 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
     vk_buffer d_D = d_ctx->dev_buffer;
     const size_t d_off = vk_tensor_offset(dst) + dst->view_offs;
 
+    vk_buffer d_Saved = d_S0;
+    size_t saved_off = 0;
+    if (has_saved) {
+        ggml_backend_vk_buffer_context * saved_ctx = (ggml_backend_vk_buffer_context *)src4->buffer->context;
+        d_Saved = saved_ctx->dev_buffer;
+        saved_off = vk_tensor_offset(src4) + src4->view_offs;
+    }
+
     const vk_op_ssm_conv_push_constants pc = {
         nc, nr, n_t,
         (uint32_t)(src0->nb[1] / sizeof(float)),
         (uint32_t)(src1->nb[1] / sizeof(float)),
         (uint32_t)(src2->nb[1] / sizeof(float)),
+        has_saved ? 1u : 0u,
     };
 
     ggml_vk_sync_buffers(subctx);
@@ -8775,6 +8787,7 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
         vk_subbuffer{d_X, x_off, VK_WHOLE_SIZE},
         vk_subbuffer{d_C, c_off, VK_WHOLE_SIZE},
         vk_subbuffer{d_D, d_off, VK_WHOLE_SIZE},
+        vk_subbuffer{d_Saved, saved_off, VK_WHOLE_SIZE},
     }, pc, { nr, (n_t + 31u) / 32u, 1 });
 
     const vk_op_ssm_conv_final_push_constants pc2 = {
@@ -8798,6 +8811,7 @@ static void ggml_vk_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
     const ggml_tensor * g     = dst->src[3];
     const ggml_tensor * beta  = dst->src[4];
     const ggml_tensor * state = dst->src[5];
+    const ggml_tensor * saved = dst->src[6];
 
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(k->type == GGML_TYPE_F32);
@@ -8830,6 +8844,7 @@ static void ggml_vk_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
         (uint32_t)(v->nb[2] / sizeof(float)),
         (uint32_t)(v->nb[3] / sizeof(float)),
         1.0f / sqrtf((float)S_v),
+        saved != nullptr ? 1u : 0u,
     };
 
     ggml_backend_vk_buffer_context * q_ctx     = (ggml_backend_vk_buffer_context *)q->buffer->context;
@@ -8855,6 +8870,14 @@ static void ggml_vk_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
     vk_buffer d_D = d_ctx->dev_buffer;
     const size_t d_off = vk_tensor_offset(dst) + dst->view_offs;
 
+    vk_buffer d_Saved = d_S;
+    size_t saved_off = 0;
+    if (saved != nullptr) {
+        ggml_backend_vk_buffer_context * saved_ctx = (ggml_backend_vk_buffer_context *)saved->buffer->context;
+        d_Saved = saved_ctx->dev_buffer;
+        saved_off = vk_tensor_offset(saved) + saved->view_offs;
+    }
+
     ggml_vk_sync_buffers(subctx);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
         vk_subbuffer{d_Q, q_off, VK_WHOLE_SIZE},
@@ -8864,6 +8887,7 @@ static void ggml_vk_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
         vk_subbuffer{d_B, b_off, VK_WHOLE_SIZE},
         vk_subbuffer{d_S, s_off, VK_WHOLE_SIZE},
         vk_subbuffer{d_D, d_off, VK_WHOLE_SIZE},
+        vk_subbuffer{d_Saved, saved_off, VK_WHOLE_SIZE},
     }, pc, { H_v, n_seqs, 1 });
 }
 
@@ -10503,7 +10527,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_SSM_CONV:
-        ggml_vk_ssm_conv(ctx, compute_ctx, src0, src1, src2, src3, node, dryrun);
+        ggml_vk_ssm_conv(ctx, compute_ctx, src0, src1, src2, src3, src4, node, dryrun);
 
         break;
 
@@ -11678,11 +11702,9 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                     op->src[2]->type != GGML_TYPE_F32 || op->src[3]->type != GGML_TYPE_I32 || op->type != GGML_TYPE_F32) {
                     return false;
                 }
-                // Only the single-sequence fast path is implemented; per-step conv checkpointing
-                // (src[4]) and multi-sequence routing fall back to the CPU backend.
-                if (op->src[4] != nullptr) {
-                    return false;
-                }
+                // Only the single-sequence fast path is implemented; multi-sequence routing
+                // falls back to the CPU backend. Per-step conv checkpointing (src[4]) is
+                // written by the conv shader when present.
                 if (op->src[0]->ne[2] != 1 || op->src[3]->ne[0] != 1) {
                     return false;
                 }
@@ -11691,10 +11713,6 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
         case GGML_OP_DELTA_NET:
             {
                 if (op->src[0]->type != GGML_TYPE_F32 || op->src[2]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
-                    return false;
-                }
-                // Per-step state checkpointing (src[6]) is not implemented on Vulkan yet.
-                if (op->src[6] != nullptr) {
                     return false;
                 }
                 const int64_t S_v = op->src[2]->ne[0];

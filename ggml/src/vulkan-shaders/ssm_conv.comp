@@ -14,12 +14,14 @@ layout(push_constant) uniform PC {
     uint src0_nb1;
     uint src1_nb1;
     uint c_nb1;
+    uint has_saved;
 } p;
 
 layout(binding = 0) readonly buffer S0 { float s0[]; };
 layout(binding = 1) readonly buffer X  { float x[]; };
 layout(binding = 2) readonly buffer C  { float c[]; };
 layout(binding = 3) buffer DST { float dst[]; };
+layout(binding = 4) buffer SAVED { float saved[]; };
 
 void main() {
     const uint row = gl_GlobalInvocationID.x;
@@ -44,6 +46,9 @@ void main() {
                 ? s0[state_base + idx]
                 : x[row + (idx - (p.nc - 1u)) * p.src1_nb1];
             sum += xv * c[c_base + j];
+            if (p.has_saved != 0u && j > 0u) {
+                saved[t * p.nr * (p.nc - 1u) + row * (p.nc - 1u) + (j - 1u)] = xv;
+            }
         }
         dst[row + t * p.nr] = sum;
     }

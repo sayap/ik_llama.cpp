@@ -155,7 +155,9 @@ static void test_ssm_conv(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt
     ggml_set_name(c_c, "c");
     ggml_tensor * sq_c = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_I32, 1, n_t);
     ggml_set_name(sq_c, "sq");
-    ggml_tensor * raw_c = ggml_ssm_conv(ctx_cpu, s_c, x_c, c_c, sq_c, nullptr);
+    ggml_tensor * saved_c = ggml_new_tensor_1d(ctx_cpu, GGML_TYPE_F32, (nc - 1) * nr * n_t);
+    ggml_set_name(saved_c, "saved");
+    ggml_tensor * raw_c = ggml_ssm_conv(ctx_cpu, s_c, x_c, c_c, sq_c, saved_c);
     // the real graph always feeds ssm_conv into a view + silu; keep that shape so the
     // CPU's nc==4 fast path has valid following nodes to look at
     ggml_tensor * conv_c = ggml_view_2d(ctx_cpu, raw_c, nr, n_t, ggml_row_size(GGML_TYPE_F32, nr), 0);
@@ -169,7 +171,9 @@ static void test_ssm_conv(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt
     ggml_set_name(c_t, "c");
     ggml_tensor * sq_t = ggml_new_tensor_2d(ctx_tgt, GGML_TYPE_I32, 1, n_t);
     ggml_set_name(sq_t, "sq");
-    ggml_tensor * raw_t = ggml_ssm_conv(ctx_tgt, s_t, x_t, c_t, sq_t, nullptr);
+    ggml_tensor * saved_t = ggml_new_tensor_1d(ctx_tgt, GGML_TYPE_F32, (nc - 1) * nr * n_t);
+    ggml_set_name(saved_t, "saved");
+    ggml_tensor * raw_t = ggml_ssm_conv(ctx_tgt, s_t, x_t, c_t, sq_t, saved_t);
     ggml_tensor * conv_t = ggml_view_2d(ctx_tgt, raw_t, nr, n_t, ggml_row_size(GGML_TYPE_F32, nr), 0);
     ggml_tensor * out_t = ggml_silu(ctx_tgt, conv_t);
 
@@ -214,6 +218,22 @@ static void test_ssm_conv(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt
             } else {
                 printf("OK   %s (max abs diff = %g)\n", name, err);
             }
+
+            // per-step conv checkpoint
+            const size_t ns = ggml_nelements(saved_c);
+            std::vector<float> sa(ns), sb(ns);
+            ggml_backend_tensor_get(saved_c, sa.data(), 0, ns * sizeof(float));
+            ggml_backend_tensor_get(saved_t, sb.data(), 0, ns * sizeof(float));
+            double serr = max_abs_diff(sa.data(), sb.data(), ns);
+            if (serr > 1e-4) {
+                fprintf(stderr, "FAIL %s saved: max abs diff = %g > %g\n", name, serr, 1e-4);
+                for (size_t i = 0; i < ns && i < 32; i++) {
+                    fprintf(stderr, "  [%zu] cpu=%g tgt=%g\n", i, sa[i], sb[i]);
+                }
+                n_failures++;
+            } else {
+                printf("OK   %s saved (max abs diff = %g)\n", name, serr);
+            }
         }
     }
     ggml_free(ctx_cpu);
@@ -233,7 +253,7 @@ static void test_delta_net(ggml_backend_t backend_cpu, ggml_backend_t backend_tg
     ggml_context * ctx_cpu = ggml_init(params);
     ggml_context * ctx_tgt = ggml_init(params);
 
-    auto build = [&](ggml_context * ctx) {
+    auto build = [&](ggml_context * ctx, ggml_tensor ** saved_out) {
         // conv output (silu'd) [qkv_dim, n_tok] laid out q | k | v along dim0
         ggml_tensor * conv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, qkv_dim, n_tok);
         ggml_set_name(conv, "conv");
@@ -277,13 +297,19 @@ static void test_delta_net(ggml_backend_t backend_cpu, ggml_backend_t backend_tg
         ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, S * H_v);
         ggml_set_name(state, "state");
 
-        ggml_tensor * out = ggml_delta_net(ctx, q, k, v, g, b, state, nullptr);
+        ggml_tensor * saved = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (n_tok - 1) * S * S * H_v);
+        ggml_set_name(saved, "saved");
+
+        ggml_tensor * out = ggml_delta_net(ctx, q, k, v, g, b, state, saved);
         out->op_params[0] = repeat_type;
+        *saved_out = saved;
         return out;
     };
 
-    ggml_tensor * out_c = build(ctx_cpu);
-    ggml_tensor * out_t = build(ctx_tgt);
+    ggml_tensor * saved_c = nullptr;
+    ggml_tensor * saved_t = nullptr;
+    ggml_tensor * out_c = build(ctx_cpu, &saved_c);
+    ggml_tensor * out_t = build(ctx_tgt, &saved_t);
 
     ggml_backend_alloc_ctx_tensors(ctx_cpu, backend_cpu);
     ggml_backend_alloc_ctx_tensors(ctx_tgt, backend_tgt);
@@ -295,6 +321,23 @@ static void test_delta_net(ggml_backend_t backend_cpu, ggml_backend_t backend_tg
     copy_tensors_by_name(ctx_cpu, ctx_tgt);
 
     check(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, 0.05);
+
+    if (n_tok > 1) {
+        const size_t ns = ggml_nelements(saved_c);
+        std::vector<float> sa(ns), sb(ns);
+        ggml_backend_tensor_get(saved_c, sa.data(), 0, ns * sizeof(float));
+        ggml_backend_tensor_get(saved_t, sb.data(), 0, ns * sizeof(float));
+        double serr = max_abs_diff(sa.data(), sb.data(), ns);
+        if (serr > 0.05) {
+            fprintf(stderr, "FAIL %s saved: max abs diff = %g > %g\n", name, serr, 0.05);
+            for (size_t i = 0; i < ns && i < 32; i++) {
+                fprintf(stderr, "  [%zu] cpu=%g tgt=%g\n", i, sa[i], sb[i]);
+            }
+            n_failures++;
+        } else {
+            printf("OK   %s saved (max abs diff = %g)\n", name, serr);
+        }
+    }
     ggml_free(ctx_cpu);
     ggml_free(ctx_tgt);
 }
