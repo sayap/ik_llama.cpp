@@ -180,6 +180,22 @@ several quant types and batch sizes.
 
 ## Remaining gaps
 
+### Priority (highest first)
+
+1. **Gated delta-net** (`qwen35` / `qwen3next`): `SSM_CONV`, `L2_NORM`, `SOFTPLUS`,
+   `DELTA_NET`. Stateful, so CPU fallback produces garbage logits — these models cannot
+   run on Vulkan at all today.
+2. **`Q6_0`** — the only legacy 6-bit quant still missing from `MUL_MAT`.
+3. **`MXFP4`** — the micro-scaling 4-bit format.
+4. **Indexer / DSA / CSA / HCA / GLM-DSA**: `INDEXER_TOPK`, `MASK_TOPK`, `MASK_TO_IDX`,
+   `SINKHORN`, `HC_PRE`, `HC_POST`, `LATENT_ATTN`, `DS4_COMP`. Stateful sparse-attention
+   ops (DeepSeek2/4, OpenPangu, GLM-4.5-Air, GLM-DSA).
+5. **`--fit` with `GGML_BACKEND_DL`** — per-device memory reports 0 MiB.
+6. **`-sm graph` / `-sm attn`** split modes.
+7. Everything else: Mamba `SSM_SCAN`, the `*_R4` repacks and `IQ1_BN`/`IQ2_BN`, async
+   tensor copies/events, the fence busy-wait, and the remaining training/vision ops
+   (`GLU`, `RWKV_WKV6/7`, `CONV_2D_DW`, `SIN`/`COS`, ...).
+
 ### Op coverage (the big one)
 
 These ops are produced by ik_llama's graph builder but are **not implemented** in the
@@ -198,6 +214,12 @@ Vulkan backend, so they fall back to the CPU backend with expensive copies:
   and `supports_op` / `build_graph` entries; `DELTA_NET` is the large one (a fused,
   flash-attention-style recurrent kernel; it is ik_llama-specific, so there is no upstream
   Vulkan implementation to port).
+- **Indexer / DSA / CSA / HCA / GLM-DSA** (DeepSeek2/4, OpenPangu, GLM-4.5-Air, GLM-DSA
+  sparse attention): `GGML_OP_INDEXER_TOPK`, `GGML_OP_MASK_TOPK`, `GGML_OP_MASK_TO_IDX`,
+  `GGML_OP_SINKHORN`, `GGML_OP_HC_PRE`, `GGML_OP_HC_POST`, `GGML_OP_LATENT_ATTN`,
+  `GGML_OP_DS4_COMP`. CUDA implements all of these; Vulkan has none, so these
+  architectures fall back to the CPU backend (with the same stateful round-trip problem
+  as delta-net).
 - `GGML_OP_MULTI_ADD` exists but check the specific fused-mul-multiadd variants
   (`fused_mmad`); `-no-mmad` disables them
 
@@ -215,14 +237,15 @@ The Vulkan `MUL_MAT` supports `F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_
 Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL` plus
 the full **IQK/K-family** (`IQ2_K, IQ3_K, IQ4_K, IQ5_K, IQ6_K, IQ2_KS, IQ3_KS, IQ4_KS, IQ4_KSS,
 IQ5_KS, IQ2_KL`) and **KT-family** (`IQ1_KT, IQ2_KT, IQ3_KT, IQ4_KT`). The decode path uses
-native per-type `mul_mat_vec` kernels; prompt processing uses a coopmat2 tensor-core matmul
-with per-element inline dequant (`mul_mm_cm2.comp`). On the RTX 3090 it is currently on par
-with the dequant+F16 path (the decode-per-element overhead offsets reading the weights once),
-so the flat dequant path remains the fallback for MoE (`MUL_MAT_ID`).
+native per-type `mul_mat_vec` kernels; prompt processing uses the flat dequant-to-F16 +
+tensor-core matmul (the cm2 per-element inline dequant, scalar or V=4, turned out slower and
+is no longer used for these types).
 
-The `*_R4` repack variants (`IQ2_K_R4, IQ3_K_R4, IQ4_K_R4, IQ5_K_R4, IQ4_KS_R4, IQ5_KS_R4`)
-and the remaining CUDA-supported types (`Q6_0, MXFP4, IQ1_BN, IQ2_BN, IQ1_S_R4, IQ1_M_R4`)
-are still not supported and run their matmuls on CPU.
+Still not supported (their matmuls run on CPU), in priority order:
+
+- `Q6_0` and `MXFP4` (the highest-value missing quants).
+- `IQ1_BN`, `IQ2_BN`, and the `*_R4` repacks (`IQ2_K_R4`, `IQ3_K_R4`, `IQ4_K_R4`,
+  `IQ5_K_R4`, `IQ4_KS_R4`, `IQ5_KS_R4`, `IQ1_S_R4`, `IQ1_M_R4`).
 
 ### Performance / architecture
 
