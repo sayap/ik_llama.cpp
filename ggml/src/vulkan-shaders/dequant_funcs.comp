@@ -83,6 +83,25 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_Q6_0)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint qh_byte = uint(data_a[a_offset + ib].qh[iqs % 8u]);
+    const uint h = (iqs < 8u) ? (qh_byte & 0x0Fu) : (qh_byte >> 4u);
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
+    return vec2((vui & 0x0Fu) | ((h << 4u) & 0x30u), (vui >> 4u) | ((h << 2u) & 0x30u)) - 32.0f;
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a_packed16[a_offset + ib].qs[iqs/2u]);
+    const uint ha = (iqs < 8u) ? (uint(data_a[a_offset + ib].qh[iqs]) & 0x0Fu) : (uint(data_a[a_offset + ib].qh[iqs - 8u]) >> 4u);
+    const uint hb = (iqs + 1u < 8u) ? (uint(data_a[a_offset + ib].qh[iqs + 1u]) & 0x0Fu) : (uint(data_a[a_offset + ib].qh[iqs + 1u - 8u]) >> 4u);
+    const uint q0 = (vui & 0x0Fu) | ((ha << 4u) & 0x30u);
+    const uint q1 = ((vui >> 4u) & 0x0Fu) | ((ha << 2u) & 0x30u);
+    const uint q2 = ((vui >> 8u) & 0x0Fu) | ((hb << 4u) & 0x30u);
+    const uint q3 = ((vui >> 12u) & 0x0Fu) | ((hb << 2u) & 0x30u);
+    return vec4(q0, q1, q2, q3) - 32.0f;
+}
+#endif
+
 #if defined(DATA_A_Q8_0)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     return vec2(int(data_a[a_offset + ib].qs[iqs]), int(data_a[a_offset + ib].qs[iqs + 1]));
@@ -449,7 +468,7 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q6_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
 }

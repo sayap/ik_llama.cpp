@@ -17,7 +17,7 @@ ik_llama.cpp, what has been fixed, how to get good performance, and what is stil
   supported** by the Vulkan backend (see "What we fixed"): single-token decode runs a native
   `mul_mat_vec` kernel per type and prompt processing runs a flat-dequant-to-F16 + tensor-core
   matmul (the dequant kernels are vectorized and the quantized weights are read once; see
-  "vs CUDA" for the measured result). The `*_R4` repack variants and `Q6_0`, `MXFP4`,
+  "vs CUDA" for the measured result). The `*_R4` repack variants and `MXFP4`,
   `IQ1_BN`, `IQ2_BN` are still not supported and fall back to the CPU backend.
 
 ## What we fixed
@@ -184,6 +184,18 @@ forces F32 for every arch), so it only surfaced with `GGML_BACKEND_DL=ON`, where
 arch list is the only thing forcing F32. Added `LLM_ARCH_QWEN3NEXT`,
 `LLM_ARCH_QWEN35` and `LLM_ARCH_QWEN35MOE` to both lists.
 
+### 9. Q6_0 quant
+
+`Q6_0` (32-element blocks: fp16 scale + 8 bytes of high bits + 16 bytes of nibbles)
+is now supported by `MUL_MAT` and `GET_ROWS`, using the same paths as the other
+legacy quants: native `mul_mat_vec` decode (`dequantize`/`dequantize4` in
+`dequant_funcs.comp`), cm2 inline dequant for coopmat2 prompt processing
+(`dequantFuncQ6_0`), and a flat `dequant_q6_0.comp` for the non-coopmat2 / MoE
+fallback. This lets Qwen3.6-27B IQK models (whose qkv/out projections are `Q6_0`)
+run those matmuls on Vulkan instead of falling back to the CPU. `MUL_MAT_ID`
+mat-mat for `Q6_0` is not wired yet (MoE models with `Q6_0` weights still fall
+back for those experts).
+
 ## Benchmarks (RTX 3090, Vulkan0)
 
 Qwen2.5-Coder-0.5B-Instruct-Q8_0 (dense, `-c 2048`, single token batch):
@@ -225,8 +237,7 @@ several quant types and batch sizes.
 
 ### Priority (highest first)
 
-1. **`Q6_0`** — the only legacy 6-bit quant still missing from `MUL_MAT`.
-2. **`MXFP4`** — the micro-scaling 4-bit format.
+1. **`MXFP4`** — the micro-scaling 4-bit format.
 3. **Indexer / DSA / CSA / HCA / GLM-DSA**: `INDEXER_TOPK`, `MASK_TOPK`, `MASK_TO_IDX`,
    `SINKHORN`, `HC_PRE`, `HC_POST`, `LATENT_ATTN`, `DS4_COMP`. Stateful sparse-attention
    ops (DeepSeek2/4, OpenPangu, GLM-4.5-Air, GLM-DSA).
@@ -281,7 +292,7 @@ is no longer used for these types).
 
 Still not supported (their matmuls run on CPU), in priority order:
 
-- `Q6_0` and `MXFP4` (the highest-value missing quants).
+- `MXFP4` (the highest-value missing quant).
 - `IQ1_BN`, `IQ2_BN`, and the `*_R4` repacks (`IQ2_K_R4`, `IQ3_K_R4`, `IQ4_K_R4`,
   `IQ5_K_R4`, `IQ4_KS_R4`, `IQ5_KS_R4`, `IQ1_S_R4`, `IQ1_M_R4`).
 
