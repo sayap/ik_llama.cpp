@@ -2932,6 +2932,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_MMV_Q8_1(GGML_TYPE_IQ4_K, iq4_k)
         CREATE_MMV_Q8_1(GGML_TYPE_IQ5_KS, iq5_ks)
         CREATE_MMV_Q8_1(GGML_TYPE_IQ5_K, iq5_k)
+        CREATE_MMV_Q8_1(GGML_TYPE_IQ6_K, iq6_k)
 #undef CREATE_MMV_Q8_1
 #endif
     }
@@ -4408,6 +4409,7 @@ static bool ggml_vk_is_iqk_q8_1_type(ggml_type type) {
         case GGML_TYPE_IQ4_K:
         case GGML_TYPE_IQ5_KS:
         case GGML_TYPE_IQ5_K:
+        case GGML_TYPE_IQ6_K:
             return true;
         default:
             return false;
@@ -4636,6 +4638,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_q8_1(ggml_backend_vk_conte
         case GGML_TYPE_IQ4_K:
         case GGML_TYPE_IQ5_KS:
         case GGML_TYPE_IQ5_K:
+        case GGML_TYPE_IQ6_K:
             break;
         default:
             return nullptr;
