@@ -14,10 +14,13 @@ layout (binding = 0) readonly buffer A32 { uint data_a32[]; };
 #define QUANT_K 256
 #define BLOCK_BYTES 144
 
-shared uint iq4k_byte_shmem[2][128];
+// Combined byte-pair table: entry[q] packs iq4k_values[v1*16 + (q & 0xf)] (low
+// byte) and iq4k_values[v2*16 + (q >> 4)] (high byte), so IQ4_K's two table
+// selectors are one shared load per quantized byte.
+shared uint iq4k_pair_shmem[4][128];
 
-uint iq4k_byte_entry(uint v, uint q) {
-    return iq4k_byte_shmem[v][q / 2u] >> (16u * (q % 2u));
+uint iq4k_pair_entry(uint sel, uint q) {
+    return iq4k_pair_shmem[sel][q / 2u] >> (16u * (q % 2u));
 }
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
@@ -41,6 +44,7 @@ void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, co
         const uint extra_shift = extra16 >> (2 * ib32);
         const uint v1_sel = (extra_shift & 1u) != 0 ? 1 : 0;
         const uint v2_sel = (extra_shift & 2u) != 0 ? 1 : 0;
+        const uint pair_sel = 2 * v1_sel + v2_sel;
 
         // sub-block scales: ls1 for the low-nibble group, ls2 for the high-nibble group
         const uint sh_byte = (data_a32[block_dw + 1] >> (8 * (ib32 / 2))) & 0xffu;
@@ -71,10 +75,9 @@ void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, co
                 int packed_hi = 0;
                 [[unroll]] for (uint k = 0; k < 4; ++k) {
                     const uint q = (w >> (8 * k)) & 0xffu;
-                    const uint e1 = iq4k_byte_entry(v1_sel, q);
-                    const uint e2 = iq4k_byte_entry(v2_sel, q);
-                    packed_lo |= int(e1 & 0xffu) << (8 * k);
-                    packed_hi |= int((e2 >> 8) & 0xffu) << (8 * k);
+                    const uint e = iq4k_pair_entry(pair_sel, q);
+                    packed_lo |= int(e & 0xffu) << (8 * k);
+                    packed_hi |= int((e >> 8) & 0xffu) << (8 * k);
                 }
                 sumi1 += dotPacked4x8EXT(packed_lo, data_b[b8].qs[g]);
                 sumi2 += dotPacked4x8EXT(packed_hi, data_b[b8].qs[g + 4]);
@@ -98,8 +101,22 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint ix = tid / 8;
 
     [[unroll]] for (uint idx = tid; idx < 128; idx += BLOCK_SIZE) {
-        iq4k_byte_shmem[0][idx] = iq4k_values_byte_0[idx];
-        iq4k_byte_shmem[1][idx] = iq4k_values_byte_16[idx];
+        const uint b0 = iq4k_values_byte_0[idx];
+        const uint b16 = iq4k_values_byte_16[idx];
+        // sel = v1*2 + v2; combined byte-pair = lo nibble from table v1, hi from v2.
+        // b0/b16 each pack two 16-bit byte-pairs (bytes 2*idx and 2*idx+1).
+        const uint c00 = (b0 & 0xffu) | (b0 & 0xff00u);
+        const uint c01 = (b0 & 0xffu) | (b16 & 0xff00u);
+        const uint c10 = (b16 & 0xffu) | (b0 & 0xff00u);
+        const uint c11 = (b16 & 0xffu) | (b16 & 0xff00u);
+        const uint d00 = ((b0 >> 16) & 0xffu) | ((b0 >> 16) & 0xff00u);
+        const uint d01 = ((b0 >> 16) & 0xffu) | ((b16 >> 16) & 0xff00u);
+        const uint d10 = ((b16 >> 16) & 0xffu) | ((b0 >> 16) & 0xff00u);
+        const uint d11 = ((b16 >> 16) & 0xffu) | ((b16 >> 16) & 0xff00u);
+        iq4k_pair_shmem[0][idx] = c00 | (d00 << 16);
+        iq4k_pair_shmem[1][idx] = c01 | (d01 << 16);
+        iq4k_pair_shmem[2][idx] = c10 | (d10 << 16);
+        iq4k_pair_shmem[3][idx] = c11 | (d11 << 16);
     }
     barrier();
 
