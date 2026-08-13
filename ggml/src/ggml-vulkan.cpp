@@ -2912,17 +2912,18 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_MMV_IQK(GGML_TYPE_IQ4_KT, iq4_kt)
 #undef CREATE_MMV_IQK
 
-        // KT-family Q8_1 activation vec kernels (dot4 against quantized activations).
+        // Q8_1 activation vec kernels: Trellis (KT) hash decode + IQ4_KS table decode.
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-#define CREATE_MMV_KT_Q8_1(TYPE, NAMELC) \
+#define CREATE_MMV_Q8_1(TYPE, NAMELC) \
         if (device->integer_dot_product) { \
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[TYPE][i], "mul_mat_vec_" #NAMELC "_q8_1_"+std::to_string(i+1), mul_mat_vec_ ## NAMELC ## _q8_1_len, mul_mat_vec_ ## NAMELC ## _q8_1_data, "main", 3, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq, i+1}, 1, true); \
         }
-        CREATE_MMV_KT_Q8_1(GGML_TYPE_IQ1_KT, iq1_kt)
-        CREATE_MMV_KT_Q8_1(GGML_TYPE_IQ2_KT, iq2_kt)
-        CREATE_MMV_KT_Q8_1(GGML_TYPE_IQ3_KT, iq3_kt)
-        CREATE_MMV_KT_Q8_1(GGML_TYPE_IQ4_KT, iq4_kt)
-#undef CREATE_MMV_KT_Q8_1
+        CREATE_MMV_Q8_1(GGML_TYPE_IQ1_KT, iq1_kt)
+        CREATE_MMV_Q8_1(GGML_TYPE_IQ2_KT, iq2_kt)
+        CREATE_MMV_Q8_1(GGML_TYPE_IQ3_KT, iq3_kt)
+        CREATE_MMV_Q8_1(GGML_TYPE_IQ4_KT, iq4_kt)
+        CREATE_MMV_Q8_1(GGML_TYPE_IQ4_KS, iq4_ks)
+#undef CREATE_MMV_Q8_1
 #endif
     }
 
@@ -4381,13 +4382,14 @@ static bool ggml_vk_is_iqk_type(ggml_type type) {
     }
 }
 
-// KT family only: these have native Q8_1-activation mul_mat_vec shaders.
-static bool ggml_vk_is_iqk_kt_type(ggml_type type) {
+// Types with a native Q8_1-activation mul_mat_vec shader.
+static bool ggml_vk_is_iqk_q8_1_type(ggml_type type) {
     switch (type) {
         case GGML_TYPE_IQ1_KT:
         case GGML_TYPE_IQ2_KT:
         case GGML_TYPE_IQ3_KT:
         case GGML_TYPE_IQ4_KT:
+        case GGML_TYPE_IQ4_KS:
             return true;
         default:
             return false;
@@ -4606,6 +4608,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_q8_1(ggml_backend_vk_conte
         case GGML_TYPE_IQ2_KT:
         case GGML_TYPE_IQ3_KT:
         case GGML_TYPE_IQ4_KT:
+        case GGML_TYPE_IQ4_KS:
             break;
         default:
             return nullptr;
@@ -5896,7 +5899,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
 
-    const bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0 && ggml_vk_is_iqk_kt_type(src0->type);
+    const bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0 && ggml_vk_is_iqk_q8_1_type(src0->type);
 
     const bool qx_needs_dequant = x_non_contig;
     const bool qy_needs_dequant = !quantize_y && ((src1->type != GGML_TYPE_F16 && !f16_f32_kernel) || y_non_contig);
