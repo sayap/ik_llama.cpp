@@ -1,0 +1,147 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+#include "mul_mat_vec_iqk_base_q8_1.comp"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// uint32 view of the byte-addressed weight buffer. IQ3_KS has a 2-byte row
+// scale header and 102-byte blocks (2-byte aligned only), so fields are read
+// through an unaligned-safe loader.
+layout (binding = 0) readonly buffer A32 { uint data_a32[]; };
+
+uint iq3k_load_u32(uint byte_off) {
+    const uint dw = byte_off >> 2;
+    const uint sh = (byte_off & 3u) * 8u;
+    if (sh == 0u) return data_a32[dw];
+    return (data_a32[dw] >> sh) | (data_a32[dw + 1u] << (32u - sh));
+}
+
+#define QUANT_K 256
+#define BLOCK_BYTES 102
+#define META 2
+
+// Byte-pair table: entry[q] packs iq3nl_values[q & 0xf] (low byte) and
+// iq3nl_values[q >> 4] (high byte), so two 4-bit indices are one shared load.
+shared uint iq3nl_byte_shmem[256];
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, const uint i,
+                     const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    // 8 threads per block, CUDA-style vec_dot_iq3_ks_q8_1: thread (ib128, il8)
+    // handles 8 elements in each of four Q8_1 blocks (sub-blocks 4*ib128+0..3).
+    const uint ib128 = itid / 4;   // 0..1
+    const uint il8 = itid % 4;     // 0..3
+
+    const uint row_bytes = p.stride_a + num_blocks_per_row * BLOCK_BYTES;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint row_byte = a_byte + (first_row + n) * row_bytes;
+        const uint block_byte = row_byte + META + i * BLOCK_BYTES;
+
+        const float d = iqk_f16_to_f32(iqk_load_u16(row_byte));
+
+        // extra (2 bytes) at offset 0, then scales[0..3] at offset 2.
+        const uint head = iq3k_load_u32(block_byte);
+        const uint extra16 = head & 0xffffu;
+        const uint scales01 = head >> 16;                  // scales[0] | scales[1] << 8
+        const uint scales23 = iq3k_load_u32(block_byte + 4) & 0xffffu; // scales[2] | scales[3] << 8
+        const uint scales_all = scales01 | (scales23 << 16);
+
+        // qs bytes [32*ib128 + 8*il8, +8), qh bytes [8*il8, +8)
+        const uint qs_w0 = iq3k_load_u32(block_byte + 6 + 32 * ib128 + 8 * il8);
+        const uint qs_w1 = iq3k_load_u32(block_byte + 10 + 32 * ib128 + 8 * il8);
+        const uint qh_w0 = iq3k_load_u32(block_byte + 70 + 8 * il8);
+        const uint qh_w1 = iq3k_load_u32(block_byte + 74 + 8 * il8);
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint base_b8 = (j * p.batch_stride_b + b_offset + i * QUANT_K) / 32;
+            float sumf = 0.0f;
+            [[unroll]] for (uint ib = 0; ib < 4; ++ib) {
+                const uint s = 4 * ib128 + ib;
+                const uint b8 = base_b8 + s;
+                const vec2 ds = vec2(data_b[b8].ds);
+                const float d8 = ds.x;
+
+                // sub-block scale: 4-bit scales nibble + 1 extra bit, minus 16.
+                const uint nib = (scales_all >> (8 * ib + 4 * ib128)) & 0xFu;
+                const uint ls = nib | (((extra16 >> s) & 1u) << 4);
+                const float dl = d * float(int(ls) - 16);
+                const uint voff32 = (((extra16 >> (8 + s)) & 1u) != 0) ? 0x08080808u : 0u;
+
+                // Build the four 4-bit indices for this sub-block with one
+                // shift+mask per uint32 word (matching CUDA's packed decode).
+                const uint sh = 4 * ib128 + ib;
+                const uint idx0 = ((qs_w0 >> (2 * ib)) & 0x03030303u) | (((qh_w0 >> sh) & 0x01010101u) << 2) | voff32;
+                const uint idx1 = ((qs_w1 >> (2 * ib)) & 0x03030303u) | (((qh_w1 >> sh) & 0x01010101u) << 2) | voff32;
+
+                const uint pair00 = (idx0 & 0xFu) | ((idx0 >> 4) & 0xF0u);
+                const uint pair01 = ((idx0 >> 16) & 0xFu) | ((idx0 >> 20) & 0xF0u);
+                const uint pair10 = (idx1 & 0xFu) | ((idx1 >> 4) & 0xF0u);
+                const uint pair11 = ((idx1 >> 16) & 0xFu) | ((idx1 >> 20) & 0xF0u);
+
+                const int packed_lo = int(iq3nl_byte_shmem[pair00] | (iq3nl_byte_shmem[pair01] << 16));
+                const int packed_hi = int(iq3nl_byte_shmem[pair10] | (iq3nl_byte_shmem[pair11] << 16));
+                const int qb0 = data_b[b8].qs[2 * il8 + 0];
+                const int qb1 = data_b[b8].qs[2 * il8 + 1];
+                int dot = dotPacked4x8EXT(packed_lo, qb0);
+                dot += dotPacked4x8EXT(packed_hi, qb1);
+
+                sumf += dl * d8 * float(dot);
+            }
+            temp[j][n] += sumf;
+        }
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_byte, b_offset, d_offset;
+    get_offsets(a_byte, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+
+    const uint blocks_per_wg = gl_WorkGroupSize.x / 8;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid % 8;
+    const uint ix = tid / 8;
+
+    [[unroll]] for (uint idx = tid; idx < 256; idx += BLOCK_SIZE) {
+        const uint lo_i = idx & 0xFu;
+        const uint hi_i = idx >> 4;
+        const uint lo_p = iq3nl_values_packed[lo_i >> 2];
+        const uint hi_p = iq3nl_values_packed[hi_i >> 2];
+        int lo = int((lo_p >> (8 * (lo_i & 3))) & 0xffu);
+        int hi = int((hi_p >> (8 * (hi_i & 3))) & 0xffu);
+        if (lo >= 128) lo -= 256;
+        if (hi >= 128) hi -= 256;
+        iq3nl_byte_shmem[idx] = (lo & 0xffu) | ((hi & 0xffu) << 8);
+    }
+    barrier();
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg)
+        calc_superblock(a_byte, b_offset, itid, i, num_blocks_per_row, first_row, num_rows);
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}
