@@ -1340,9 +1340,8 @@ struct block_iq4_nl_packed16
 // IQK (QK_K=256) and KT quant families: byte-addressed with 256-element
 // blocks of varying byte sizes, optionally with a per-row scale (META)
 // header. There is no typed block struct (the loaders address bytes
-// explicitly), so A_TYPE/A_TYPE_PACKED16 are uint8_t. Used by the Q8_1 mmq
-// (mul_mmq.comp, IQ4_KT) and the coopmat2 inline-dequant matmul
-// (mul_mm_cm2.comp).
+// explicitly), so A_TYPE/A_TYPE_PACKED16 are uint8_t. Used by the coopmat2
+// inline-dequant matmul (mul_mm_cm2.comp).
 #if defined(DATA_A_IQ2_K)   || defined(DATA_A_IQ3_K)   || defined(DATA_A_IQ4_K)   || \
     defined(DATA_A_IQ5_K)   || defined(DATA_A_IQ6_K)   || defined(DATA_A_IQ2_KS)  || \
     defined(DATA_A_IQ3_KS)  || defined(DATA_A_IQ4_KS)  || defined(DATA_A_IQ4_KSS) || \
