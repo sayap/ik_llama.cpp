@@ -365,9 +365,13 @@ Remaining performance notes:
   so they also benefit. The F32/F16 `mul_mat_vec_iq5_k` fallback (non-integer-dot devices and
   the `MUL_MAT_ID` vec path) is still the 16-thread byte-addressed shader.
 - **Decode numbers after the uint32-view / 8-thread rework** (RTX 3090, 32B Qwen2.5-Coder,
-  `-c 4096`, `-n 128 --temp 0`): IQ5_K ~25.5 tok/s, IQ2_K ~32.6 tok/s (its attn_output/attn_v
-  are IQ3_K/IQ4_K), IQ4_KSS ~33.7 tok/s. The smaller quants are now clearly faster than
-  IQ5_K, as expected from their smaller weight footprint.
+  `-c 4096`, `-n 128 --temp 0`): IQ3_K ~25.3 tok/s, IQ5_K ~25.5 tok/s, IQ4_K ~28.2 tok/s,
+  IQ2_K ~33.4 tok/s (its attn_output/attn_v are IQ3_K/IQ4_K), IQ4_KSS ~33.7 tok/s.
+  IQ3_K's 110-byte block is only 2-byte aligned, so it uses an unaligned-safe uint32 loader
+  and stays slightly behind the 4-byte-aligned quants. Dump a model's per-tensor types with
+  `gguf-py/scripts/gguf_dump.py <model.gguf>` (the IQ*_K models mix a few higher-precision
+  attention tensors and an output tensor, e.g. IQ3_K keeps attn_v as IQ4_K and output as Q5_K,
+  IQ4_K keeps attn_v as IQ5_K and output as Q6_K).
 - The decode (`mul_mat_vec`) kernels still dequantize per element with the KT-family
   multiplicative-hash decode (4 hash rounds per weight); the output projection
   `[5120, 152064]` alone is ~0.7 ms/token.
