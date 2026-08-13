@@ -294,9 +294,10 @@ Still not supported (their matmuls run on CPU), in priority order:
   of its calibration factor (see above). Note: on `Vulkan0` the multi-token `MUL_MAT`
   cases take the dequant-to-F16 path on both `Vulkan0` and `Vulkan1` (the cm2 inline-dequant
   path is no longer used for the IQK/KT types), so both `MUL_MAT` and `MUL_MAT_ID` exercise
-  the flat dequant kernels. The single-token KS/KL/KT cases currently fail on `Vulkan1`
-  (a pre-existing `mul_mat_vec` row-meta issue on that device, unrelated to the dequant
-  kernels).
+  the flat dequant kernels. The single-token KS/KL/KT cases previously failed on `Vulkan1`
+  because the `mul_mat_vec` A subbuffer omitted the per-row scale header (the last rows read
+  out of range); the vec dispatch now uses `ggml_nbytes(src0)` for the raw-weight case, and
+  all 15 types pass on both `Vulkan0` and `Vulkan1`.
 - End-to-end benchmark (RTX 3090, Qwen2.5-Coder-32B-Instruct-IQ4_KT):
   `llama-server -m <model> -dev Vulkan0 -c 4096 -ub 2048 -b 2048 -n 256 -nocb --host 127.0.0.1`
   Send a tiny warmup prompt first — the first prompt compiles the Vulkan pipelines — then
