@@ -371,9 +371,14 @@ running many iterations) shows both remaining gaps are dominated by the FFN:
 
     A V=4 vector-decode path (`GL_NV_cooperative_matrix_decode_vector`, one driver
     invocation per 4 elements with shared row-header/block-selector reads) is implemented
-    for all 15 types with SPIR-V stripping for devices without the capability, but the
-    RTX 3090 (Ampere, driver 610.57.04) does not expose the extension, so it falls back
-    to the scalar decode there. It should help on decode-vector-capable GPUs.
+    for all 15 types with SPIR-V stripping for devices without the capability. It was
+    first exercised on the NVIDIA beta driver 595.44.14 (which exposes the extension and
+    is now enabled at device creation; previously the feature was queried into the wrong
+    struct and never enabled). On the RTX 3090 it is correct for IQ4_KT but still ~1.5x
+    slower than the flat dequant+F16 path at n=2048 (9.6 vs 6.7 ms per FFN matmul),
+    because the inline decode is re-done once per N-tile while the flat dequant runs once
+    per batch; several other types' V=4 decoders are also buggy (e.g. IQ2_KL). The
+    dequant+F16 path is therefore used for all IQK/KT MUL_MAT on coopmat2.
 
     **The flat dequant kernels are now optimized, and dense IQK/KT MUL_MAT uses them.**
     The 15 `dequant_iqX_*` shaders keep the original 8-threads-per-block mapping but now
@@ -383,7 +388,7 @@ running many iterations) shows both remaining gaps are dominated by the FFN:
     dequant+`MUL_MAT_ID` FFN matmul (`[27648, 5120] x [27648, n]`) drops to ~1.3-2.3 ms
     (n=32) from ~3.8 ms, now faster than the scalar cm2 inline dequant (~3.1 ms). The
     dense `MUL_MAT` path therefore falls back to dequant+F16 for the IQK/KT families
-    (cm2 is kept only on decode-vector-capable GPUs). End-to-end prompt processing on the
+    (the cm2 inline-dequant path, scalar or V=4, is not used for these types). End-to-end prompt processing on the
     32B IQ4_KT model improves from ~500 tok/s to ~850 tok/s at the default ubatch (512);
     with `-ub 2048` (or `-ub 4096`) it reaches ~1090-1110 tok/s, within ~1.1x of CUDA
     (~1240 tok/s), because the larger batch uses the tensor cores more efficiently and

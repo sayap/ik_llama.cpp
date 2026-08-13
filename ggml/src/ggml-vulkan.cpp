@@ -3485,15 +3485,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
             last_struct = (VkBaseOutStructure *)&coopmat2_props;
         }
 #endif
-#if defined(GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT)
-        VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV coopmat2_decode_vector_features {};
-        coopmat2_decode_vector_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_DECODE_VECTOR_FEATURES_NV;
-        if (coopmat2_decode_vector_support) {
-            last_struct->pNext = (VkBaseOutStructure *)&coopmat2_decode_vector_features;
-            last_struct = (VkBaseOutStructure *)&coopmat2_decode_vector_features;
-        }
-#endif
-
         if (device->integer_dot_product) {
             last_struct->pNext = (VkBaseOutStructure *)&shader_integer_dot_product_props;
             last_struct = (VkBaseOutStructure *)&shader_integer_dot_product_props;
@@ -3632,6 +3623,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
             last_struct->pNext = (VkBaseOutStructure *)&coopmat2_features;
             last_struct = (VkBaseOutStructure *)&coopmat2_features;
             device_extensions.push_back("VK_NV_cooperative_matrix2");
+        }
+#endif
+
+#if defined(GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT)
+        VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV coopmat2_decode_vector_features {};
+        coopmat2_decode_vector_features.pNext = nullptr;
+        coopmat2_decode_vector_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_DECODE_VECTOR_FEATURES_NV;
+        if (coopmat2_decode_vector_support) {
+            last_struct->pNext = (VkBaseOutStructure *)&coopmat2_decode_vector_features;
+            last_struct = (VkBaseOutStructure *)&coopmat2_decode_vector_features;
+            device_extensions.push_back("VK_NV_cooperative_matrix_decode_vector");
         }
 #endif
 
@@ -4525,10 +4527,11 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
 
     if (ctx->device->coopmat2) {
         assert(src1_type == GGML_TYPE_F16);
-        // The flat dequant+F16 fallback is now faster than the scalar per-element
-        // cm2 inline dequant for the IQK/KT families (see docs/Vulkan.md). Keep
-        // cm2 only on decode-vector-capable GPUs where the V=4 path may win.
-        if (ggml_vk_is_iqk_type(src0_type) && !ctx->device->coopmat2_decode_vector) {
+        // The IQK/KT families use the flat dequant+F16 fallback: it is faster
+        // than the cm2 inline dequant (scalar or V=4 decode-vector) because the
+        // inline decode is re-done once per N-tile while the flat dequant runs
+        // once per batch (see docs/Vulkan.md).
+        if (ggml_vk_is_iqk_type(src0_type)) {
             return nullptr;
         }
         vk_matmul_pipeline p = prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
