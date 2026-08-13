@@ -561,6 +561,15 @@ void process_shaders() {
 
     }
 
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    // KT-family Q8_1 activation mul_mat_vec: decode the KT hash values to packed
+    // int8 and dot them against block_q8_1 activations with dotPacked4x8EXT.
+    for (const auto& tname : std::vector<std::string>{ "iq1_kt", "iq2_kt", "iq3_kt", "iq4_kt" }) {
+        const std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+        string_to_spv("mul_mat_vec_" + tname + "_q8_1", "mul_mat_vec_" + tname + "_q8_1.comp", {{"FLOAT_TYPE", "float"}, {data_a_key, "1"}, {"D_TYPE", "float"}});
+    }
+#endif
+
     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPE_VEC4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
     string_to_spv("mul_mat_vec_p021_f16_f32",              "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPE_VEC4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}});
     string_to_spv("mul_mat_vec_nc_f16_f32", "mul_mat_vec_nc.comp", {{"A_TYPE", "float16_t"}, {"A_TYPE_VEC4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}});

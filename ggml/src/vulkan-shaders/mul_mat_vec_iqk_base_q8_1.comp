@@ -1,0 +1,95 @@
+// Shared base for the Q8_1-activation mul_mat_vec shaders of the KT quant family.
+//
+// This is the Q8_1 counterpart of mul_mat_vec_iqk_base.comp: the weights (A)
+// are still read as raw bytes with the per-row scale header, but the
+// activations (B) are block_q8_1 (packed int8 + half scales), so the decoded
+// KT hash values are dotted against them with dotPacked4x8EXT.
+//
+//   row byte stride  = p.stride_a + nbpb * BLOCK_BYTES     (p.stride_a = meta bytes)
+//   block byte offset = row * row_stride + p.stride_a + blk * BLOCK_BYTES
+//
+// p.batch_stride_b carries the B row stride in ELEMENTS (as in the F32/F16
+// vec shaders); the per-type shaders divide by 32 to get the Q8_1 block index.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "types.comp"
+#define IQK_USE_DOT4
+#include "iqk_tables.comp"
+
+layout (binding = 1) readonly buffer B { block_q8_1_packed32 data_b[]; };
+layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;
+    uint stride_a;      // row meta size in bytes
+    uint stride_b;      // B row stride in elements
+    uint stride_d;
+
+    uint batch_stride_a; // bytes per batch/expert of A
+    uint batch_stride_b;
+    uint batch_stride_d;
+
+    uint ne02;
+    uint ne12;
+    uint broadcast2;
+    uint broadcast3;
+} p;
+
+void get_offsets(out uint a_byte, out uint b_offset, out uint d_offset) {
+    const uint batch_idx = gl_GlobalInvocationID.y;
+
+    uint batch_idx_a = 0;
+    if (batch_idx != 0) {
+        const uint i13 = batch_idx / p.ne12;
+        const uint i12 = batch_idx % p.ne12;
+
+        const uint i03 = i13 / p.broadcast3;
+        const uint i02 = i12 / p.broadcast2;
+
+        batch_idx_a = i03 * p.ne02 + i02;
+    }
+
+    a_byte = batch_idx_a * p.batch_stride_a;
+    b_offset = batch_idx * p.batch_stride_b;
+    d_offset = batch_idx * p.batch_stride_d;
+}
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 16;
+layout (constant_id = 1) const uint NUM_ROWS = 1;
+layout (constant_id = 2) const uint NUM_COLS = 1;
+
+shared FLOAT_TYPE tmpsh[NUM_COLS][NUM_ROWS][BLOCK_SIZE];
+
+void reduce_result(const in FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
+    // sum up partial sums and write back result
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            tmpsh[j][n][tid] = temp[j][n];
+        }
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                    tmpsh[j][n][tid] += tmpsh[j][n][tid + s];
+                }
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+            }
+        }
+    }
+}

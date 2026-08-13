@@ -64,6 +64,24 @@ vec4 iqk_hash_values(inout uint x, bool is_abs, uint sign_mask) {
     return res;
 }
 
+#ifdef IQK_USE_DOT4
+// Packed-int8 variant of iqk_hash_values for the Q8_1 activation dot: the four
+// decoded values are returned in one int32 (one byte per value), ready for
+// dotPacked4x8EXT against the quantized activations.
+int iqk_hash_values_packed(inout uint x, bool is_abs, uint sign_mask) {
+    int packed = 0;
+    [[unroll]] for (int k = 0; k < 4; ++k) {
+        x *= 0xCBAC1FEDu;
+        const uint s = x & 0x3F3F3F3Fu;
+        int v = dotPacked4x8EXT(int(s), 0x01010101) - 126;
+        if (is_abs) v = abs(v);
+        if (((sign_mask >> k) & 1u) != 0u) v = -v;
+        packed |= (v & 0xff) << (8 * k);
+    }
+    return packed;
+}
+#endif
+
 // 2-bit nonlinear values (two 4-entry tables)
 const int8_t iq2nl_values[8] = {
     int8_t(-31), int8_t(-13), int8_t(1), int8_t(17),
