@@ -1,0 +1,117 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+#include "mul_mat_vec_iqk_base_q8_1.comp"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+#define QUANT_K 256
+#define BLOCK_BYTES 76
+
+shared uint iq2nl_shmem[2];
+
+int iq2nl_value_shmem(uint index) {
+    const int v = int((iq2nl_shmem[index / 4u] >> (8u * (index % 4u))) & 0xffu);
+    return v >= 128 ? v - 256 : v;
+}
+
+FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+
+void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, const uint i,
+                     const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    const uint ib32 = itid / 2;
+    const uint h = itid % 2;
+    const uint e = 32 * ib32 + 16 * h;
+    const uint shift = 2 * (ib32 % 4);
+    const uint qs_off = 12 + (ib32 / 4) * 32 + h * 16;
+
+    const uint y_idx = i * QUANT_K + e;
+    const uint row_bytes = p.stride_a + num_blocks_per_row * BLOCK_BYTES;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint block_byte = a_byte + (first_row + n) * row_bytes + p.stride_a + i * BLOCK_BYTES;
+
+        const uint extra = iqk_load_u16(block_byte + 2);
+        const uint e_shift = extra >> (2 * ib32);
+        const uint v_off = ((h == 0 ? (e_shift & 1u) : (e_shift & 2u)) != 0) ? 4 : 0;
+
+        const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+        const uint sc = data_a[block_byte + 4 + ib32];
+        const float dl = d * (float((sc >> (4 * h)) & 0xFu) - 8.0f);
+
+        const uint w0 = iqk_load_u32(block_byte + qs_off + 0);
+        const uint w1 = iqk_load_u32(block_byte + qs_off + 4);
+        const uint w2 = iqk_load_u32(block_byte + qs_off + 8);
+        const uint w3 = iqk_load_u32(block_byte + qs_off + 12);
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b8 = (j * p.batch_stride_b + b_offset + y_idx) / 32;
+            const vec2 ds = vec2(data_b[b8].ds);
+            const float d8 = ds.x;
+
+            const int q0 = data_b[b8].qs[4 * h + 0];
+            const int q1 = data_b[b8].qs[4 * h + 1];
+            const int q2 = data_b[b8].qs[4 * h + 2];
+            const int q3 = data_b[b8].qs[4 * h + 3];
+
+            int sumi = 0;
+            [[unroll]] for (uint g = 0; g < 4; ++g) {
+                const uint w = (g == 0) ? w0 : (g == 1) ? w1 : (g == 2) ? w2 : w3;
+                int packed = 0;
+                [[unroll]] for (uint k = 0; k < 4; ++k) {
+                    const uint q = (w >> (8 * k)) & 0xffu;
+                    const uint idx = ((q >> shift) & 3u) + v_off;
+                    const int v = iq2nl_value_shmem(idx);
+                    packed |= (v & 0xff) << (8 * k);
+                }
+                const int qb = (g == 0) ? q0 : (g == 1) ? q1 : (g == 2) ? q2 : q3;
+                sumi += dotPacked4x8EXT(packed, qb);
+            }
+
+            temp[j][n] = fma(dl * d8, float(sumi), temp[j][n]);
+        }
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_byte, b_offset, d_offset;
+    get_offsets(a_byte, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+
+    const uint blocks_per_wg = gl_WorkGroupSize.x / 16;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid % 16;
+    const uint ix = tid / 16;
+
+    if (tid < 2) {
+        iq2nl_shmem[tid] = iq2nl_values_packed[tid];
+    }
+    barrier();
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg)
+        calc_superblock(a_byte, b_offset, itid, i, num_blocks_per_row, first_row, num_rows);
+
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}
