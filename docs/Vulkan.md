@@ -364,17 +364,60 @@ Remaining performance notes:
   IQ4_KS/IQ4_KT/IQ2_K models store some attention tensors as IQ5_K (e.g. IQ4_KS `attn_v`),
   so they also benefit. The F32/F16 `mul_mat_vec_iq5_k` fallback (non-integer-dot devices and
   the `MUL_MAT_ID` vec path) is still the 16-thread byte-addressed shader.
-- **Decode numbers after the uint32-view / 8-thread rework** (RTX 3090, 32B Qwen2.5-Coder,
-  `-c 4096`, `-n 128 --temp 0`): IQ3_K ~25.3 tok/s, IQ5_K ~25.5 tok/s, IQ4_K ~28.2 tok/s,
-  IQ2_K ~33.4 tok/s (its attn_output/attn_v are IQ3_K/IQ4_K), IQ4_KSS ~33.7 tok/s.
-  IQ3_K's 110-byte block is only 2-byte aligned, so it uses an unaligned-safe uint32 loader
-  and stays slightly behind the 4-byte-aligned quants. (Alternatives were tried and regressed:
-  a branchless select load and a 3-aligned-word pair loader both measured slower than the
-  plain 1-or-2-load branch — the divergence is cheap and the extra always-on loads/shifts are
-  not.) Dump a model's per-tensor types with
+- **TG decode numbers after the uint32-view / 8-thread / Q8_1 rework** (RTX 3090, 32B
+  Qwen2.5-Coder, `-c 4096 -n 128 --temp 0`; the 27 GB IQ6_K uses
+  `-dev Vulkan0,Vulkan1 -ts 8,1`):
+
+  | quant | size | TG tok/s | | quant | size | TG tok/s |
+  |---|---|---|---|---|---|---|
+  | IQ1_KT | 7.6 GB | 43.4 | | IQ3_KS | 13.3 GB | 26.0 |
+  | IQ2_KT | 9.6 GB | 42.4 | | IQ4_KT | 16.7 GB | 32.9 |
+  | IQ2_KS | 9.4 GB | 34.5 | | IQ4_KSS | 16.9 GB | 33.7 |
+  | IQ2_K | 10.3 GB | 33.4 | | IQ4_KS | 17.9 GB | 29.2 |
+  | IQ2_KL | 11.3 GB | 35.0 | | IQ4_K | 18.7 GB | 28.2 |
+  | IQ3_KT | 13.7 GB | 26.8 | | IQ5_KS | 21.6 GB | 30.0 |
+  | IQ3_K | 14.3 GB | 25.3 | | IQ5_K | 22.6 GB | 25.5 |
+  | | | | | IQ6_K | 27.1 GB | 19.4 (2 GPU) |
+
+  The 1-2 bit quants decode at ~33-43 tok/s and the 3-6 bit at ~25-33 tok/s (IQ6_K is the
+  2-GPU outlier). The base `_K` types store some attention tensors in higher-precision
+  quants (e.g. IQ2_K keeps attn_output/attn_v as IQ3_K/IQ4_K), so their decode reflects a
+  mix. IQ3_K's 110-byte block is only 2-byte aligned, so it uses an unaligned-safe uint32
+  loader and stays slightly behind the 4-byte-aligned quants. (Alternatives were tried and
+  regressed: a branchless select load and a 3-aligned-word pair loader both measured slower
+  than the plain 1-or-2-load branch — the divergence is cheap and the extra always-on
+  loads/shifts are not.) Dump a model's per-tensor types with
   `gguf-py/scripts/gguf_dump.py <model.gguf>` (the IQ*_K models mix a few higher-precision
   attention tensors and an output tensor, e.g. IQ3_K keeps attn_v as IQ4_K and output as Q5_K,
   IQ4_K keeps attn_v as IQ5_K and output as Q6_K).
+- **PP numbers** (RTX 3090, same 32B models, 2600-token fixed-seed prompt,
+  `-ub 2048 -b 2048 -nocb -n 1`, single `Vulkan0` except IQ6_K):
+
+  | quant | PP tok/s | | quant | PP tok/s |
+  |---|---|---|---|---|
+  | IQ1_KT | 1074 | | IQ3_KS | 1062 |
+  | IQ2_KT | 1072 | | IQ4_KT | 1070 |
+  | IQ2_KS | 1108 | | IQ4_KSS | 1005 |
+  | IQ2_K | 1108 | | IQ4_KS | 1009 |
+  | IQ2_KL | 1102 | | IQ4_K | 1015 |
+  | IQ3_KT | 1127 | | IQ5_KS | 941 |
+  | IQ3_K | 1134 | | IQ5_K | 937 |
+  | | | | IQ6_K | 451 (2 GPU) |
+
+  PP goes through the dequant-to-F16 + F16 tensor-core matmul path (not the `mul_mat_vec`
+  Q8_1 shaders), which was already optimized. It is dominated by the fixed per-layer F16
+  matmul, so it barely depends on quant bit-width (~940-1134 tok/s for the single-device
+  quants, i.e. within the docs' ~1.1x-of-CUDA figure). `-nocb` matters: without it IQ2_KS
+  showed a spurious ~872 tok/s and IQ3_KT hit a `vk::DeviceLostError`. IQ6_K is the only
+  laggard, limited by the multi-GPU split (17% of tensors on the ~3.7x-slower AMD iGPU plus
+  per-split cross-device sync) rather than the IQ6_K decode.
+  **PP optimization candidates** (see also "vs CUDA" below): (1) the F16 tensor-core matmul
+  runs at ~75% of FP16 peak — tile-size / split-k tuning of the generic coopmat2 matmul lifts
+  every quant uniformly; (2) for >24 GB models, tune the tensor-split heuristic to keep the
+  output projection and more FFN on the fast device, and implement the async tensor copies /
+  events (still NULL in the backend interface) so cross-device transfer overlaps compute;
+  (3) the flat dequant kernels still feed `MUL_MAT_ID` (MoE) and non-coopmat2 devices — the
+  V=4 coopmat2 inline dequant is available but ~1.5x slower than dequant+F16 today.
 - The decode (`mul_mat_vec`) kernels still dequantize per element with the KT-family
   multiplicative-hash decode (4 hash rounds per weight); the output projection
   `[5120, 152064]` alone is ~0.7 ms/token.
