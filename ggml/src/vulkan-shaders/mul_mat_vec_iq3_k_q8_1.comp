@@ -21,9 +21,9 @@ uint iq3k_load_u32(uint byte_off) {
 #define QUANT_K 256
 #define BLOCK_BYTES 110
 
-// 16 sign-extended int32 entries (one per iq3nl table value), so the hot-loop
-// lookup is a single shared-memory load with no division/modulo/shift/mask.
-shared int iq3nl_shmem[16];
+// Byte-pair table: entry[q] packs iq3nl_values[q & 0xf] (low byte) and
+// iq3nl_values[q >> 4] (high byte), so two 4-bit indices are one shared load.
+shared uint iq3nl_byte_shmem[256];
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
@@ -69,21 +69,21 @@ void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, co
                 const uint sign = (sh16 >> (2 * ib32 + is_hi)) & 1u;
                 const int ls = int(2 * ((sl >> (4 * is_hi)) & 0xFu) + 1) * (sign != 0 ? -1 : 1);
                 const float dl = d * float(ls);
-                const uint voff = ((extra16 >> (2 * ib32 + is_hi)) & 1u) != 0 ? 8u : 0u;
+                const uint voff32 = (((extra16 >> (2 * ib32 + is_hi)) & 1u) != 0) ? 0x08080808u : 0u;
 
-                int packed_lo = 0;
-                int packed_hi = 0;
-                [[unroll]] for (uint k = 0; k < 4; ++k) {
-                    const uint q0 = (qs_w0 >> (8 * k)) & 0xffu;
-                    const uint h0 = (qh_w0 >> (8 * k)) & 0xffu;
-                    const uint idx0 = ((q0 >> (2 * s)) & 3u) | (((h0 >> (4 * ib128 + s)) & 1u) << 2);
-                    packed_lo |= (iq3nl_shmem[idx0 + voff] & 0xff) << (8 * k);
+                // Build the four 4-bit indices for this sub-block with one
+                // shift+mask per uint32 word (matching CUDA's packed decode).
+                const uint sh = 4 * ib128 + s;
+                const uint idx0 = ((qs_w0 >> (2 * s)) & 0x03030303u) | (((qh_w0 >> sh) & 0x01010101u) << 2) | voff32;
+                const uint idx1 = ((qs_w1 >> (2 * s)) & 0x03030303u) | (((qh_w1 >> sh) & 0x01010101u) << 2) | voff32;
 
-                    const uint q1 = (qs_w1 >> (8 * k)) & 0xffu;
-                    const uint h1 = (qh_w1 >> (8 * k)) & 0xffu;
-                    const uint idx1 = ((q1 >> (2 * s)) & 3u) | (((h1 >> (4 * ib128 + s)) & 1u) << 2);
-                    packed_hi |= (iq3nl_shmem[idx1 + voff] & 0xff) << (8 * k);
-                }
+                const uint pair00 = (idx0 & 0xFu) | ((idx0 >> 4) & 0xF0u);
+                const uint pair01 = ((idx0 >> 16) & 0xFu) | ((idx0 >> 20) & 0xF0u);
+                const uint pair10 = (idx1 & 0xFu) | ((idx1 >> 4) & 0xF0u);
+                const uint pair11 = ((idx1 >> 16) & 0xFu) | ((idx1 >> 20) & 0xF0u);
+
+                const int packed_lo = int(iq3nl_byte_shmem[pair00] | (iq3nl_byte_shmem[pair01] << 16));
+                const int packed_hi = int(iq3nl_byte_shmem[pair10] | (iq3nl_byte_shmem[pair11] << 16));
                 const int qb0 = data_b[b8].qs[2 * il8 + 0];
                 const int qb1 = data_b[b8].qs[2 * il8 + 1];
                 int dot = dotPacked4x8EXT(packed_lo, qb0);
@@ -107,11 +107,16 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint itid = tid % 8;
     const uint ix = tid / 8;
 
-    [[unroll]] for (uint idx = tid; idx < 16; idx += BLOCK_SIZE) {
-        const uint packed = iq3nl_values_packed[idx / 4u];
-        int v = int((packed >> (8u * (idx % 4u))) & 0xffu);
-        if (v >= 128) v -= 256;
-        iq3nl_shmem[idx] = v;
+    [[unroll]] for (uint idx = tid; idx < 256; idx += BLOCK_SIZE) {
+        const uint lo_i = idx & 0xFu;
+        const uint hi_i = idx >> 4;
+        const uint lo_p = iq3nl_values_packed[lo_i >> 2];
+        const uint hi_p = iq3nl_values_packed[hi_i >> 2];
+        int lo = int((lo_p >> (8 * (lo_i & 3))) & 0xffu);
+        int hi = int((hi_p >> (8 * (hi_i & 3))) & 0xffu);
+        if (lo >= 128) lo -= 256;
+        if (hi >= 128) hi -= 256;
+        iq3nl_byte_shmem[idx] = (lo & 0xffu) | ((hi & 0xffu) << 8);
     }
     barrier();
 
