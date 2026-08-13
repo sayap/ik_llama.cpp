@@ -110,6 +110,18 @@ const int8_t iq4k_values[32] = {
     int8_t(5),    int8_t(17),   int8_t(29),  int8_t(42),  int8_t(57),  int8_t(73),  int8_t(93),  int8_t(117),
 };
 
+// Packed iq4k_values: 4 int8 entries per uint32 (low byte first), so a 4-value
+// group is one uint load + shift/mask instead of four int8 loads.
+const uint iq4k_values_packed[8] = {
+    uint(0xbfad9881u), uint(0xf6eaddcfu), uint(0x26190d01u), uint(0x71594535u),
+    uint(0xc3b19c85u), uint(0xfaeee1d3u), uint(0x2a1d1105u), uint(0x755d4939u),
+};
+
+int iq4k_value_packed(uint index) {
+    const int v = int((iq4k_values_packed[index / 4u] >> (8u * (index % 4u))) & 0xffu);
+    return v >= 128 ? v - 256 : v;
+}
+
 // 5-bit nonlinear values (two 32-entry tables)
 const int8_t iq5nl_values[64] = {
     int8_t(-126), int8_t(-114), int8_t(-103), int8_t(-92), int8_t(-83), int8_t(-74), int8_t(-65), int8_t(-57),
