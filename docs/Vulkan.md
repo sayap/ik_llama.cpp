@@ -38,9 +38,11 @@ and `GET_ROWS`:
   `mul_mat_vec` path now quantizes the F32 activations to Q8_1 and dots packed-int8 decodes
   against them with `dotPacked4x8EXT`. The Trellis types (`IQ1_KT`..`IQ4_KT`) use the
   multiplicative-hash decode (mirroring CUDA's `vec_dot_iq{1,2,3,4}_kt_q8_1`). The IQK types
-  use shared table decodes: `IQ4_KS`/`IQ4_KSS` use the 4-bit `iq4k_values` byte-pair table
-  with an 8-threads-per-block mapping, and `IQ5_K` uses the 5-bit `iq5nl_values` table with a
-  CUDA-style 8-thread mapping and a uint32 weight-buffer view.
+  use shared table decodes with a CUDA-style 8-threads-per-block mapping and a uint32
+  weight-buffer view: `IQ2_K` (2-bit `iq2k_table` via `dotPacked4x8EXT` offset trick),
+  `IQ3_K` (3-bit `iq3nl_values` packed into a 4-bit direct-indexed table), `IQ4_K`/`IQ4_KS`/
+  `IQ4_KSS` (4-bit `iq4k_values` byte-pair table) and `IQ5_K` (5-bit `iq5nl_values` table).
+  IQ3_K's 110-byte block is only 2-byte aligned, so it uses an unaligned-safe uint32 loader.
   This removes the scalar-FMA activation dot from the decode FFN and attention projections.
 - **prompt processing (mul_mat)**: on NV_coopmat2 devices the mat-mat path runs the
   **coopmat2 tensor-core matmul with inline dequant** (`mul_mm_cm2.comp` + per-type decode
@@ -361,6 +363,10 @@ Remaining performance notes:
   IQ4_KS/IQ4_KT/IQ2_K models store some attention tensors as IQ5_K (e.g. IQ4_KS `attn_v`),
   so they also benefit. The F32/F16 `mul_mat_vec_iq5_k` fallback (non-integer-dot devices and
   the `MUL_MAT_ID` vec path) is still the 16-thread byte-addressed shader.
+- **Decode numbers after the uint32-view / 8-thread rework** (RTX 3090, 32B Qwen2.5-Coder,
+  `-c 4096`, `-n 128 --temp 0`): IQ5_K ~25.5 tok/s, IQ2_K ~32.6 tok/s (its attn_output/attn_v
+  are IQ3_K/IQ4_K), IQ4_KSS ~33.7 tok/s. The smaller quants are now clearly faster than
+  IQ5_K, as expected from their smaller weight footprint.
 - The decode (`mul_mat_vec`) kernels still dequantize per element with the KT-family
   multiplicative-hash decode (4 hash rounds per weight); the output projection
   `[5120, 152064]` alone is ~0.7 ms/token.
