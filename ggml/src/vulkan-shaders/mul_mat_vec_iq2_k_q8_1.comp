@@ -4,73 +4,70 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 
 #include "mul_mat_vec_iqk_base_q8_1.comp"
+#include "iq2k_table.comp"
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 #define QUANT_K 256
 #define BLOCK_BYTES 76
 
-shared uint iq2nl_shmem[2];
-
-int iq2nl_value_shmem(uint index) {
-    const int v = int((iq2nl_shmem[index / 4u] >> (8u * (index % 4u))) & 0xffu);
-    return v >= 128 ? v - 256 : v;
-}
+shared uint iq2k_shmem[2][256];
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
 void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, const uint i,
                      const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
-    const uint ib32 = itid / 2;
-    const uint h = itid % 2;
-    const uint e = 32 * ib32 + 16 * h;
-    const uint shift = 2 * (ib32 % 4);
-    const uint qs_off = 12 + (ib32 / 4) * 32 + h * 16;
+    // 8 threads per block, CUDA-style: each thread handles 8 values in each of
+    // four consecutive Q8_1 blocks.
+    const uint group = itid / 4;
+    const uint sub = itid % 4;
 
-    const uint y_idx = i * QUANT_K + e;
     const uint row_bytes = p.stride_a + num_blocks_per_row * BLOCK_BYTES;
 
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const uint block_byte = a_byte + (first_row + n) * row_bytes + p.stride_a + i * BLOCK_BYTES;
 
-        const uint extra = iqk_load_u16(block_byte + 2);
-        const uint e_shift = extra >> (2 * ib32);
-        const uint v_off = ((h == 0 ? (e_shift & 1u) : (e_shift & 2u)) != 0) ? 4 : 0;
-
         const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
-        const uint sc = data_a[block_byte + 4 + ib32];
-        const float dl = d * (float((sc >> (4 * h)) & 0xFu) - 8.0f);
+        const uint extra16 = iqk_load_u16(block_byte + 2);
+        const uint extra_word = extra16 >> (8 * group + sub / 2);
 
-        const uint w0 = iqk_load_u32(block_byte + qs_off + 0);
-        const uint w1 = iqk_load_u32(block_byte + qs_off + 4);
-        const uint w2 = iqk_load_u32(block_byte + qs_off + 8);
-        const uint w3 = iqk_load_u32(block_byte + qs_off + 12);
+        const uint qs_byte = block_byte + 12 + 32 * group + 8 * sub;
+        const uint w0 = iqk_load_u32(qs_byte + 0);
+        const uint w1 = iqk_load_u32(qs_byte + 4);
+
+        const uint scales = iqk_load_u32(block_byte + 4 + 4 * group);
+        int s[4];
+        [[unroll]] for (uint k = 0; k < 4; ++k) {
+            s[k] = int((scales >> (8 * k + 4 * (sub / 2))) & 0xFu) - 8;
+        }
 
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            const uint b8 = (j * p.batch_stride_b + b_offset + y_idx) / 32;
-            const vec2 ds = vec2(data_b[b8].ds);
-            const float d8 = ds.x;
+            [[unroll]] for (uint q = 0; q < 4; ++q) {
+                const uint b8 = (j * p.batch_stride_b + b_offset + i * QUANT_K) / 32 + 4 * group + q;
+                const vec2 ds = vec2(data_b[b8].ds);
+                const float d8 = ds.x;
 
-            const int q0 = data_b[b8].qs[4 * h + 0];
-            const int q1 = data_b[b8].qs[4 * h + 1];
-            const int q2 = data_b[b8].qs[4 * h + 2];
-            const int q3 = data_b[b8].qs[4 * h + 3];
+                const int qb0 = data_b[b8].qs[2 * sub + 0];
+                const int qb1 = data_b[b8].qs[2 * sub + 1];
 
-            int sumi = 0;
-            [[unroll]] for (uint g = 0; g < 4; ++g) {
-                const uint w = (g == 0) ? w0 : (g == 1) ? w1 : (g == 2) ? w2 : w3;
-                int packed = 0;
+                int packed_idx0 = 0;
+                int packed_idx1 = 0;
                 [[unroll]] for (uint k = 0; k < 4; ++k) {
-                    const uint q = (w >> (8 * k)) & 0xffu;
-                    const uint idx = ((q >> shift) & 3u) + v_off;
-                    const int v = iq2nl_value_shmem(idx);
-                    packed |= (v & 0xff) << (8 * k);
+                    packed_idx0 |= int((w0 >> (8 * k + 2 * q)) & 3u) << (8 * k);
+                    packed_idx1 |= int((w1 >> (8 * k + 2 * q)) & 3u) << (8 * k);
                 }
-                const int qb = (g == 0) ? q0 : (g == 1) ? q1 : (g == 2) ? q2 : q3;
-                sumi += dotPacked4x8EXT(packed, qb);
-            }
+                const int off0 = dotPacked4x8EXT(packed_idx0, 0x40100401);
+                const int off1 = dotPacked4x8EXT(packed_idx1, 0x40100401);
+                const uint vsel = ((extra_word >> (2 * q)) & 1u) != 0 ? 1 : 0;
 
-            temp[j][n] = fma(dl * d8, float(sumi), temp[j][n]);
+                const int packed0 = int(iq2k_shmem[vsel][off0]);
+                const int packed1 = int(iq2k_shmem[vsel][off1]);
+
+                int dot = dotPacked4x8EXT(packed0, qb0);
+                dot += dotPacked4x8EXT(packed1, qb1);
+
+                temp[j][n] = fma(d * d8 * float(s[q]), float(dot), temp[j][n]);
+            }
         }
     }
 }
@@ -81,13 +78,14 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
 
-    const uint blocks_per_wg = gl_WorkGroupSize.x / 16;
+    const uint blocks_per_wg = gl_WorkGroupSize.x / 8;
     const uint tid = gl_LocalInvocationID.x;
-    const uint itid = tid % 16;
-    const uint ix = tid / 16;
+    const uint itid = tid % 8;
+    const uint ix = tid / 8;
 
-    if (tid < 2) {
-        iq2nl_shmem[tid] = iq2nl_values_packed[tid];
+    [[unroll]] for (uint idx = tid; idx < 256; idx += BLOCK_SIZE) {
+        iq2k_shmem[0][idx] = iq2k_table[idx];
+        iq2k_shmem[1][idx] = iq2k_table[256 + idx];
     }
     barrier();
 
