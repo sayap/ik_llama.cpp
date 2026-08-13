@@ -88,6 +88,16 @@ const int8_t iq2nl_values[8] = {
     int8_t(-26), int8_t(-8),  int8_t(6), int8_t(22),
 };
 
+// Packed iq2nl_values: 4 int8 entries per uint32 (low byte first).
+const uint iq2nl_values_packed[2] = {
+    uint(0x1101f3e1u), uint(0x1606f8e6u),
+};
+
+int iq2nl_value_packed(uint index) {
+    const int v = int((iq2nl_values_packed[index / 4u] >> (8u * (index % 4u))) & 0xffu);
+    return v >= 128 ? v - 256 : v;
+}
+
 // 2-bit nonlinear values for IQ2_KL (16-bit pairs; low byte first)
 const uint16_t iq2kl_values[32] = {
     uint16_t(0xe9c1), uint16_t(0x0dc1), uint16_t(0xc1d8), uint16_t(0xf6d8), uint16_t(0x0dd8), uint16_t(0x2fd8), uint16_t(0xd8e9), uint16_t(0xe9e9),
