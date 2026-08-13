@@ -39,7 +39,8 @@ and `GET_ROWS`:
   against them with `dotPacked4x8EXT`. The Trellis types (`IQ1_KT`..`IQ4_KT`) use the
   multiplicative-hash decode (mirroring CUDA's `vec_dot_iq{1,2,3,4}_kt_q8_1`). The IQK types
   use shared table decodes: `IQ4_KS`/`IQ4_KSS` use the 4-bit `iq4k_values` byte-pair table
-  with an 8-threads-per-block mapping, and `IQ5_K` uses the 5-bit `iq5nl_values` packed table.
+  with an 8-threads-per-block mapping, and `IQ5_K` uses the 5-bit `iq5nl_values` table with a
+  CUDA-style 8-thread mapping and a uint32 weight-buffer view.
   This removes the scalar-FMA activation dot from the decode FFN and attention projections.
 - **prompt processing (mul_mat)**: on NV_coopmat2 devices the mat-mat path runs the
   **coopmat2 tensor-core matmul with inline dequant** (`mul_mm_cm2.comp` + per-type decode
@@ -350,13 +351,16 @@ utilization at 0.6 tok/s was the GPU waiting on the CPU splits).
 
 Remaining performance notes:
 
-- **IQ5_K decode is still slow**: the Q8_1 `mul_mat_vec_iq5_k` shader is a 16-threads-per-block
-  packed-table port, and a full IQ5_K 32B model decodes at ~12.4 tok/s (vs ~25-27 tok/s for
-  IQ2_K/IQ4_KS/IQ4_KSS/IQ4_KT). The CUDA-style 8-thread/4-Q8-block mapping was attempted but
-  had a correctness bug on single-token vec (multi-token mat-mat is fine) and was reverted;
-  it still needs debugging. Note that IQ4_KS/IQ4_KT/IQ2_K models store some attention tensors
-  as IQ5_K, so this also affects those models (e.g. IQ4_KS `attn_v` is IQ5_K and already uses
-  the current 16-thread Q8_1 path).
+- **IQ5_K decode was slow** (fixed): the Q8_1 `mul_mat_vec_iq5_k` shader is now a CUDA-style
+  8-threads-per-block port (each thread dots two 16-element sub-blocks against two Q8_1
+  blocks, matching `vec_dot_iq5_k_q8_1`), reads the weights through a uint32 buffer view, and
+  looks the 5-bit `iq5nl_values` table up through a 64-entry direct-indexed shared-memory
+  array. A full IQ5_K 32B model now decodes at ~25.5 tok/s (was ~12.4 tok/s). The earlier
+  8-thread attempt had been reverted for a single-token vec correctness bug; the re-derived
+  byte addressing (qs/qh/scales/extra) is validated by `test-iqk-quants`. Note that
+  IQ4_KS/IQ4_KT/IQ2_K models store some attention tensors as IQ5_K (e.g. IQ4_KS `attn_v`),
+  so they also benefit. The F32/F16 `mul_mat_vec_iq5_k` fallback (non-integer-dot devices and
+  the `MUL_MAT_ID` vec path) is still the 16-thread byte-addressed shader.
 - The decode (`mul_mat_vec`) kernels still dequantize per element with the KT-family
   multiplicative-hash decode (4 hash rounds per weight); the output projection
   `[5120, 152064]` alone is ~0.7 ms/token.

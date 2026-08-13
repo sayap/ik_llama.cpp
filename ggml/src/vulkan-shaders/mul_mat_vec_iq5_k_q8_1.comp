@@ -7,85 +7,103 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
+// uint32 view of the byte-addressed weight buffer (IQ5_K has no row meta and a
+// 176-byte block, so every block/field offset here is 4-byte aligned).
+layout (binding = 0) readonly buffer A32 { uint data_a32[]; };
+
 #define QUANT_K 256
 #define BLOCK_BYTES 176
 
-shared uint iq5nl_shmem[16];
+// 64 sign-extended int32 entries (one per iq5nl table value), so the hot-loop
+// lookup is a single shared-memory load with no division/modulo/shift/mask.
+shared int iq5nl_shmem[64];
 
-int iq5nl_value_shmem(uint index) {
-    const int v = int((iq5nl_shmem[index / 4u] >> (8u * (index % 4u))) & 0xffu);
-    return v >= 128 ? v - 256 : v;
+// Look up four 5-bit indices packed in the low 5 bits of each byte of
+// idx_packed, offset into one of the two 32-entry iq5nl value tables, and pack
+// the four int8 results into one int32 for dotPacked4x8EXT.
+int iq5nl_lookup4(uint idx_packed, uint table_off) {
+    int res = 0;
+    [[unroll]] for (int b = 0; b < 4; ++b) {
+        const uint idx = ((idx_packed >> (8 * b)) & 0x1fu) + table_off;
+        res |= (iq5nl_shmem[idx] & 0xff) << (8 * b);
+    }
+    return res;
 }
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
 void calc_superblock(const uint a_byte, const uint b_offset, const uint itid, const uint i,
                      const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
-    // 16 threads per block: thread itid handles 16 elements of a 64-element sub-block.
-    const uint ib64 = itid / 4;
-    const uint quarter = itid % 4;
-    const uint e = 64 * ib64 + 16 * quarter;
-    const uint shift = 2 * ib64;
+    // 8 threads per block, CUDA-style vec_dot_iq5_k_q8_1: thread i4 handles two
+    // 16-element sub-blocks. The low-nibble qs values (sub-block 4*(i4/2)+(i4%2))
+    // dot against Q8_1 block 2*(i4/2), the high-nibble qs values (sub-block
+    // 4*(i4/2)+2+(i4%2)) dot against Q8_1 block 2*(i4/2)+1; each reads four uint32
+    // qs/qh words.
+    const uint i4 = itid;      // 0..7
+    const uint ih = i4 / 2;    // 0..3
+    const uint il = i4 % 2;    // 0..1
 
-    const uint y_idx = i * QUANT_K + e;
     const uint row_bytes = p.stride_a + num_blocks_per_row * BLOCK_BYTES;
 
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-        const uint block_byte = a_byte + (first_row + n) * row_bytes + p.stride_a + i * BLOCK_BYTES;
+        const uint block_dw = (a_byte + (first_row + n) * row_bytes + p.stride_a + i * BLOCK_BYTES) >> 2;
 
-        const uint extra = iqk_load_u16(block_byte + 2);
-        const uint e_shift = extra >> (4 * ib64);
-        const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
-        const uint sh = data_a[block_byte + 4 + ib64];
+        const uint head = data_a32[block_dw];
+        const float d = iqk_f16_to_f32(head & 0xffffu);
+        const uint extra16 = head >> 16;
+        const uint extra_shifted = extra16 >> (4 * ih + il);
 
-        float dl;
-        uint v_off;
-        uint qs_off, qh_off;
-        bool use_hi_bits;
-        if (quarter < 2) {
-            const uint sl = data_a[block_byte + 8 + 2 * ib64];
-            dl = d * (float(((sl >> (4 * quarter)) & 0xFu) | ((sh << (4 - 2 * quarter)) & 0x30u)) - 32.0f);
-            v_off = ((e_shift & (1u << quarter)) != 0) ? 32 : 0;
-            qs_off = 16 + 32 * ib64 + 16 * (quarter & 1);
-            qh_off = 144 + 16 * (quarter & 1);
-            use_hi_bits = false;
-        } else {
-            const uint sl = data_a[block_byte + 8 + 2 * ib64 + 1];
-            dl = d * (float(((sl >> (4 * (quarter - 2))) & 0xFu) | ((sh >> (2 * (quarter - 2))) & 0x30u)) - 32.0f);
-            v_off = ((e_shift & (1u << quarter)) != 0) ? 32 : 0;
-            qs_off = 16 + 32 * ib64 + 16 * (quarter & 1);
-            qh_off = 144 + 16 * (quarter & 1);
-            use_hi_bits = true;
-        }
+        // sub-block scales: ls1 for the low-nibble group, ls2 for the high-nibble group
+        const uint sh_byte = (data_a32[block_dw + 1] >> (8 * ih)) & 0xffu;
+        const uint sh = sh_byte >> (2 * il);
+        const uint sl_word = data_a32[block_dw + 2 + (ih >> 1)];
+        const uint sl_shift = 16 * (ih & 1);
+        const uint sl0 = (sl_word >> sl_shift) & 0xffu;
+        const uint sl1 = (sl_word >> (sl_shift + 8)) & 0xffu;
+        const int ls1 = int(((sl0 >> (4 * il)) & 0xFu) | ((sh << 4) & 0x30u)) - 32;
+        const int ls2 = int(((sl1 >> (4 * il)) & 0xFu) | ((sh << 0) & 0x30u)) - 32;
+        const float dl1 = d * float(ls1);
+        const float dl2 = d * float(ls2);
+
+        // value-table selectors: extra bit s picks table 0 (0..31) or 1 (32..63)
+        const uint v1_off = 32u * (extra_shifted & 1u);
+        const uint v2_off = 32u * ((extra_shifted >> 2) & 1u);
+
+        const uint qs_dw = block_dw + 4 + 8 * ih + 4 * il;
+        const uint qh_dw = block_dw + 36 + 4 * il;
 
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            const uint b8 = (j * p.batch_stride_b + b_offset + y_idx) / 32;
-            const vec2 ds = vec2(data_b[b8].ds);
-            const float d8 = ds.x;
+            const uint base_b8 = (j * p.batch_stride_b + b_offset + i * QUANT_K) / 32;
+            const uint b8a = base_b8 + 2 * ih;
+            const uint b8b = base_b8 + 2 * ih + 1;
 
-            const uint qs_start = 4 * (quarter & 1);
-            const int q0 = data_b[b8].qs[qs_start + 0];
-            const int q1 = data_b[b8].qs[qs_start + 1];
-            const int q2 = data_b[b8].qs[qs_start + 2];
-            const int q3 = data_b[b8].qs[qs_start + 3];
+            const vec2 dsa = vec2(data_b[b8a].ds);
+            const vec2 dsb = vec2(data_b[b8b].ds);
+            const float d8a = dsa.x;
+            const float d8b = dsb.x;
 
-            int sumi = 0;
+            int sumi1 = 0;
+            int sumi2 = 0;
             [[unroll]] for (uint g = 0; g < 4; ++g) {
-                int packed = 0;
-                [[unroll]] for (uint k = 0; k < 4; ++k) {
-                    const uint q = data_a[block_byte + qs_off + 4 * g + k];
-                    const uint hb = data_a[block_byte + qh_off + 4 * g + k];
-                    const uint idx = use_hi_bits
-                        ? ((q >> 4) | (((hb >> shift) & 2u) << 3))
-                        : ((q & 0xFu) | (((hb >> shift) & 1u) << 4));
-                    const int v = iq5nl_value_shmem(idx + v_off);
-                    packed |= (v & 0xff) << (8 * k);
-                }
-                const int qb = (g == 0) ? q0 : (g == 1) ? q1 : (g == 2) ? q2 : q3;
-                sumi += dotPacked4x8EXT(packed, qb);
+                const uint q4v = data_a32[qs_dw + g];
+                const uint qhv = data_a32[qh_dw + g];
+                const uint h = qhv >> (2 * ih);
+
+                const uint idx1 = ((q4v >> 0) & 0x0f0f0f0fu) | ((h << 4) & 0x10101010u);
+                const uint idx2 = ((q4v >> 4) & 0x0f0f0f0fu) | ((h << 3) & 0x10101010u);
+
+                const int v1 = iq5nl_lookup4(idx1, v1_off);
+                const int v2 = iq5nl_lookup4(idx2, v2_off);
+
+                const int qb1 = data_b[b8a].qs[4 * il + g];
+                const int qb2 = data_b[b8b].qs[4 * il + g];
+
+                sumi1 += dotPacked4x8EXT(v1, qb1);
+                sumi2 += dotPacked4x8EXT(v2, qb2);
             }
 
-            temp[j][n] = fma(dl * d8, float(sumi), temp[j][n]);
+            temp[j][n] = fma(dl1 * d8a, float(sumi1), temp[j][n]);
+            temp[j][n] = fma(dl2 * d8b, float(sumi2), temp[j][n]);
         }
     }
 }
@@ -96,13 +114,16 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
     const uint num_blocks_per_row = p.ncols / QUANT_K;
 
-    const uint blocks_per_wg = gl_WorkGroupSize.x / 16;
+    const uint blocks_per_wg = gl_WorkGroupSize.x / 8;
     const uint tid = gl_LocalInvocationID.x;
-    const uint itid = tid % 16;
-    const uint ix = tid / 16;
+    const uint itid = tid % 8;
+    const uint ix = tid / 8;
 
-    if (tid < 16) {
-        iq5nl_shmem[tid] = iq5nl_values_packed[tid];
+    [[unroll]] for (uint idx = tid; idx < 64; idx += BLOCK_SIZE) {
+        const uint packed = iq5nl_values_packed[idx / 4u];
+        int v = int((packed >> (8u * (idx % 4u))) & 0xffu);
+        if (v >= 128) v -= 256;
+        iq5nl_shmem[idx] = v;
     }
     barrier();
 
