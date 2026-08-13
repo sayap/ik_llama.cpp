@@ -91,6 +91,7 @@ static bool test_cpu_reference_ok(ggml_type type_a) {
     switch (type_a) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q6_0:
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_IQ4_XS:
@@ -439,7 +440,7 @@ int main(int argc, char ** argv) {
     }
     printf("target backend: %s\n", ggml_backend_name(backend_tgt));
 
-    const ggml_type types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_F16, GGML_TYPE_BF16 };
+    const ggml_type types[] = { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q6_0, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_F16, GGML_TYPE_BF16 };
     // IQK/KT (QK_K = 256) families: exercised via the vec (mul_mat_vec) path for single
     // token and the dequant-to-F16 path for batches
     const ggml_type types_iqk[] = {
@@ -464,7 +465,11 @@ int main(int argc, char ** argv) {
     }
 
     // MoE: fused and separate weights, with and without bias, single and multi token
+    // (Q6_0 MUL_MAT_ID mat-mat is not wired yet, so skip it here)
     for (ggml_type type_a : types) {
+        if (type_a == GGML_TYPE_Q6_0) {
+            continue;
+        }
         for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_GELU }) {
             for (bool fused : { true, false }) {
                 for (bool bias : { false, true }) {
