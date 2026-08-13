@@ -350,6 +350,13 @@ utilization at 0.6 tok/s was the GPU waiting on the CPU splits).
 
 Remaining performance notes:
 
+- **IQ5_K decode is still slow**: the Q8_1 `mul_mat_vec_iq5_k` shader is a 16-threads-per-block
+  packed-table port, and a full IQ5_K 32B model decodes at ~12.4 tok/s (vs ~25-27 tok/s for
+  IQ2_K/IQ4_KS/IQ4_KSS/IQ4_KT). The CUDA-style 8-thread/4-Q8-block mapping was attempted but
+  had a correctness bug on single-token vec (multi-token mat-mat is fine) and was reverted;
+  it still needs debugging. Note that IQ4_KS/IQ4_KT/IQ2_K models store some attention tensors
+  as IQ5_K, so this also affects those models (e.g. IQ4_KS `attn_v` is IQ5_K and already uses
+  the current 16-thread Q8_1 path).
 - The decode (`mul_mat_vec`) kernels still dequantize per element with the KT-family
   multiplicative-hash decode (4 hash rounds per weight); the output projection
   `[5120, 152064]` alone is ~0.7 ms/token.
