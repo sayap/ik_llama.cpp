@@ -335,9 +335,18 @@ Remaining performance notes:
 
 ### vs CUDA: the prompt-processing gap and the paths to close it
 
-On the same RTX 3090 the IQ4_KT model runs at ~27 tok/s decode / ~410 tok/s prompt on
-Vulkan vs ~30 / ~1240 on CUDA. Steady-state per-op profiling (GPU clocks locked by
-running many iterations) shows both remaining gaps are dominated by the FFN:
+On the same RTX 3090 the IQ4_KT model now runs at ~1070 tok/s prompt (`-ub 2048`) and
+~23-24 tok/s decode on Vulkan, vs ~1240 / ~30 on CUDA (prompt gap ~1.16x, decode gap
+~1.25x). The decode (TG) gap is mostly *fixed*, not context-dependent: measured
+40.7 ms/token at 17-token context vs 42.5 ms/token at 4399-token context (~0.4 us per
+context token). The small growth is the KV-cache read in the decode flash-attention
+path, which uses the scalar shader for single-token queries (`N == 1` falls back from
+coopmat2 to FA_SCALAR). Note: a 4-token server timing can read ~31 tok/s because the
+first token's decode is counted against the prompt eval; 64+ tokens (llama-cli "eval
+time" and server "tg") agree at ~23-24 tok/s.
+
+Steady-state per-op profiling (GPU clocks locked by running many iterations) shows both
+remaining gaps are dominated by the FFN:
 
 - **Decode** (1.15x gap): the `mul_mat_vec` FFN was ALU-bound on the KT hash decode
   (~320 GB/s weight reads, well below peak). Replacing the per-round byte sum with one
