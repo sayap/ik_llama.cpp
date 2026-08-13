@@ -1,0 +1,50 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint SPLIT_N_T = 32;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint nc;
+    uint nr;
+    uint n_t;
+    uint src0_nb1;
+    uint src1_nb1;
+    uint c_nb1;
+} p;
+
+layout(binding = 0) readonly buffer S0 { float s0[]; };
+layout(binding = 1) readonly buffer X  { float x[]; };
+layout(binding = 2) readonly buffer C  { float c[]; };
+layout(binding = 3) buffer DST { float dst[]; };
+
+void main() {
+    const uint row = gl_GlobalInvocationID.x;
+    const uint t0 = gl_WorkGroupID.y * SPLIT_N_T;
+    if (row >= p.nr || t0 >= p.n_t) {
+        return;
+    }
+
+    const uint state_base = row * p.src0_nb1;
+    const uint c_base = row * p.c_nb1;
+
+    for (uint it = 0; it < SPLIT_N_T; ++it) {
+        const uint t = t0 + it;
+        if (t >= p.n_t) {
+            break;
+        }
+
+        float sum = 0.0f;
+        for (uint j = 0; j < p.nc; ++j) {
+            const uint idx = t + j;
+            const float xv = idx < p.nc - 1u
+                ? s0[state_base + idx]
+                : x[row + (idx - (p.nc - 1u)) * p.src1_nb1];
+            sum += xv * c[c_base + j];
+        }
+        dst[row + t * p.nr] = sum;
+    }
+}

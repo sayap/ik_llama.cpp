@@ -1,0 +1,120 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(constant_id = 0) const uint S_V = 128;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint H_k;
+    uint H_v;
+    uint n_tokens;
+    uint n_seqs;
+    uint repeat_type;
+    uint v_nb1, v_nb2, v_nb3;
+    float scale;
+} p;
+
+layout(binding = 0) readonly buffer Q { float q[]; };
+layout(binding = 1) readonly buffer K { float k[]; };
+layout(binding = 2) readonly buffer V { float v[]; };
+layout(binding = 3) readonly buffer G { float g[]; };
+layout(binding = 4) readonly buffer B { float b[]; };
+layout(binding = 5) readonly buffer S { float state_in[]; };
+layout(binding = 6) buffer D { float dst[]; };
+
+shared float s_k[S_V];
+shared float s_q[S_V];
+shared float s_scalars[3];
+
+void main() {
+    const uint head = gl_WorkGroupID.x;
+    const uint seq  = gl_WorkGroupID.y;
+    const uint row  = gl_LocalInvocationID.x;
+
+    const uint gqa = p.H_v / p.H_k;
+    const uint head_kq = (p.repeat_type == 0u) ? head / gqa : head % (p.H_v / gqa);
+
+    const uint state_size = S_V * S_V;
+    const uint state_base = (seq * p.H_v + head) * state_size;
+    const uint out_base = seq * (S_V * p.H_v * p.n_tokens) + head * S_V;
+    const uint out_token_stride = S_V * p.H_v;
+
+    const uint qkv_head_stride = S_V * p.n_tokens;
+    const uint qkv_batch_stride = S_V * p.n_tokens * p.H_k;
+    const uint q_base = seq * qkv_batch_stride + head_kq * qkv_head_stride;
+
+    const uint v_base = seq * p.v_nb3 + head * p.v_nb2;
+
+    const uint gb_batch_stride = p.n_tokens * p.H_v;
+    const uint gb_base = seq * gb_batch_stride + head;
+
+    float state_row[S_V];
+    for (uint c = 0; c < S_V; ++c) {
+        state_row[c] = state_in[state_base + c * S_V + row];
+    }
+
+    const float eps = 1e-12f;
+
+    for (uint t = 0; t < p.n_tokens; ++t) {
+        s_k[row] = k[q_base + t * S_V + row];
+        s_q[row] = q[q_base + t * S_V + row];
+
+        const float beta_raw = b[gb_base + t * p.H_v];
+        const float beta_val = 1.0f / (1.0f + exp(-beta_raw));
+        const float g_val = g[gb_base + t * p.H_v];
+        const float decay = exp(min(g_val, 50.0f));
+
+        barrier();
+
+        if (row == 0u) {
+            float q_norm_sq = 0.0f;
+            float k_norm_sq = 0.0f;
+            for (uint i = 0; i < S_V; ++i) {
+                q_norm_sq += s_q[i] * s_q[i];
+                k_norm_sq += s_k[i] * s_k[i];
+            }
+            const float q_norm_inv = inversesqrt(q_norm_sq + eps);
+            const float k_norm_inv = inversesqrt(k_norm_sq + eps);
+            float attn = 0.0f;
+            for (uint i = 0; i < S_V; ++i) {
+                attn += (s_k[i] * k_norm_inv) * (s_q[i] * q_norm_inv * p.scale);
+            }
+            s_scalars[0] = q_norm_inv;
+            s_scalars[1] = k_norm_inv;
+            s_scalars[2] = attn;
+        }
+        barrier();
+
+        const float q_norm_inv = s_scalars[0];
+        const float k_norm_inv = s_scalars[1];
+        const float attn = s_scalars[2];
+
+        const float v_val = v[v_base + t * p.v_nb1 + row];
+
+        float v_prime = 0.0f;
+        float out_val = 0.0f;
+        for (uint c = 0; c < S_V; ++c) {
+            const float sc = state_row[c];
+            v_prime += sc * s_k[c];
+            out_val  += sc * s_q[c];
+        }
+
+        const float v_new = v_val * beta_val - v_prime * beta_val * decay * k_norm_inv;
+        dst[out_base + t * out_token_stride + row] = out_val * decay * q_norm_inv * p.scale + v_new * attn;
+
+        for (uint c = 0; c < S_V; ++c) {
+            const float s_new = decay * state_row[c] + v_new * (s_k[c] * k_norm_inv);
+            state_row[c] = clamp(s_new, -1e6f, 1e6f);
+        }
+
+        barrier();
+    }
+
+    const uint output_size = S_V * p.H_v * p.n_tokens * p.n_seqs;
+    const uint state_out_base = output_size + state_base;
+    for (uint c = 0; c < S_V; ++c) {
+        dst[state_out_base + c * S_V + row] = state_row[c];
+    }
+}

@@ -672,6 +672,8 @@ void process_shaders() {
     string_to_spv("tanh_f32",       "tanh.comp",        {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("sigmoid_f16",    "sigmoid.comp",     {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("sigmoid_f32",    "sigmoid.comp",     {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
+    string_to_spv("softplus_f16",   "softplus.comp",    {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
+    string_to_spv("softplus_f32",   "softplus.comp",    {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
 
     string_to_spv("geglu_f16",      "geglu.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("geglu_f32",      "geglu.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
@@ -760,6 +762,11 @@ void process_shaders() {
     string_to_spv("add_bias_id_f32", "add_bias_id.comp", {});
 
     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+
+    // Qwen3Next / Qwen3.5 gated delta-net recurrent layers
+    string_to_spv("ssm_conv_f32", "ssm_conv.comp", {});
+    string_to_spv("ssm_conv_final_state_f32", "ssm_conv_final_state.comp", {});
+    string_to_spv("delta_net_f32", "delta_net.comp", {});
     //
     // ============================== end ik_llama.cpp
 
