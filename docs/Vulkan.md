@@ -331,6 +331,39 @@ several quant types and batch sizes.
   Upstream additionally allows Xe1 integrated GPUs with the Intel proprietary Windows
   driver. AMD RADV is always allowed (RDNA3+ hardware permitting).
 
+### MoE offload vs `-sm graph` (notes, not yet benchmarked)
+
+For large MoE models on the 3090 + Strix Halo, the reference hybrid config is:
+
+    -dev CUDA0 -ngl 99 -cmoe -ub 2048
+
+`-cmoe` keeps the MoE FFN (`ffn_*_exps`) in host RAM; `offload_op` (dc663fe6) streams those
+FFN tensors into the 3090 when `batch_size * n_active >= min_batch * n_tot`, amortized by the
+large ubatch. TG (`batch=1`) keeps the FFN on the CPU (memory-bound, DDR). So the hybrid is
+"attention resident on 3090 + FFN streamed for PP + FFN on CPU for TG".
+
+`-sm graph` does not stream; it statically shards tensors. Two variants matter:
+
+- `-sm graph -cmoe`: the ncmoe override still force-places FFN on the CPU, so this is just
+  the hybrid plus a tensor-parallel attention split we do not need — expected worse.
+- `-sm graph` (no `-cmoe`): the FFN experts are statically split (~24 GB in 3090 VRAM, the
+  rest in the iGPU's local RAM). PP becomes "3090 shard + iGPU shard + reduce" with no PCIe
+  streaming; TG becomes "3090 VRAM + iGPU RAM" (iGPU RAM is the same DDR the CPU reads).
+
+The open question for PP is a race between (a) the hybrid's PCIe streaming of the full FFN
+vs (b) the iGPU computing its shard from local RAM. That is only likely to favor `-sm graph`
+when the hybrid is PCIe-bound (FFN_bytes / PCIe_BW > compute_time), i.e. very large experts.
+For TG the iGPU shares the CPU's DDR, so no win is expected, plus a per-layer reduce.
+
+Benchmark plan (blocked on Vulkan op coverage for the sparse-attention MoE arches, i.e. the
+indexer / DSA / CSA / HCA / GLM-DSA ops below; MLA-only arches such as GLM-4.5-Air are not
+blocked by this — the MLA op set is already supported):
+
+1. hybrid: `-dev CUDA0 -ngl 99 -cmoe -ub 2048`
+2. `-sm graph`: `-dev CUDA0,Vulkan1 -sm graph -ub 2048`
+
+record PP tok/s and TG tok/s for both.
+
 ## Remaining gaps
 
 ### Priority (highest first)
@@ -338,7 +371,7 @@ several quant types and batch sizes.
 1. **`MXFP4`** — the micro-scaling 4-bit format.
 3. **Indexer / DSA / CSA / HCA / GLM-DSA**: `INDEXER_TOPK`, `MASK_TOPK`, `MASK_TO_IDX`,
    `SINKHORN`, `HC_PRE`, `HC_POST`, `LATENT_ATTN`, `DS4_COMP`. Stateful sparse-attention
-   ops (DeepSeek2/4, OpenPangu, GLM-4.5-Air, GLM-DSA).
+   ops (DeepSeek2/4, OpenPangu, GLM-DSA). MLA-only arches are not gated on these.
 4. **`--fit` with `GGML_BACKEND_DL`** — fixed: per-device memory is now queried through
    the backend registry (`ggml_backend_reg_get_device_memory`), so DL builds report real
    free memory (and `--fit` no longer sees 0 MiB).
@@ -369,12 +402,14 @@ Vulkan backend, so they fall back to the CPU backend with expensive copies:
   per-step conv/state checkpointing (`src[4]`/`src[6]` non-null) and multi-sequence
   `SSM_CONV` routing (`n_kv > 1`). `GGML_OP_REDUCE` (needed for multi-device splits of
   the layer) is now implemented as a host-staged all-reduce.
-- **Indexer / DSA / CSA / HCA / GLM-DSA** (DeepSeek2/4, OpenPangu, GLM-4.5-Air, GLM-DSA
-  sparse attention): `GGML_OP_INDEXER_TOPK`, `GGML_OP_MASK_TOPK`, `GGML_OP_MASK_TO_IDX`,
+- **Indexer / DSA / CSA / HCA / GLM-DSA** (DeepSeek2/4, OpenPangu, GLM-DSA sparse
+  attention): `GGML_OP_INDEXER_TOPK`, `GGML_OP_MASK_TOPK`, `GGML_OP_MASK_TO_IDX`,
   `GGML_OP_SINKHORN`, `GGML_OP_HC_PRE`, `GGML_OP_HC_POST`, `GGML_OP_LATENT_ATTN`,
   `GGML_OP_DS4_COMP`. CUDA implements all of these; Vulkan has none, so these
   architectures fall back to the CPU backend (with the same stateful round-trip problem
-  as delta-net).
+  as delta-net). MLA ops (`mul_mat`/`mul_mat_id`/`concat`/`permute`/`flash_attn_ext`) are
+  already supported, so MLA-only models run on Vulkan; only the `-sm attn` MLA
+  `split_dim=2` load path remains.
 - `GGML_OP_MULTI_ADD` exists but check the specific fused-mul-multiadd variants
   (`fused_mmad`); `-no-mmad` disables them
 
