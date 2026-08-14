@@ -3168,7 +3168,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
         const uint32_t delta_net_sizes[] = { 16, 32, 64, 128 };
         for (uint32_t i = 0; i < 4; ++i) {
             const uint32_t S_V = delta_net_sizes[i];
-            ggml_vk_create_pipeline(device, device->pipeline_delta_net[i], "delta_net_f32_d" + std::to_string(S_V), delta_net_f32_len, delta_net_f32_data, "main", 8, sizeof(vk_op_delta_net_push_constants), {1, 1, 1}, {S_V}, 1);
+            // One workgroup handles CS rows; the remaining S_V/CS column groups
+            // reduce across shared memory. Use the warp size (32) where it fits.
+            const uint32_t CS = std::min(32u, S_V);
+            ggml_vk_create_pipeline(device, device->pipeline_delta_net[i], "delta_net_f32_d" + std::to_string(S_V), delta_net_f32_len, delta_net_f32_data, "main", 8, sizeof(vk_op_delta_net_push_constants), {1, 1, 1}, {S_V, CS}, 1);
         }
     }
 
@@ -8905,7 +8908,7 @@ static void ggml_vk_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx,
         vk_subbuffer{d_S, s_off, VK_WHOLE_SIZE},
         vk_subbuffer{d_D, d_off, VK_WHOLE_SIZE},
         vk_subbuffer{d_Saved, saved_off, VK_WHOLE_SIZE},
-    }, pc, { H_v, n_seqs, 1 });
+    }, pc, { H_v, n_seqs, S_v / std::min(32u, S_v) });
 }
 
 static void ggml_vk_unary(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst, bool dryrun = false) {
