@@ -2,34 +2,70 @@
 
 #include "dequant_head.comp"
 
+#extension GL_EXT_shader_16bit_storage : require
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {block_q6_0 data_a[];};
-layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+layout (binding = 0) readonly buffer A32 {uint data_a32[];};
+layout (binding = 1) writeonly buffer D4 {f16vec4 data_b4[];};
+
+// 32-bit load at an arbitrary byte offset (unaligned-safe).
+uint load_u32(uint byte_off) {
+    const uint w = data_a32[byte_off >> 2];
+    const uint sh = (byte_off & 3u) * 8u;
+    if (sh == 0u) {
+        return w;
+    }
+    return (w >> sh) | (data_a32[(byte_off >> 2) + 1u] << (32u - sh));
+}
 
 void main() {
     const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
 
     const uint tid = gl_LocalInvocationID.x % 64;
-    const uint il  = tid/32;
-    const uint ir  = tid%32;
-    const uint ib = 32*i + ir;
+    const uint il  = tid / 32;
+    const uint ir  = tid % 32;
+    const uint ib  = 32 * i + ir;
     if (ib >= p.nel / 32) {
         return;
     }
 
-    const uint b_idx = 1024*i + 32*ir + 8*il;
-
+    // Q6_0 block: d (2B) | qh[8] (8B) | qs[16] (16B).
+    const uint block_byte = ib * 26;
     const float d = float(data_a[ib].d);
 
-    const uint q_idx = 8*il;
+    const uint b_idx = 1024 * i + 32 * ir + 8 * il;
 
-    [[unroll]] for (uint l = 0; l < 8; ++l) {
-        const uint iqs = q_idx + l;
-        const uint qh_byte = uint(data_a[ib].qh[iqs % 8u]);
-        const uint h = (iqs < 8u) ? (qh_byte & 0x0Fu) : (qh_byte >> 4u);
-        const uint vui = uint(data_a[ib].qs[iqs]);
-        data_b[b_idx + l +  0] = D_TYPE(d * (((vui & 0x0Fu) | ((h << 4u) & 0x30u)) - 32.0f));
-        data_b[b_idx + l + 16] = D_TYPE(d * (((vui >>  4u) | ((h << 2u) & 0x30u)) - 32.0f));
+    // il selects the first (iqs 0..7) or second (iqs 8..15) half of the block.
+    const uint qs_base = block_byte + 10 + 8 * il;
+    const uint qh_base = block_byte + 2;
+    const uint qs0 = load_u32(qs_base);
+    const uint qs1 = load_u32(qs_base + 4);
+    const uint qh0 = load_u32(qh_base);
+    const uint qh1 = load_u32(qh_base + 4);
+    const bool hi = (il == 1u);
+
+    vec4 x0[2];
+    vec4 x1[2];
+    for (uint h = 0; h < 2; ++h) {
+        const uint qs_w = h == 0u ? qs0 : qs1;
+        const uint qh_w = h == 0u ? qh0 : qh1;
+        uint x0v[4];
+        uint x1v[4];
+        [[unroll]] for (uint l = 0; l < 4; ++l) {
+            const uint qs_b = (qs_w >> (8u * l)) & 0xFFu;
+            const uint qh_b = (qh_w >> (8u * l)) & 0xFFu;
+            const uint hn = hi ? (qh_b >> 4u) : (qh_b & 0xFu);
+            x0v[l] = (qs_b & 0xFu) | ((hn & 3u) << 4u);
+            x1v[l] = (qs_b >> 4u) | (((hn >> 2u) & 3u) << 4u);
+        }
+        x0[h] = vec4(x0v[0], x0v[1], x0v[2], x0v[3]) - 32.0f;
+        x1[h] = vec4(x1v[0], x1v[1], x1v[2], x1v[3]) - 32.0f;
     }
+
+    data_b4[(b_idx)      >> 2] = f16vec4(d * x0[0]);
+    data_b4[(b_idx + 4)  >> 2] = f16vec4(d * x0[1]);
+    data_b4[(b_idx + 16) >> 2] = f16vec4(d * x1[0]);
+    data_b4[(b_idx + 20) >> 2] = f16vec4(d * x1[1]);
 }
