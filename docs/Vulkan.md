@@ -163,12 +163,17 @@ The four recurrent ops are now implemented on Vulkan (see "Op coverage"):
   contiguous `[ne0, rows]` layout (q/k are permuted views for prompt batches) and used
   `inversesqrt(max(sum, eps))` instead of the CPU's `1/max(sqrt(sum), eps)`.
 - **`SOFTPLUS`**: new `softplus.comp` shader (f32/f16) matching `ggml_compute_softplus_f32`.
-- **`DELTA_NET`**: new `delta_net.comp` shader. One workgroup per (head, seq), `S_V`
-  threads (spec constant, 16/32/64/128); each thread owns one output row and keeps the
-  state row in registers. q/k addressing matches the graph layout (contiguous for prompt,
-  head-strided for decode); v/g/beta use the permuted-view strides from the tensors. The
-  new state is written into the result tail and the existing `CPY` node persists it, so
-  the CPU-side src[7] fused-copy optimization is not needed.
+- **`DELTA_NET`**: new `delta_net.comp` shader, mirroring the CUDA kernel's
+  decomposition. A workgroup handles `CS` rows (spec constant, min(32, `S_V`)) and the
+  `S_V` threads are arranged as `S_V/CS` column groups × `CS` rows; each thread keeps
+  only `CS` floats of its state row in registers, partial sums are reduced across column
+  groups in shared memory, and the q/k dot-product scalar is reduced in parallel (q/k
+  re-normalization is skipped since the graph already L2-norms them). This replaced the
+  original one-row-per-thread version (full 128-float state row, serial thread-0
+  reductions) and cut `DELTA_NET` from ~2019 µs to ~662 µs per 512-token batch (~3×).
+  v/g/beta use the permuted-view strides from the tensors, and the new state is written
+  into the result tail with the existing `CPY` node persisting it (the CPU-side src[7]
+  fused-copy optimization is not needed).
 
 `tests/test-delta-net.cpp` checks all four ops against the CPU reference (single- and
 multi-token, both repeat types, several head sizes) on a target backend, and passes on
@@ -190,10 +195,43 @@ arch list is the only thing forcing F32. Added `LLM_ARCH_QWEN3NEXT`,
 is now supported by `MUL_MAT` and `GET_ROWS`, using the same paths as the other
 legacy quants: native `mul_mat_vec` decode (`dequantize`/`dequantize4` in
 `dequant_funcs.comp`) and the flat dequant-to-F16 prompt path (`dequant_q6_0.comp`;
-like the IQK/KT families, this beats the cm2 inline dequant). `MUL_MAT_ID` (MoE
-experts) is wired too, for both the vec and mat-mat paths. This lets
-Qwen3.6-27B IQK models (whose qkv/out projections are `Q6_0`) run those matmuls
-on Vulkan instead of falling back to the CPU.
+like the IQK/KT families, this beats the cm2 inline dequant). The flat dequant was
+initially a naive byte-addressed scalar shader; it is now uint32-load + f16vec4-store
+(like the IQK/KT dequants), which cut the Q6_0 projection matmuls ~2× each.
+`MUL_MAT_ID` (MoE experts) is wired too, for both the vec and mat-mat paths. This
+lets Qwen3.6-27B IQK models (whose qkv/out projections are `Q6_0`) run those matmuls
+on Vulkan instead of falling back to the CPU. CUDA instead has a native int8 mmq for
+`Q6_0` (decode to int8 + INT8 tensor cores), which Vulkan does not yet do.
+
+### 10. Gated delta-net PP/TG performance and remaining gaps
+
+Qwen3.6-27B-IQK (17 GB; qkv/gate/ssm_out/attn projections are `Q6_0`, FFN is `IQ4_KS`),
+RTX 3090, `llama-server` + tiny warmup prompt, 2870-token prompt / 128-token decode:
+
+| | CUDA0 | Vulkan0 | gap |
+|---|---|---|---|
+| PP | ~1345 tok/s | ~1031 tok/s | ~1.30x |
+| TG | ~41.9 tok/s | ~30.2 tok/s | ~1.39x |
+
+Per-op profiling of the Vulkan prompt path (per 512-token batch) shows the remaining
+cost is dominated by the quantized matmuls, not the recurrent ops:
+
+- `FUSED_UP_GATE` + FFN-down (`IQ4_KS`): ~276 ms/batch.
+- qkv/gate/ssm_out/attn projections (`Q6_0`): ~120 ms/batch (after the uint32+f16vec4
+  dequant rewrite; was ~230 ms with the naive byte-addressed dequant).
+- `DELTA_NET`: ~32 ms/batch (~5%), after the CUDA-style register-tiled rewrite (was
+  ~97 ms with the one-row-per-thread shader).
+- `SSM_CONV`: ~3 ms/batch.
+
+Remaining gaps:
+
+- **The generic coopmat2 F16 matmul** runs below FP16 peak and is now the main PP
+  lever; it affects the FFN and every projection (see the `Qwen2.5-Coder` "vs CUDA"
+  section for the tuning analysis).
+- **`Q6_0` has no native int8 mmq on Vulkan** (CUDA decodes to int8 and uses INT8
+  tensor cores); `coopmat_int_support` is detected but unused.
+- **Decode (`mul_mat_vec`) TG** (~1.39x) is FFN/output-projection bound; the
+  `Q6_0` vec path and the `IQ4_KS`/KT vec path are the likely levers.
 
 ## Benchmarks (RTX 3090, Vulkan0)
 
