@@ -1,0 +1,176 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_integer_dot_product : require
+
+#include "types.comp"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A { block_q6_0 data_a[]; };
+layout (binding = 0) readonly buffer A32 { uint data_a32[]; };
+layout (binding = 1) readonly buffer B { block_q8_1_packed32 data_b[]; };
+layout (binding = 2) writeonly buffer D { float data_d[]; };
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;      // K (elements)
+    uint stride_a;   // K (elements), unused for the raw block_q6_0 layout
+    uint stride_b;   // B row stride in elements
+    uint stride_d;
+
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+
+    uint ne02;
+    uint ne12;
+    uint broadcast2;
+    uint broadcast3;
+} p;
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+layout (constant_id = 1) const uint NUM_ROWS = 2;
+layout (constant_id = 2) const uint NUM_COLS = 1;
+
+shared float tmpsh[NUM_COLS][NUM_ROWS][BLOCK_SIZE];
+
+// 32-bit load at an arbitrary byte offset (unaligned-safe). A Q6_0 block is
+// 26 bytes so block/field offsets are not 4-byte aligned.
+uint load_u32(uint byte_off) {
+    const uint w = data_a32[byte_off >> 2];
+    const uint sh = (byte_off & 3u) * 8u;
+    if (sh == 0u) {
+        return w;
+    }
+    return (w >> sh) | (data_a32[(byte_off >> 2) + 1u] << (32u - sh));
+}
+
+void get_offsets(out uint a_blocks, out uint b_offset, out uint d_offset) {
+    const uint batch_idx = gl_GlobalInvocationID.y;
+
+    uint batch_idx_a = 0;
+    if (batch_idx != 0) {
+        const uint i13 = batch_idx / p.ne12;
+        const uint i12 = batch_idx % p.ne12;
+
+        const uint i03 = i13 / p.broadcast3;
+        const uint i02 = i12 / p.broadcast2;
+
+        batch_idx_a = i03 * p.ne02 + i02;
+    }
+
+    // batch_stride_a is in elements for the raw (non row-meta) quants.
+    a_blocks = (batch_idx_a * p.batch_stride_a) / 32;
+    b_offset = batch_idx * p.batch_stride_b;
+    d_offset = batch_idx * p.batch_stride_d;
+}
+
+void reduce_result(const in float temp[NUM_COLS][NUM_ROWS], const in uint d_offset, const in uint first_row, const in uint num_rows, const in uint tid) {
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            tmpsh[j][n][tid] = temp[j][n];
+        }
+    }
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE/2; s > 0; s >>= 1) {
+        if (tid < s) {
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                    tmpsh[j][n][tid] += tmpsh[j][n][tid + s];
+                }
+            }
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                data_d[j*p.batch_stride_d + d_offset + first_row + n] = tmpsh[j][n][0];
+            }
+        }
+    }
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS > p.stride_d) {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+    }
+
+    const uint tid = gl_LocalInvocationID.x;
+
+    uint a_blocks, b_offset, d_offset;
+    get_offsets(a_blocks, b_offset, d_offset);
+
+    const uint blocks_per_row = p.ncols / 32;
+
+    // CUDA-style mapping: 2 threads per 32-element block, thread itid decodes
+    // qs int32s (2*itid, 2*itid+1) (16 elements) and dots them against the
+    // corresponding Q8_1 int32s. Each thread subtracts 16*ds.y to account for
+    // the -32 in the Q6_0 values.
+    const uint itid = tid % 2;
+    const uint bx = tid / 2;
+    const uint blocks_per_wg = BLOCK_SIZE / 2;
+    const uint iqs = 2 * itid;
+
+    float temp[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = 0.0f;
+        }
+    }
+
+    for (uint b = bx; b < blocks_per_row; b += blocks_per_wg) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint b8 = (j * p.batch_stride_b + b_offset + 32 * b) / 32;
+            const vec2 ds = vec2(data_b[b8].ds);
+            const float d8 = ds.x;
+            const int u0 = data_b[b8].qs[iqs];
+            const int u1 = data_b[b8].qs[iqs + 4];
+            const int u2 = data_b[b8].qs[iqs + 1];
+            const int u3 = data_b[b8].qs[iqs + 1 + 4];
+
+            [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+                if (first_row + n >= p.stride_d) {
+                    break;
+                }
+                const uint abs_block = a_blocks + (first_row + n) * blocks_per_row + b;
+                const uint block_byte = abs_block * 26;
+
+                const float d = float(data_a[abs_block].d);
+                const uint qs0 = load_u32(block_byte + 10 + 4 * iqs);
+                const uint qs1 = load_u32(block_byte + 10 + 4 * (iqs + 1));
+                uint qh0 = load_u32(block_byte + 2);
+                uint qh1 = load_u32(block_byte + 6);
+                if (iqs == 2) {
+                    qh0 >>= 4;
+                    qh1 >>= 4;
+                }
+
+                const int vi0_0 = int((qs0 & 0x0f0f0f0fu) | ((qh0 << 4) & 0x30303030u));
+                const int vi1_0 = int(((qs0 >> 4) & 0x0f0f0f0fu) | ((qh0 << 2) & 0x30303030u));
+                const int vi0_1 = int((qs1 & 0x0f0f0f0fu) | ((qh1 << 4) & 0x30303030u));
+                const int vi1_1 = int(((qs1 >> 4) & 0x0f0f0f0fu) | ((qh1 << 2) & 0x30303030u));
+
+                int sumi = dotPacked4x8EXT(vi0_0, u0);
+                sumi += dotPacked4x8EXT(vi1_0, u1);
+                sumi += dotPacked4x8EXT(vi0_1, u2);
+                sumi += dotPacked4x8EXT(vi1_1, u3);
+
+                temp[j][n] = fma(d, float(sumi) * d8 - 16.0f * ds.y, temp[j][n]);
+            }
+        }
+    }
+
+    const uint num_rows = (first_row + NUM_ROWS <= p.stride_d) ? NUM_ROWS : (p.stride_d - first_row);
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
