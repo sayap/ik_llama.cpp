@@ -332,6 +332,10 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
 struct vk_device_struct {
     std::recursive_mutex mutex;
 
+    // Back-pointer to the backend context that owns this device (one per device), used
+    // by cross-device operations to flush another device's pending compute.
+    ggml_backend_vk_context * backend_ctx {};
+
     vk::PhysicalDevice physical_device;
     vk::PhysicalDeviceProperties properties;
     std::string name;
@@ -1251,6 +1255,17 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         }
     }
     ctx->device->device.resetFences({ ctx->fence });
+}
+
+static void ggml_vk_flush_pending_compute(ggml_backend_vk_context * ctx);
+
+// Flush any pending compute on a device before a host/transfer operation touches its
+// buffers. graph_compute defers its drain, so a transfer that reads or overwrites a
+// device buffer must first ensure the compute queue has finished with it.
+static void ggml_vk_device_flush_pending_compute(vk_device& device) {
+    if (device->backend_ctx) {
+        ggml_vk_flush_pending_compute(device->backend_ctx);
+    }
 }
 
 // variables to track number of compiles in progress
@@ -4432,6 +4447,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->name = GGML_VK_NAME + std::to_string(idx);
 
     ctx->device = ggml_vk_get_device(idx);
+    ctx->device->backend_ctx = ctx;
 
     ctx->semaphore_idx = 0;
     ctx->event_idx = 0;
@@ -5267,6 +5283,8 @@ static void ggml_vk_buffer_write_async(vk_context subctx, vk_buffer& dst, size_t
 
 static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_2d(" << width << ", " << height << ")");
+    ggml_vk_device_flush_pending_compute(dst->device);
+
     // Buffer is already mapped
     if(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
         GGML_ASSERT(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
@@ -5358,6 +5376,8 @@ static void ggml_vk_buffer_read_async(vk_context subctx, vk_buffer& src, size_t 
 static void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_read(" << src->buffer << ", " << offset << ", " << size << ")");
 
+    ggml_vk_device_flush_pending_compute(src->device);
+
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
     // through PCIe is sufficient fast reading back data from PCIe is slower than going through
     // the HW device to host copy path.
@@ -5409,7 +5429,10 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
         ggml_vk_queue_command_pools_cleanup(src->device);
     } else {
         VK_LOG_DEBUG("ggml_vk_buffer_copy(MULTI_DEVICE, " << size << ")");
-        // Copy device to device
+        // Copy device to device; both queues must be done with these buffers first.
+        ggml_vk_device_flush_pending_compute(src->device);
+        ggml_vk_device_flush_pending_compute(dst->device);
+
         ggml_vk_ensure_sync_staging_buffer(src->device, size);
         ggml_vk_ensure_sync_staging_buffer(dst->device, size);
 
@@ -10187,6 +10210,8 @@ static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node)
 
     // Persistent scratch buffers: the reduce runs once per layer per token, and the
     // synchronous host staging already dominates; avoid re-allocating these every call.
+    // Each ggml_backend_tensor_get/set below flushes the owning device's deferred compute
+    // before touching its buffers, so the partials are read after their producers finish.
     static thread_local std::vector<float> acc;
     static thread_local std::vector<uint8_t> tmp;
     acc.assign(nelem, 0.0f);
@@ -10889,6 +10914,17 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
 }
 
 // Clean up after graph processing is done
+// Reset the per-graph state that must start fresh for every graph_compute call. This is
+// separate from ggml_vk_graph_cleanup, which owns resources (command buffers, temp
+// buffers, semaphores) that can only be recycled once the GPU has finished with them.
+static void ggml_vk_graph_reset(ggml_backend_vk_context * ctx) {
+    ctx->semaphore_idx = 0;
+    ctx->event_idx = 0;
+    ctx->pipeline_descriptor_set_requirements = 0;
+    ctx->descriptor_set_idx = 0;
+    ctx->tensor_ctxs.clear();
+}
+
 static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_graph_cleanup()");
     for (auto& buffer : ctx->gc.temp_buffers) {
@@ -10908,7 +10944,6 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
         ctx->device->device.destroySemaphore({ ctx->gc.tl_semaphores[i].s });
     }
     ctx->gc.tl_semaphores.clear();
-    ctx->semaphore_idx = 0;
 
     ctx->event_idx = 0;
 
@@ -10916,10 +10951,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
         ctx->device->device.resetEvent(event);
     }
 
-    ctx->tensor_ctxs.clear();
     ctx->gc.contexts.clear();
-    ctx->pipeline_descriptor_set_requirements = 0;
-    ctx->descriptor_set_idx = 0;
 }
 
 // Clean up on backend free
@@ -11305,11 +11337,25 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend, const ggml_
     return false;
 }
 
-static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
-    VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
-    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+// Flush any pending compute work on a device: signal the fence after all previously
+// submitted compute work, wait for it, and recycle command pools. This is the only place
+// that drains the deferred per-split submissions.
+static void ggml_vk_flush_pending_compute(ggml_backend_vk_context * ctx) {
+    if (!ctx->submit_pending) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> guard(queue_mutex);
+        ctx->device->compute_queue.queue.submit({}, ctx->fence);
+    }
+    ggml_vk_wait_for_fence(ctx);
+    ctx->submit_pending = false;
+    ggml_vk_graph_cleanup(ctx);
+}
 
-    // flush pending transfer work
+static void ggml_vk_synchronize_ctx(ggml_backend_vk_context * ctx) {
+    // flush pending transfer work (the async interface is currently unused, but the
+    // path is kept for completeness)
     if (!ctx->transfer_ctx.expired()) {
         vk_context transfer_ctx = ctx->transfer_ctx.lock();
 
@@ -11327,21 +11373,15 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
         }
 
         ctx->transfer_ctx.reset();
-        ctx->submit_pending = false;
     }
 
-    if (ctx->submit_pending) {
-        // signal the fence once all previously submitted compute work has completed,
-        // then wait for it and clean up the command pools
-        {
-            std::lock_guard<std::mutex> guard(queue_mutex);
-            ctx->device->compute_queue.queue.submit({}, ctx->fence);
-        }
-        ggml_vk_wait_for_fence(ctx);
+    ggml_vk_flush_pending_compute(ctx);
+}
 
-        ctx->submit_pending = false;
-        ggml_vk_graph_cleanup(ctx);
-    }
+static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
+    VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    ggml_vk_synchronize_ctx(ctx);
 }
 
 static bool ggml_vk_is_empty(ggml_tensor * node) {
@@ -11382,6 +11422,8 @@ static bool ggml_vk_can_fuse(const struct ggml_cgraph * cgraph, int node_idx, st
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    ggml_vk_graph_reset(ctx);
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
@@ -11538,27 +11580,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->submit_pending = false;
     }
 
-    // Wait for the GPU to finish executing the graph before cleaning up the command pools.
-    // The per-batch submissions use no fence (or the almost-ready fence) so that CPU command
-    // recording overlaps with GPU execution within a graph; an empty submission on the same
-    // queue is signaled once all the graph work has completed. This also guarantees that any
-    // host reads or cross-backend copies performed by the scheduler afterwards see the
-    // results, since this backend has no transfer/compute queue synchronization.
-    //
-    // If no compute work was enqueued (e.g. a REDUCE-only split, which is host-staged and
-    // already synchronizes its transfers), there is nothing to wait for and the fence round
-    // trip is pure overhead.
-    if (ctx->submit_pending) {
-        {
-            std::lock_guard<std::mutex> guard(queue_mutex);
-            ctx->device->compute_queue.queue.submit({}, ctx->fence);
-        }
-        ggml_vk_wait_for_fence(ctx);
-        ctx->submit_pending = false;
-    }
-
-    ggml_vk_graph_cleanup(ctx);
-
+    // Defer the drain: batches are submitted without a fence, so leave submit_pending set
+    // and return. Host/transfer operations flush pending compute lazily (see
+    // ggml_vk_device_flush_pending_compute), and the scheduler's synchronize drains at
+    // cross-device/host boundaries. This lets consecutive same-device splits overlap.
     return GGML_STATUS_SUCCESS;
 
     UNUSED(backend);
