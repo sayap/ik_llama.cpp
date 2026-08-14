@@ -357,6 +357,23 @@ Still not supported (their matmuls run on CPU), in priority order:
   `ggml_vk_strip_decode_vector()` becomes a no-op). This keeps the backend buildable with
   older toolchains such as Ubuntu's `shaderc 2023.8` / `glslang 14.0.0`, at the cost of the
   dot4 decode speedup on integer-dot-capable GPUs.
+- **Ubuntu build-toolchain gotcha**: a proper build needs a `glslc` that understands
+  `GL_NV_cooperative_matrix2` and `GL_EXT_integer_dot_product`, plus Vulkan headers that
+  define `VK_NV_cooperative_matrix2`. Ubuntu 24.04's system `glslc` (`shaderc 2023.8` /
+  `glslang 14.0.0`) is too old: the CMake feature tests fail *silently* and the build comes
+  out without `GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT` and
+  `GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT`, so the device line prints
+  `matrix cores: KHR_coopmat` / `int dot: 0` and the backend falls back to coopmat1
+  (16x16x16) F16 matmul + the scalar (non-dot4) KT decode. On a 32B IQ4_KT model that is
+  ~3.2x slower PP and ~1.65x slower TG than a proper build, even though the driver fully
+  supports coopmat2 and integer dot. Fix: install the LunarG Vulkan SDK (or newer
+  `shaderc` + `vulkan-headers`, e.g. the LunarG PPA `packages.lunarg.com/vulkan`; note the
+  PPA splits headers into a separate `vulkan-headers` package), then reconfigure from a
+  clean build dir. Verify: `glslc --version` (need shaderc 2024+ / glslang 15+; the LunarG
+  shaderc package prints a misleading "v2023.8" banner with a 2025 build date, which is
+  fine), `grep -c VK_NV_cooperative_matrix2 /usr/include/vulkan/vulkan_core.h` (>= 1), and
+  confirm `GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT` / `GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT`
+  appear in the build's `flags.make`.
 
 ### Testing
 
@@ -401,6 +418,14 @@ Still not supported (their matmuls run on CPU), in priority order:
   prompt / ~23.6 tok/s generation); IQ4_KS measures ~1042 tok/s prompt / ~27.2 tok/s
   generation with the Q8_1 + shared table decodes for IQ4_KS and its IQ5_K attention-v
   tensors (vs ~4.1 tok/s before).
+- Blackwell (RTX PRO 4000, entry-level Blackwell — ~59% of the 3090's CUDA/tensor cores,
+  ~72% of its memory bandwidth, so absolute numbers are lower): with a proper build (see
+  the toolchain note in "Integration"), IQ4_KT runs at TG parity with CUDA (~16.8 vs
+  ~16.1 tok/s) and PP ~1.14x of CUDA at `-ub 4096` (738 vs 839 tok/s; ~683 tok/s at
+  `-ub 2048`, ~528 tok/s at the default `-ub 512`). A coopmat2 F16 tile sweep (BK=32/128,
+  BN=128 via an env override) showed the Ampere-tuned config (BK=64, BN=256) is already
+  optimal — every variant regressed (BK=32 −12%, BK=128 −28%, BN=128 −21%). The residual
+  ~1.12-1.14x PP gap is the dequant+F16 structure, not tile sizing.
   Decode-only measurements use `llama-cli ... -n 64 --temp 0` and the `eval time` line.
   CUDA reference: the same server command with `-dev CUDA0`.
 - `test-backend-ops` does not currently compile against this fork's headers.
@@ -540,7 +565,7 @@ remaining gaps are dominated by the FFN:
 - **Prompt** (1.12x gap): prompt processing takes the mat-mat path for IQK/KT types, which
   dequantizes each weight matrix to F16 on the GPU and runs the F16 matmul (~4.4 ms per
   FFN matmul: ~1.5 ms dequant + ~2.9 ms tensor-core matmul). CUDA has a native quantized
-  matmul (`mmq`) that reads the quantized weights once. Two approaches were explored for
+  matmul (`mmq`) that reads the quantized weights once. Three approaches were explored for
   adding one to Vulkan:
   * **The SIMT dot4 mmq (`mul_mmq.comp` with Q8_1 activations) is now implemented for
     `IQ4_KT`** (the only IQK/KT type wired up so far; the other row-meta types could follow
@@ -594,6 +619,19 @@ remaining gaps are dominated by the FFN:
     because the inline decode is re-done once per N-tile while the flat dequant runs once
     per batch; several other types' V=4 decoders are also buggy (e.g. IQ2_KL). The
     dequant+F16 path is therefore used for all IQK/KT MUL_MAT on coopmat2.
+
+  * **The INT8 coopmat1 (KHR) tensor-core mmq (`mul_mmq.comp` with `coopmat<int8_t>`)
+    was also tried for `IQ4_KT`**: the byte-addressed tile loader packs the hash decode
+    into signed int8 and accumulates with `coopMatMulAdd` on the fixed `16x16x32` SINT8
+    coopmat1 shape (coopmat2 exposes no INT8; only KHR coopmat1 reaches the int8 tensor
+    cores). The `COOPMAT` path in `mul_mmq.comp` turned out to be unfinished dead code
+    (undeclared scale buffers, stale variable names), so it was fixed and wired up as an
+    experiment. It is correct (`test-iqk-quants` passes) but ~8x *slower* than the
+    dequant+F16 path on the RTX 3090 (133 vs 1075 tok/s PP at `-ub 2048`): the
+    16x16x32 subgroup-scoped int8 tiles cannot compete with coopmat2's flexible 128x256
+    F16 tiles, and IQ4_KT's per-32-element `dl` scale forces a float scale-multiply per
+    K-tile, which consumes the whole tensor-core benefit. Reverted; dequant+F16 remains
+    the fastest known prompt path for IQK/KT on tensor-core GPUs.
 
     **The flat dequant kernels are now optimized, and dense IQK/KT MUL_MAT uses them.**
     The 15 `dequant_iqX_*` shaders keep the original 8-threads-per-block mapping but now
