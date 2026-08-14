@@ -420,6 +420,15 @@ Still not supported (their matmuls run on CPU), in priority order:
   instead of staging through the transfer queue (the iGPU get+set pair dropped from ~42 us
   to ~0.15 us). This lifts `-sm graph` decode further to ~24.5 tok/s (`-ts 8,1`),
   ~17.0 tok/s (`-ts 1,1`) and ~12.4 tok/s (default split).
+- An opt-in **shared-buffer DMA reduce** (`GGML_VK_P2P=1`) is wired: it shares a
+  `DEVICE_LOCAL` buffer via `external_memory_fd` (OPAQUE_FD on NVIDIA, DMA_BUF on mesa)
+  and reduces with `vkCmdCopyBuffer` + a GPU add. It is off by default because (a) the
+  host-staged reduce is already near-optimal for UMA devices, and (b) device-local
+  cross-device import is a spec violation and crashes RADV/mesa without
+  `CONFIG_DMABUF_MOVE_NOTIFY`; it is intended for same-vendor NVIDIA-only setups. The
+  diagnostic `tests/test-vk-p2p.cpp` exercises the underlying mechanisms and showed that
+  NVIDIA does not support cross-device semaphore import (SYNC_FD is absent on Blackwell;
+  OPAQUE_FD is same-device-only), so the DMA copies are host-fence ordered.
 - No events and no async tensor copies yet; the scheduler's `is_async` parallel path is
   still disabled for Vulkan. `-sas` works (it falls back to `synchronize`), but adds only
   ~3% for an equal split and nothing for a lopsided split, because the deferred drain

@@ -360,6 +360,9 @@ struct vk_device_struct {
 
     bool integer_dot_product;
 
+    bool external_memory_fd_support {};
+    bool external_dma_buf_support {};
+
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
     uint32_t subgroup_max_size;
@@ -3882,6 +3885,23 @@ static vk_device ggml_vk_get_device(size_t idx) {
         }
 
         device_extensions.push_back("VK_KHR_16bit_storage");
+
+        // External memory/semaphore fd support, used for the cross-device all-reduce.
+        // Enable whatever is available so the P2P path can pick the best handle type.
+        {
+            std::vector<vk::ExtensionProperties> avail_ext = device->physical_device.enumerateDeviceExtensionProperties();
+            auto has_ext = [&](const char * name) {
+                for (auto & e : avail_ext) if (strcmp(e.extensionName, name) == 0) return true;
+                return false;
+            };
+            if (has_ext("VK_KHR_get_memory_requirements_2"))   device_extensions.push_back("VK_KHR_get_memory_requirements_2");
+            if (has_ext("VK_KHR_dedicated_allocation"))        device_extensions.push_back("VK_KHR_dedicated_allocation");
+            if (has_ext("VK_KHR_external_memory_fd"))          device_extensions.push_back("VK_KHR_external_memory_fd");
+            if (has_ext("VK_KHR_external_semaphore_fd"))       device_extensions.push_back("VK_KHR_external_semaphore_fd");
+            if (has_ext("VK_EXT_external_memory_dma_buf"))     device_extensions.push_back("VK_EXT_external_memory_dma_buf");
+            device->external_memory_fd_support = has_ext("VK_KHR_external_memory_fd");
+            device->external_dma_buf_support    = has_ext("VK_EXT_external_memory_dma_buf");
+        }
 
 #ifdef GGML_VULKAN_VALIDATE
         device_extensions.push_back("VK_KHR_shader_non_semantic_info");
@@ -10178,15 +10198,173 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx) {
 }
 
 static bool ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool use_fence, bool almost_ready);
+static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer);
 
-// Synchronous all-reduce for -sm graph. The Vulkan backend has no cross-device copy
-// or events yet, so this pulls each partial tensor through host staging, adds them on
-// the host, and writes the full sum back to every participating device. REDUCE always
-// runs as its own scheduler split, so every producer split has already been waited on
-// by the scheduler when this is called.
+// Cross-device all-reduce using a buffer shared via external_memory_fd. The buffer is
+// host-visible by default; GGML_VK_P2P=1 selects device-local memory instead (experimental,
+// and it still relies on host-side ordering since cross-device semaphore import is not
+// reliably available). Each DMA copy / add is synchronous, so the producer must be
+// flushed before the partials are moved.
+struct vk_reduce_pair {
+    bool valid = false;
+    size_t size = 0;
+    bool device_local = false;
+    vk_device dev[2];
+    vk_buffer shared[2];   // shared buffer view on each device
+};
+
+static std::map<uint64_t, vk_reduce_pair> g_reduce_pairs;
+
+static uint64_t vk_reduce_pair_key(vk_device a, vk_device b) {
+    uint64_t lo = std::min(a->idx, b->idx);
+    uint64_t hi = std::max(a->idx, b->idx);
+    return (lo << 32) | hi;
+}
+
+static vk::ExternalMemoryHandleTypeFlagBits vk_p2p_handle_type(vk_device dev) {
+    return dev->external_dma_buf_support ? vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT
+                                         : vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+}
+
+static int vk_export_memory_fd(vk_device dev, vk::DeviceMemory mem, vk::ExternalMemoryHandleTypeFlagBits ht) {
+    auto pfn = (PFN_vkGetMemoryFdKHR) dev->device.getProcAddr("vkGetMemoryFdKHR");
+    if (!pfn) return -1;
+    VkMemoryGetFdInfoKHR gi{};
+    gi.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+    gi.memory = (VkDeviceMemory) mem;
+    gi.handleType = (VkExternalMemoryHandleTypeFlagBits) ht;
+    int fd = -1;
+    pfn((VkDevice) dev->device, &gi, &fd);
+    return fd;
+}
+
+static bool vk_reduce_pair_init(vk_reduce_pair& rp, vk_device dev0, vk_device dev1, size_t size, bool device_local) {
+    rp.valid = false;
+    rp.size = size;
+    rp.device_local = device_local;
+    rp.dev[0] = dev0;
+    rp.dev[1] = dev1;
+
+    if (!dev0->external_memory_fd_support || !dev1->external_memory_fd_support) {
+        return false;
+    }
+
+    auto ht = vk_p2p_handle_type(dev0);
+    if (ht == vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT &&
+        (!dev0->external_dma_buf_support || !dev1->external_dma_buf_support)) {
+        return false;
+    }
+
+    vk::MemoryPropertyFlags mem_flags = device_local
+        ? vk::MemoryPropertyFlagBits::eDeviceLocal
+        : (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    vk::BufferUsageFlags usage = vk::BufferUsageFlagBits::eTransferSrc |
+                                 vk::BufferUsageFlagBits::eTransferDst |
+                                 vk::BufferUsageFlagBits::eStorageBuffer;
+
+    try {
+        // export from dev0
+        vk::ExternalMemoryBufferCreateInfo ebci0{ht};
+        vk::Buffer b0 = dev0->device.createBuffer(vk::BufferCreateInfo{{}, size, usage, vk::SharingMode::eExclusive, 0, nullptr, &ebci0});
+        auto req0 = dev0->device.getBufferMemoryRequirements(b0);
+        auto mp0 = dev0->physical_device.getMemoryProperties();
+        uint32_t mt0 = find_properties(&mp0, &req0, mem_flags);
+        if (mt0 == UINT32_MAX) return false;
+        vk::MemoryDedicatedAllocateInfo ded0{{}, b0, nullptr};
+        vk::ExportMemoryAllocateInfo emai{ht, &ded0};
+        vk::DeviceMemory mem0 = dev0->device.allocateMemory(vk::MemoryAllocateInfo{req0.size, mt0, &emai});
+        dev0->device.bindBufferMemory(b0, mem0, 0);
+        int fd = vk_export_memory_fd(dev0, mem0, ht);
+        if (fd < 0) return false;
+
+        // import on dev1
+        vk::ExternalMemoryBufferCreateInfo ebci1{ht};
+        vk::Buffer b1 = dev1->device.createBuffer(vk::BufferCreateInfo{{}, size, usage, vk::SharingMode::eExclusive, 0, nullptr, &ebci1});
+        auto req1 = dev1->device.getBufferMemoryRequirements(b1);
+        auto mp1 = dev1->physical_device.getMemoryProperties();
+        uint32_t mt1 = find_properties(&mp1, &req1, mem_flags);
+        if (mt1 == UINT32_MAX) return false;
+        vk::MemoryDedicatedAllocateInfo ded1{{}, b1, nullptr};
+        vk::ImportMemoryFdInfoKHR imfi{ht, fd, &ded1};
+        vk::DeviceMemory mem1 = dev1->device.allocateMemory(vk::MemoryAllocateInfo{req1.size, mt1, &imfi});
+        dev1->device.bindBufferMemory(b1, mem1, 0);
+
+        rp.shared[0] = std::make_shared<vk_buffer_struct>();
+        rp.shared[0]->buffer = b0;
+        rp.shared[0]->device_memory = mem0;
+        rp.shared[0]->memory_property_flags = mem_flags;
+        rp.shared[0]->size = size;
+        rp.shared[0]->device = dev0;
+
+        rp.shared[1] = std::make_shared<vk_buffer_struct>();
+        rp.shared[1]->buffer = b1;
+        rp.shared[1]->device_memory = mem1;
+        rp.shared[1]->memory_property_flags = mem_flags;
+        rp.shared[1]->size = size;
+        rp.shared[1]->device = dev1;
+
+        rp.valid = true;
+        return true;
+    } catch (const vk::SystemError&) {
+        return false;
+    }
+}
+
+// elementwise dst[dst_off..] += src[src_off..] on the device using the existing ADD pipeline
+static void vk_reduce_add(ggml_backend_vk_context * ctx, vk_buffer dst, uint64_t dst_off, vk_buffer src, uint64_t src_off, uint64_t nelem, ggml_type type) {
+    vk_pipeline pipeline = type == GGML_TYPE_F16
+        ? ctx->device->pipeline_add[1][1][1]
+        : ctx->device->pipeline_add[0][0][0];
+    if (!pipeline) {
+        return;
+    }
+
+    vk::DescriptorPoolSize dps{vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT};
+    vk::DescriptorPool dp = ctx->device->device.createDescriptorPool(vk::DescriptorPoolCreateInfo{{}, 1, dps});
+    std::vector<vk::DescriptorSetLayout> layouts(1, ctx->device->dsl);
+    auto sets = ctx->device->device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{dp, 1, layouts.data()});
+    vk::DescriptorSet ds = sets[0];
+
+    vk_context subctx = ggml_vk_create_temporary_context(ctx->device->compute_queue.cmd_pool);
+    ggml_vk_ctx_begin(ctx->device, subctx);
+
+    std::array<vk::DescriptorBufferInfo, 3> dbis = {{
+        { (VkBuffer) dst->buffer, dst_off, VK_WHOLE_SIZE },
+        { (VkBuffer) src->buffer, src_off, VK_WHOLE_SIZE },
+        { (VkBuffer) dst->buffer, dst_off, VK_WHOLE_SIZE },
+    }};
+    vk::WriteDescriptorSet wds{ ds, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, dbis.data() };
+    ctx->device->device.updateDescriptorSets({ wds }, {});
+
+    vk_op_binary_push_constants pc{};
+    pc.ne = (uint32_t) nelem;
+    pc.ne00 = (uint32_t) nelem; pc.ne01 = 1; pc.ne02 = 1; pc.ne03 = 1; pc.nb00 = 1; pc.nb01 = (uint32_t) nelem; pc.nb02 = (uint32_t) nelem; pc.nb03 = (uint32_t) nelem;
+    pc.ne10 = (uint32_t) nelem; pc.ne11 = 1; pc.ne12 = 1; pc.ne13 = 1; pc.nb10 = 1; pc.nb11 = (uint32_t) nelem; pc.nb12 = (uint32_t) nelem; pc.nb13 = (uint32_t) nelem;
+    pc.ne20 = (uint32_t) nelem; pc.ne21 = 1; pc.ne22 = 1; pc.ne23 = 1; pc.nb20 = 1; pc.nb21 = (uint32_t) nelem; pc.nb22 = (uint32_t) nelem; pc.nb23 = (uint32_t) nelem;
+    pc.misalign_offsets = 0; pc.param1 = 0.0f; pc.param2 = 0.0f; pc.param3 = 0;
+    init_pushconst_fastdiv(pc);
+
+    subctx->s->buffer.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc), &pc);
+    subctx->s->buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+    subctx->s->buffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline->layout, 0, { ds }, {});
+    uint32_t wg0 = CEIL_DIV((uint32_t) nelem, pipeline->wg_denoms[0]);
+    subctx->s->buffer.dispatch(wg0, 1, 1);
+
+    ggml_vk_ctx_end(subctx);
+
+    vk::Fence f = ctx->device->device.createFence({});
+    ggml_vk_submit(subctx, f);
+    ctx->device->device.waitForFences(f, true, UINT64_MAX);
+    ctx->device->device.destroyFence(f);
+    ctx->device->device.destroyDescriptorPool(dp);
+    ggml_vk_queue_command_pools_cleanup(ctx->device);
+}
+
+// Synchronous all-reduce for -sm graph. For two devices it first tries a shared-buffer
+// DMA path (external_memory_fd + vkCmdCopyBuffer + a GPU add); otherwise it falls back
+// to host staging. REDUCE always runs as its own scheduler split, so producers are
+// flushed before the partials are moved.
 static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node) {
-    GGML_UNUSED(ctx);
-
     GGML_ASSERT(node->op == GGML_OP_REDUCE);
     GGML_ASSERT(node->op_params[0] == GGML_OP_ADD);
 
@@ -10209,10 +10387,65 @@ static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node)
     GGML_ASSERT(local_src != nullptr);
     GGML_ASSERT(node->data == local_src->data);
 
-    // Persistent scratch buffers: the reduce runs once per layer per token, and the
-    // synchronous host staging already dominates; avoid re-allocating these every call.
-    // Each ggml_backend_tensor_get/set below flushes the owning device's deferred compute
-    // before touching its buffers, so the partials are read after their producers finish.
+    // Find the single remote src (the shared-buffer path handles exactly two devices).
+    ggml_tensor * remote_src = nullptr;
+    bool multi_remote = false;
+    for (int j = 0; j < nreduce; ++j) {
+        ggml_tensor * src = node->src[j];
+        if (!src || src == local_src) continue;
+        if (remote_src) { multi_remote = true; break; }
+        remote_src = src;
+    }
+
+    // The shared-buffer path is opt-in: on UMA/mixed setups the host-staged path below
+    // already memcpy's through host-visible buffers, and the DMA+add has more fixed
+    // overhead. GGML_VK_P2P=1 selects the device-local shared-buffer (true P2P) path.
+    const bool want_p2p = getenv("GGML_VK_P2P") != nullptr;
+
+    if (want_p2p && !multi_remote && remote_src && remote_src->buffer && ggml_backend_buffer_is_vk(remote_src->buffer)) {
+        ggml_backend_vk_buffer_context * rb_ctx = (ggml_backend_vk_buffer_context *) remote_src->buffer->context;
+        ggml_backend_vk_buffer_context * lb_ctx = (ggml_backend_vk_buffer_context *) node->buffer->context;
+        vk_device remote_dev = rb_ctx->device.lock();
+        vk_device local_dev  = lb_ctx->device.lock();
+
+        if (remote_dev && local_dev && remote_dev != local_dev &&
+            local_dev->external_memory_fd_support && remote_dev->external_memory_fd_support) {
+
+            uint64_t key = vk_reduce_pair_key(local_dev, remote_dev);
+            auto it = g_reduce_pairs.find(key);
+            if (it == g_reduce_pairs.end() || !it->second.valid || it->second.size < nbytes) {
+                vk_reduce_pair rp;
+                if (vk_reduce_pair_init(rp, local_dev, remote_dev, nbytes, /*device_local=*/ true)) {
+                    g_reduce_pairs[key] = std::move(rp);
+                    it = g_reduce_pairs.find(key);
+                }
+            }
+
+            if (it != g_reduce_pairs.end() && it->second.valid && it->second.size >= nbytes) {
+                vk_reduce_pair& rp = it->second;
+                const int local_slot  = (rp.dev[0] == local_dev) ? 0 : 1;
+                const int remote_slot = 1 - local_slot;
+
+                // Flush the deferred compute on both devices before moving the partials.
+                ggml_vk_flush_pending_compute(ctx);
+                ggml_vk_flush_pending_compute(remote_dev->backend_ctx);
+
+                vk_buffer local_buf  = lb_ctx->dev_buffer;
+                uint64_t  local_off  = vk_tensor_offset(node) + node->view_offs;
+                vk_buffer remote_buf = rb_ctx->dev_buffer;
+                uint64_t  remote_off = vk_tensor_offset(remote_src) + remote_src->view_offs;
+
+                // remote -> shared, local += shared, local -> shared, shared -> remote
+                ggml_vk_buffer_copy(rp.shared[remote_slot], 0, remote_buf, remote_off, nbytes);
+                vk_reduce_add(ctx, local_buf, local_off, rp.shared[local_slot], 0, nelem, node->type);
+                ggml_vk_buffer_copy(rp.shared[local_slot], 0, local_buf, local_off, nbytes);
+                ggml_vk_buffer_copy(remote_buf, remote_off, rp.shared[remote_slot], 0, nbytes);
+                return;
+            }
+        }
+    }
+
+    // Fallback: host-staged reduce.
     static thread_local std::vector<float> acc;
     static thread_local std::vector<uint8_t> tmp;
     acc.assign(nelem, 0.0f);
@@ -10220,21 +10453,15 @@ static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node)
 
     for (int j = 0; j < nreduce; ++j) {
         ggml_tensor * src = node->src[j];
-        if (!src) {
-            continue;
-        }
+        if (!src) continue;
         GGML_ASSERT(src->type == node->type);
         ggml_backend_tensor_get(src, tmp.data(), 0, nbytes);
         if (node->type == GGML_TYPE_F32) {
             const float * p = (const float *) tmp.data();
-            for (size_t i = 0; i < nelem; ++i) {
-                acc[i] += p[i];
-            }
+            for (size_t i = 0; i < nelem; ++i) acc[i] += p[i];
         } else {
             const ggml_fp16_t * p = (const ggml_fp16_t *) tmp.data();
-            for (size_t i = 0; i < nelem; ++i) {
-                acc[i] += ggml_fp16_to_fp32(p[i]);
-            }
+            for (size_t i = 0; i < nelem; ++i) acc[i] += ggml_fp16_to_fp32(p[i]);
         }
     }
 
@@ -10242,21 +10469,15 @@ static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node)
         ggml_backend_tensor_set(node, acc.data(), 0, nbytes);
         for (int j = 0; j < nreduce; ++j) {
             ggml_tensor * src = node->src[j];
-            if (!src || src == local_src) {
-                continue;
-            }
+            if (!src || src == local_src) continue;
             ggml_backend_tensor_set(src, acc.data(), 0, nbytes);
         }
     } else {
-        for (size_t i = 0; i < nelem; ++i) {
-            ((ggml_fp16_t *) tmp.data())[i] = ggml_fp32_to_fp16(acc[i]);
-        }
+        for (size_t i = 0; i < nelem; ++i) ((ggml_fp16_t *) tmp.data())[i] = ggml_fp32_to_fp16(acc[i]);
         ggml_backend_tensor_set(node, tmp.data(), 0, nbytes);
         for (int j = 0; j < nreduce; ++j) {
             ggml_tensor * src = node->src[j];
-            if (!src || src == local_src) {
-                continue;
-            }
+            if (!src || src == local_src) continue;
             ggml_backend_tensor_set(src, tmp.data(), 0, nbytes);
         }
     }
