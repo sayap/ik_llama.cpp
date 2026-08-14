@@ -217,11 +217,12 @@ RTX 3090, `llama-server` + tiny warmup prompt, 2870-token prompt / 128-token dec
 
 | | CUDA0 | Vulkan0 | gap |
 |---|---|---|---|
-| PP | ~1435 tok/s | ~1110 tok/s | ~1.29x |
-| TG | ~42.7 tok/s | ~31.8 tok/s | ~1.34x |
+| PP | ~1420 tok/s | ~1110 tok/s | ~1.28x |
+| TG | ~42.6 tok/s | ~35.8 tok/s | ~1.19x |
 
-(TG reflects the Q8_1-activation Q6_0 vec kernel; it was ~30.2 tok/s / ~1.41x
-before that. PP is unchanged — it goes through the dequant-to-F16 + F16 matmul path.)
+(TG reflects the Q8_1-activation Q6_0 vec kernel plus the IQ4_KS uint32-load
+and byte-indexed-table decode; it was ~30.2 tok/s / ~1.41x before those. PP is
+unchanged — it goes through the dequant-to-F16 + F16 matmul path.)
 
 Per-op profiling of the Vulkan prompt path (per 512-token batch) shows the remaining
 cost is dominated by the quantized matmuls, not the recurrent ops:
@@ -240,10 +241,13 @@ Remaining gaps:
   section for the tuning analysis).
 - **`Q6_0` has no native int8 mmq on Vulkan** (CUDA decodes to int8 and uses INT8
   tensor cores); `coopmat_int_support` is detected but unused.
-- **Decode (`mul_mat_vec`) TG** (~1.34x) is FFN/output-projection bound. The `Q6_0`
-  vec path is now a native Q8_1 + dot4 kernel (see "Q6_0 quant"); the remaining gap is
-  dominated by the `IQ4_KS` FFN (~51% of decode) whose Q8_1 table-decode kernel runs at
-  ~610-625 GB/s, below the ~870 GB/s the Q6_0 output projection reaches.
+- **Decode (`mul_mat_vec`) TG** (~1.19x) is FFN/output-projection bound. The `Q6_0`
+  vec path is now a native Q8_1 + dot4 kernel (see "Q6_0 quant"), and the `IQ4_KS`
+  Q8_1 table-decode kernel reads its 4-byte-aligned weights through a uint32 view
+  (instead of 4 byte loads per word) and uses a byte-indexed shared table. The IQ4_KS
+  FFN (~44% of decode) now runs at ~730 GB/s; the Q6_0 output projection reaches
+  ~870 GB/s, so the remaining IQ4_KS gap is the shared-memory table lookup (removing
+  it experimentally lifts decode to ~39 tok/s).
 
 ## Benchmarks (RTX 3090, Vulkan0)
 
