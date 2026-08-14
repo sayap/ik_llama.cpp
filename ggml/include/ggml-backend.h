@@ -127,6 +127,17 @@ extern "C" {
     GGML_API ggml_backend_t             ggml_backend_reg_init_backend(size_t i, const char * params); // params is backend-specific
     GGML_API ggml_backend_buffer_type_t ggml_backend_reg_get_default_buffer_type(size_t i);
     GGML_API ggml_backend_buffer_t      ggml_backend_reg_alloc_buffer(size_t i, size_t size);
+    GGML_API void                       ggml_backend_reg_get_device_memory(size_t i, size_t * free, size_t * total);
+
+    //
+    // Backend-agnostic split buffer type (for -sm graph / -sm attn)
+    //
+    // bufts[i] is the buffer type used for device slot i (one entry per selected device).
+    // The split shapes are read from the tensor's ggml_split_tensor_t extra at allocation time,
+    // so the same type can span a single backend or a mix of backends.
+    //
+    GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_split_buffer_type(ggml_backend_buffer_type_t * bufts, size_t n);
+    GGML_API GGML_CALL bool ggml_backend_buft_is_split(ggml_backend_buffer_type_t buft);
 
     // Dynamic loading of backends
     //

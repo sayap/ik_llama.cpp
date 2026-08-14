@@ -5380,7 +5380,7 @@ int ggml_backend_sycl_reg_devices() {
     for (int i = 0; i < ggml_sycl_info().device_count; i++) {
         char name[128];
         snprintf(name, sizeof(name), "%s%d", GGML_SYCL_NAME, i);
-        ggml_backend_register(name, ggml_backend_reg_sycl_init, ggml_backend_sycl_buffer_type(i), (void *) (intptr_t) i);
+        ggml_backend_register(name, ggml_backend_reg_sycl_init, ggml_backend_sycl_buffer_type(i), ggml_backend_sycl_get_device_memory, (void *) (intptr_t) i);
     }
     return ggml_sycl_info().device_count;
 }

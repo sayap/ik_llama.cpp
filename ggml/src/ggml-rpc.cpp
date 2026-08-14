@@ -993,7 +993,7 @@ GGML_CALL int ggml_backend_rpc_reg_devices() {
         std::string name = it.second->name;
         std::string endpoint = std::string(it.second->endpoint);
         uint32_t device = it.second->device;
-        ggml_backend_register(name.c_str(), ggml_backend_reg_rpc_init, ggml_backend_rpc_buffer_type(endpoint.c_str(), device), &(it.second));
+        ggml_backend_register(name.c_str(), ggml_backend_reg_rpc_init, ggml_backend_rpc_buffer_type(endpoint.c_str(), device), NULL, &(it.second));
         i++;
     }
     return device_count;

@@ -394,69 +394,88 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
     }
 }
 
-static std::vector<int> create_split(int nr, int granularity, const std::vector<float> & splits, const std::vector<size_t> & mem_used,
-        bool verbose = false) {
+// Proportional split of nr units (granularity-sized chunks) across devices using the
+// target cumulative fractions in splits, using the largest-remainder method. Unlike
+// create_split this does not try to compensate for already-placed memory; it is used for
+// the gated delta-net head split, where every layer must shard its recurrent state the
+// same way and the replicated norms placed earlier must not skew the head balance.
+static std::vector<int> split_proportional(int nr, int granularity, const std::vector<float> & splits) {
     GGML_ASSERT(nr % granularity == 0);
     GGML_ASSERT(!splits.empty());
-    if (granularity < 0) return std::vector<int>(splits.size(), nr);
-    GGML_ASSERT(mem_used.size() == splits.size());
-    size_t tot_memory_used = 1;
-    for (auto & mem : mem_used) tot_memory_used += mem;
-    int nchunk = nr / granularity;
-    std::vector<int> result(splits.size());
+
+    const int nchunk = nr / granularity;
+    const int n = (int) splits.size();
+    std::vector<int> result(n, 0);
+    std::vector<float> raw(n, 0.0f);
+
     float last_split = 0;
-    int sum = 0;
-    if (verbose) LLAMA_LOG_INFO("--- %s: %d chunks\n", __func__, nchunk);
-    for (int i = 0; i < (int)splits.size(); ++i) {
-        float p = splits[i] - last_split;
-        float p0 = p;
-        p += (p - 1.f*mem_used[i]/tot_memory_used);
-        result[i] = roundf(p*nchunk);
-        if (result[i] < 0) result[i] = 0;
-        if (verbose) LLAMA_LOG_INFO("i = %d, p0 = %g, p = %g, result = %d\n", i, p0, p, result[i]);
-        sum += result[i];
+    for (int i = 0; i < n; ++i) {
+        raw[i] = (splits[i] - last_split) * nchunk;
+        result[i] = (int) floorf(raw[i]);
         last_split = splits[i];
     }
-    while (sum > nchunk) {
-        last_split = 0;
-        float best_err = -INFINITY;
-        int ibest = -1;
-        for (int i = 0; i < (int)splits.size(); ++i) {
-            if (result[i] > 0) {
-                float p = splits[i] - last_split;
-                p += (p - 1.f*mem_used[i]/tot_memory_used);
-                float n_want = p*nchunk;
-                float err = result[i] - n_want;
-                if (err > best_err) {
-                    best_err = err; ibest = i;
-                }
-            }
-            last_split = splits[i];
-        }
-        GGML_ASSERT(ibest >= 0 && result[ibest] > 0);
-        --result[ibest];
-        --sum;
+
+    int sum = 0;
+    for (auto r : result) sum += r;
+    int rem = nchunk - sum;
+    GGML_ASSERT(rem >= 0 && rem <= n);
+
+    std::vector<int> order(n);
+    for (int i = 0; i < n; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        return (raw[a] - result[a]) > (raw[b] - result[b]);
+    });
+    for (int k = 0; k < rem; ++k) {
+        ++result[order[k]];
     }
-    while (sum < nchunk) {
-        last_split = 0;
-        float best_err = -INFINITY;
-        int ibest = -1;
-        for (int i = 0; i < (int)splits.size(); ++i) {
-            float p = splits[i] - last_split;
-            p += (p - 1.f*mem_used[i]/tot_memory_used);
-            float n_want = p*nchunk;
-            float err = n_want - result[i];
-            if (err > best_err) {
-                best_err = err; ibest = i;
+
+    // Guarantee at least one chunk for every device that has a non-zero target
+    // fraction, when there are enough chunks. Coarse granularities (e.g. the gated
+    // QKV attention split) can otherwise round a small device down to zero shards,
+    // which the recurrent/attention reduce paths cannot handle.
+    auto largest = [&]() {
+        int imax = -1;
+        for (int i = 0; i < n; ++i) {
+            if (result[i] > 1 && (imax == -1 || result[i] > result[imax])) {
+                imax = i;
             }
-            last_split = splits[i];
         }
-        GGML_ASSERT(ibest >= 0);
-        ++result[ibest];
-        ++sum;
+        return imax;
+    };
+    float last = 0;
+    for (int i = 0; i < n; ++i) {
+        float p = splits[i] - last;
+        last = splits[i];
+        if (p <= 1e-6f) {
+            continue; // device is not part of this split
+        }
+        if (result[i] == 0) {
+            int imax = largest();
+            if (imax < 0) {
+                break; // not enough chunks to give every device one
+            }
+            --result[imax];
+            ++result[i];
+        }
     }
+
     for (auto & r : result) r *= granularity;
     return result;
+}
+
+static std::vector<int> create_split(int nr, int granularity, const std::vector<float> & splits, const std::vector<size_t> & mem_used,
+        bool verbose = false) {
+    // The old mem_used-adjusted heuristic could round a device down to zero shards for
+    // lopsided memory splits (especially right after replicated norms), which either
+    // silently drops the device or aborts in the recurrent/attention paths. The split
+    // ratios in `splits` are already memory-proportional (and adjusted separately for
+    // -mg), so a largest-remainder proportional split is both simpler and robust.
+    GGML_UNUSED(mem_used);
+    GGML_UNUSED(verbose);
+    if (granularity < 0) {
+        return std::vector<int>(splits.size(), nr);
+    }
+    return split_proportional(nr, granularity, splits);
 }
 
 ggml_context * create_tensors_helper::get_context_for_tensor(ggml_context * ctx, const std::string & name) {
@@ -5091,7 +5110,11 @@ static void split_recurrent_tensors(const llama_hparams & hparams, llama_layer &
         GGML_ABORT("Quantization types with per row meta data are not supported for the ssm_out tensor when using split mode graph");
     }
 
-    auto split = create_split(num_k_heads, k_head_granularity, cur_splits, mem_used);
+    // Split the recurrent heads proportionally to the device split ratios. Using the
+    // mem_used-adjusted create_split here is wrong: the per-layer recurrent state must be
+    // sharded the same way on every layer, and the replicated norms placed earlier make
+    // create_split round a small (but valid) device down to zero heads, which aborts below.
+    auto split = split_proportional(num_k_heads, k_head_granularity, cur_splits);
     LLAMA_LOG_DEBUG("================ %s(%d)", __func__, il);
     int n_on = 0;
     for (auto & s : split) {

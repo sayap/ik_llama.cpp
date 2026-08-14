@@ -10155,6 +10155,87 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx) {
 
 static bool ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool use_fence, bool almost_ready);
 
+// Synchronous all-reduce for -sm graph. The Vulkan backend has no cross-device copy
+// or events yet, so this pulls each partial tensor through host staging, adds them on
+// the host, and writes the full sum back to every participating device. REDUCE always
+// runs as its own scheduler split, so every producer split has already been waited on
+// by the scheduler when this is called.
+static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node) {
+    GGML_UNUSED(ctx);
+
+    GGML_ASSERT(node->op == GGML_OP_REDUCE);
+    GGML_ASSERT(node->op_params[0] == GGML_OP_ADD);
+
+    if (node->op_params[3] == 1) {
+        // The dst tensor is just a container for the sources; reduce is disabled.
+        return;
+    }
+
+    const int nreduce = node->op_params[1];
+    const int nhave   = node->op_params[2];
+    GGML_ASSERT(nhave >= 2 && nhave <= nreduce);
+    GGML_ASSERT(node->type == GGML_TYPE_F32 || node->type == GGML_TYPE_F16);
+
+    const size_t nelem  = ggml_nelements(node);
+    const size_t nbytes = ggml_nbytes(node);
+
+    // ggml_reduce() builds dst as a view of the last non-null src, so the backend
+    // running the op aliases that src's buffer (this is the one local copy).
+    ggml_tensor * local_src = node->view_src;
+    GGML_ASSERT(local_src != nullptr);
+    GGML_ASSERT(node->data == local_src->data);
+
+    // Persistent scratch buffers: the reduce runs once per layer per token, and the
+    // synchronous host staging already dominates; avoid re-allocating these every call.
+    static thread_local std::vector<float> acc;
+    static thread_local std::vector<uint8_t> tmp;
+    acc.assign(nelem, 0.0f);
+    tmp.resize(nbytes);
+
+    for (int j = 0; j < nreduce; ++j) {
+        ggml_tensor * src = node->src[j];
+        if (!src) {
+            continue;
+        }
+        GGML_ASSERT(src->type == node->type);
+        ggml_backend_tensor_get(src, tmp.data(), 0, nbytes);
+        if (node->type == GGML_TYPE_F32) {
+            const float * p = (const float *) tmp.data();
+            for (size_t i = 0; i < nelem; ++i) {
+                acc[i] += p[i];
+            }
+        } else {
+            const ggml_fp16_t * p = (const ggml_fp16_t *) tmp.data();
+            for (size_t i = 0; i < nelem; ++i) {
+                acc[i] += ggml_fp16_to_fp32(p[i]);
+            }
+        }
+    }
+
+    if (node->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(node, acc.data(), 0, nbytes);
+        for (int j = 0; j < nreduce; ++j) {
+            ggml_tensor * src = node->src[j];
+            if (!src || src == local_src) {
+                continue;
+            }
+            ggml_backend_tensor_set(src, acc.data(), 0, nbytes);
+        }
+    } else {
+        for (size_t i = 0; i < nelem; ++i) {
+            ((ggml_fp16_t *) tmp.data())[i] = ggml_fp32_to_fp16(acc[i]);
+        }
+        ggml_backend_tensor_set(node, tmp.data(), 0, nbytes);
+        for (int j = 0; j < nreduce; ++j) {
+            ggml_tensor * src = node->src[j];
+            if (!src || src == local_src) {
+                continue;
+            }
+            ggml_backend_tensor_set(src, tmp.data(), 0, nbytes);
+        }
+    }
+}
+
 // Returns true if node has enqueued work into the queue, false otherwise
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
 static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool dryrun, bool last_node, bool almost_ready, bool submit){
@@ -10263,11 +10344,21 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_FLASH_ATTN_EXT:
     case GGML_OP_SSM_CONV:
     case GGML_OP_DELTA_NET:
+    case GGML_OP_REDUCE:
     //case GGML_OP_OPT_STEP_ADAMW:
         break;
     default:
         std::cerr << "ggml_vulkan: Error: Missing op: " << ggml_op_name(node->op) << std::endl;
         GGML_ABORT("fatal error");
+        return false;
+    }
+
+    // REDUCE is a cross-device host-side all-reduce and has no GPU pipeline; it runs
+    // synchronously in the real pass (the scheduler guarantees the producers are done).
+    if (node->op == GGML_OP_REDUCE) {
+        if (!dryrun) {
+            ggml_vk_op_reduce(ctx, node);
+        }
         return false;
     }
 
@@ -11029,6 +11120,17 @@ ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
     return &dev->buffer_type;
 }
 
+// split buffer
+
+ggml_backend_buffer_type_t ggml_backend_vk_split_buffer_type(const float * /*tensor_split*/) {
+    const int n = ggml_backend_vk_get_device_count();
+    std::vector<ggml_backend_buffer_type_t> bufts(n);
+    for (int i = 0; i < n; ++i) {
+        bufts[i] = ggml_backend_vk_buffer_type(i);
+    }
+    return ggml_backend_split_buffer_type(bufts.data(), n);
+}
+
 // host buffer type
 
 static const char * ggml_backend_vk_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -11442,12 +11544,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // queue is signaled once all the graph work has completed. This also guarantees that any
     // host reads or cross-backend copies performed by the scheduler afterwards see the
     // results, since this backend has no transfer/compute queue synchronization.
-    {
-        std::lock_guard<std::mutex> guard(queue_mutex);
-        ctx->device->compute_queue.queue.submit({}, ctx->fence);
+    //
+    // If no compute work was enqueued (e.g. a REDUCE-only split, which is host-staged and
+    // already synchronizes its transfers), there is nothing to wait for and the fence round
+    // trip is pure overhead.
+    if (ctx->submit_pending) {
+        {
+            std::lock_guard<std::mutex> guard(queue_mutex);
+            ctx->device->compute_queue.queue.submit({}, ctx->fence);
+        }
+        ggml_vk_wait_for_fence(ctx);
+        ctx->submit_pending = false;
     }
-    ggml_vk_wait_for_fence(ctx);
-    ctx->submit_pending = false;
 
     ggml_vk_graph_cleanup(ctx);
 
@@ -11947,6 +12055,11 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
             return true;
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_REDUCE:
+            // Cross-device all-reduce; the Vulkan backend currently reduces F32/F16 tensors
+            // through host staging (see ggml_vk_op_reduce).
+            return op->op_params[0] == GGML_OP_ADD &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
         default:
             return false;
     }
@@ -12062,7 +12175,7 @@ GGML_CALL int ggml_backend_vk_reg_devices() {
     for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
         char name[128];
         snprintf(name, sizeof(name), "%s%ld", GGML_VK_NAME, i);
-        ggml_backend_register(name, ggml_backend_reg_vk_init, ggml_backend_vk_buffer_type(i), (void *) (intptr_t) i);  // NOLINT
+        ggml_backend_register(name, ggml_backend_reg_vk_init, ggml_backend_vk_buffer_type(i), ggml_backend_vk_get_device_memory, (void *) (intptr_t) i);  // NOLINT
     }
     return vk_instance.device_indices.size();
 }

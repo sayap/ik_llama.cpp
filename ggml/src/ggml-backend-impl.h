@@ -146,8 +146,12 @@ extern "C" {
     //
 
     typedef ggml_backend_t (*GGML_CALL ggml_backend_init_fn)(const char * params, void * user_data);
+    typedef void (*GGML_CALL ggml_backend_get_device_memory_fn)(int device, size_t * free, size_t * total);
 
-    GGML_CALL void ggml_backend_register(const char * name, ggml_backend_init_fn init_fn, ggml_backend_buffer_type_t default_buffer_type, void * user_data);
+    GGML_CALL void ggml_backend_register(const char * name, ggml_backend_init_fn init_fn,
+            ggml_backend_buffer_type_t default_buffer_type,
+            ggml_backend_get_device_memory_fn get_device_memory_fn,
+            void * user_data);
 
 #ifdef  __cplusplus
 }

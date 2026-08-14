@@ -21,6 +21,8 @@ GGML_API GGML_CALL void ggml_backend_vk_get_device_description(int device, char 
 GGML_API GGML_CALL void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total);
 
 GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num);
+// split buffer for -sm graph / -sm attn (multi-device tensor parallelism)
+GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_vk_split_buffer_type(const float * tensor_split);
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(void);
 
