@@ -16,10 +16,10 @@ layout (binding = 0) readonly buffer A32 { uint data_a32[]; };
 #define BLOCK_BYTES 128
 #define META 4
 
-shared uint iq4k_byte_shmem[2][128];
+shared uint iq4k_byte_shmem[2][256];
 
 uint iq4k_byte_entry(uint v, uint q) {
-    return iq4k_byte_shmem[v][q / 2u] >> (16u * (q % 2u));
+    return iq4k_byte_shmem[v][q];
 }
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
@@ -97,8 +97,12 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     const uint ix = tid / 8;
 
     [[unroll]] for (uint idx = tid; idx < 128; idx += BLOCK_SIZE) {
-        iq4k_byte_shmem[0][idx] = iq4k_values_byte_0[idx];
-        iq4k_byte_shmem[1][idx] = iq4k_values_byte_16[idx];
+        const uint e0 = iq4k_values_byte_0[idx];
+        const uint e16 = iq4k_values_byte_16[idx];
+        iq4k_byte_shmem[0][2*idx]     = e0 & 0xffffu;
+        iq4k_byte_shmem[0][2*idx + 1] = e0 >> 16;
+        iq4k_byte_shmem[1][2*idx]     = e16 & 0xffffu;
+        iq4k_byte_shmem[1][2*idx + 1] = e16 >> 16;
     }
     barrier();
 
