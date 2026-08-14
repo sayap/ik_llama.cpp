@@ -404,15 +404,22 @@ Still not supported (their matmuls run on CPU), in priority order:
 
 ### Performance / architecture
 
-- No async tensor copies, no events, no transfer/compute queue synchronization. Enabling
-  those (as upstream did) would allow true per-decode overlap and remove the per-`graph_compute`
-  fence wait. Profiling `-sm graph` decode (2 Vulkan devices) shows the per-split fence wait
-  (which serializes CPU recording against GPU execution) is ~63% of `graph_compute` time and
-  the host-staged REDUCE is ~23%; the GPU kernels themselves are only ~15-20%.
+- `graph_compute` now **defers its drain**: batches are submitted without a fence and the
+  per-split fence wait at the end of `graph_compute` was removed, so consecutive
+  same-device splits overlap (the CPU records the next split while the GPU executes the
+  previous one). Host/transfer operations flush pending compute lazily via
+  `ggml_vk_device_flush_pending_compute`, and the scheduler's `synchronize` still drains at
+  cross-device/host boundaries. This is not full async (no events / cross-queue
+  semaphores yet; the transfer and compute queues are still ordered only by these host-side
+  flushes), but it removed the ~63% per-split fence wait that profiling showed was the
+  dominant `-sm graph` decode cost. On Qwen3.6-27B-IQK (2 Vulkan devices), `-sm graph`
+  decode improved from ~13 to ~19 tok/s (`-ts 8,1`) and ~6.4 to ~9.8 tok/s (default split).
+- No events and no async tensor copies yet; the scheduler's `is_async` parallel path is
+  still disabled for Vulkan. Enabling events + `cpy_tensor_async` (as upstream did) would
+  let the two devices' compute overlap across the REDUCE barrier, which is the next lever.
 - The spin in `ggml_vk_wait_for_fence` is still a busy-wait for the final fence; upstream
   keeps the same pattern, but a blocking `vkWaitForFences` for the tail would reduce CPU
-  usage further at a small latency cost. The final wait is now skipped for host-staged
-  (REDUCE-only) splits, which have no pending compute work.
+  usage further at a small latency cost.
 - `-sm graph`/`-sm attn` split modes previously fell back to the layer split path
   because there was no split buffer type available to the generic model loader. A
   backend-agnostic split buffer type and a host-staged `GGML_OP_REDUCE` are now
