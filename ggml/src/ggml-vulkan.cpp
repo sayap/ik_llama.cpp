@@ -1263,6 +1263,7 @@ static std::condition_variable compile_count_cond;
 // built with the vector decode can also run on devices without the
 // capability. Returns true if the module was modified (out is filled).
 static bool ggml_vk_strip_decode_vector(const uint32_t * code, size_t word_count, std::vector<uint32_t> & out) {
+#if defined(GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT)
     static const char kDecodeVectorExt[] = "SPV_NV_cooperative_matrix_decode_vector";
 
     if (word_count < 5) {
@@ -1375,6 +1376,11 @@ static bool ggml_vk_strip_decode_vector(const uint32_t * code, size_t word_count
 
     flush_run(word_count);
     return true;
+#else
+    // no decode-vector support: leave the SPIR-V module untouched
+    out.assign(code, code + word_count);
+    return false;
+#endif
 }
 
 static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipeline, size_t spv_size, const void* spv_data, const std::string entrypoint,
@@ -2928,6 +2934,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[GGML_TYPE_IQ4_NL][i],  "mul_mat_vec_iq4_nl_f16_f32_"+std::to_string(i+1),  mul_mat_vec_iq4_nl_f16_f32_len,  mul_mat_vec_iq4_nl_f16_f32_data,  "main", 3, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq, i+1}, 1, true);
 
         // IQK / KT quant families (QK_K = 256, dequantized in-shader)
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
 #define CREATE_MMV_IQK(TYPE, NAMELC) \
         if (device->integer_dot_product) { \
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[TYPE][i], "mul_mat_vec_" #NAMELC "_f32_f32_"+std::to_string(i+1), mul_mat_vec_ ## NAMELC ## _f32_f32_dot4_len, mul_mat_vec_ ## NAMELC ## _f32_f32_dot4_data, "main", 3, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq, i+1}, 1, true); \
@@ -2936,6 +2943,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[TYPE][i], "mul_mat_vec_" #NAMELC "_f32_f32_"+std::to_string(i+1), mul_mat_vec_ ## NAMELC ## _f32_f32_len, mul_mat_vec_ ## NAMELC ## _f32_f32_data, "main", 3, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq, i+1}, 1, true); \
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[TYPE][i], "mul_mat_vec_" #NAMELC "_f16_f32_"+std::to_string(i+1), mul_mat_vec_ ## NAMELC ## _f16_f32_len, mul_mat_vec_ ## NAMELC ## _f16_f32_data, "main", 3, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq, i+1}, 1, true); \
         }
+#else
+#define CREATE_MMV_IQK(TYPE, NAMELC) \
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[TYPE][i], "mul_mat_vec_" #NAMELC "_f32_f32_"+std::to_string(i+1), mul_mat_vec_ ## NAMELC ## _f32_f32_len, mul_mat_vec_ ## NAMELC ## _f32_f32_data, "main", 3, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq, i+1}, 1, true); \
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[TYPE][i], "mul_mat_vec_" #NAMELC "_f16_f32_"+std::to_string(i+1), mul_mat_vec_ ## NAMELC ## _f16_f32_len, mul_mat_vec_ ## NAMELC ## _f16_f32_data, "main", 3, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq, i+1}, 1, true);
+#endif
         CREATE_MMV_IQK(GGML_TYPE_IQ2_K, iq2_k)
         CREATE_MMV_IQK(GGML_TYPE_IQ3_K, iq3_k)
         CREATE_MMV_IQK(GGML_TYPE_IQ4_K, iq4_k)
@@ -3003,12 +3015,17 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[GGML_TYPE_IQ4_NL],  "mul_mat_vec_id_iq4_nl_f32",  mul_mat_vec_id_iq4_nl_f32_len,  mul_mat_vec_id_iq4_nl_f32_data,  "main", 4, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq}, 1, true);
 
     // IQK / KT quant families (dot4 hash decode when the device has the extension)
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
 #define CREATE_MMV_ID_IQK(TYPE, NAMELC) \
     if (device->integer_dot_product) { \
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[TYPE], "mul_mat_vec_id_" #NAMELC "_f32", mul_mat_vec_id_ ## NAMELC ## _f32_dot4_len, mul_mat_vec_id_ ## NAMELC ## _f32_dot4_data, "main", 4, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq}, 1, true); \
     } else { \
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[TYPE], "mul_mat_vec_id_" #NAMELC "_f32", mul_mat_vec_id_ ## NAMELC ## _f32_len, mul_mat_vec_id_ ## NAMELC ## _f32_data, "main", 4, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq}, 1, true); \
     }
+#else
+#define CREATE_MMV_ID_IQK(TYPE, NAMELC) \
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_f32[TYPE], "mul_mat_vec_id_" #NAMELC "_f32", mul_mat_vec_id_ ## NAMELC ## _f32_len, mul_mat_vec_id_ ## NAMELC ## _f32_data, "main", 4, sizeof(vk_mat_vec_id_push_constants), {rm_iq, 1, 1}, {subgroup_size_16, rm_iq}, 1, true);
+#endif
     CREATE_MMV_ID_IQK(GGML_TYPE_IQ2_K, iq2_k)
     CREATE_MMV_ID_IQK(GGML_TYPE_IQ3_K, iq3_k)
     CREATE_MMV_ID_IQK(GGML_TYPE_IQ4_K, iq4_k)
@@ -3049,12 +3066,17 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_XS],  "dequant_iq4_xs",  dequant_iq4_xs_len,  dequant_iq4_xs_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_NL],  "dequant_iq4_nl",  dequant_iq4_nl_len,  dequant_iq4_nl_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     // IQK / KT flat dequant (dot4 hash byte-sum when the device has the extension)
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
 #define CREATE_DEQUANT_IQK(TYPE, NAMELC) \
     if (device->integer_dot_product) { \
         ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], "dequant_" #NAMELC, dequant_ ## NAMELC ## _dot4_len, dequant_ ## NAMELC ## _dot4_data, "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1); \
     } else { \
         ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], "dequant_" #NAMELC, dequant_ ## NAMELC ## _len, dequant_ ## NAMELC ## _data, "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1); \
     }
+#else
+#define CREATE_DEQUANT_IQK(TYPE, NAMELC) \
+    ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], "dequant_" #NAMELC, dequant_ ## NAMELC ## _len, dequant_ ## NAMELC ## _data, "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
+#endif
     CREATE_DEQUANT_IQK(GGML_TYPE_IQ2_K,  iq2_k)
     CREATE_DEQUANT_IQK(GGML_TYPE_IQ3_K,  iq3_k)
     CREATE_DEQUANT_IQK(GGML_TYPE_IQ4_K,  iq4_k)
@@ -3449,7 +3471,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
         bool amd_shader_core_properties2 = false;
         bool pipeline_robustness = false;
         bool coopmat2_support = false;
+#if defined(GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT)
         bool coopmat2_decode_vector_support = false;
+#endif
         device->coopmat_support = false;
         device->integer_dot_product = false;
         bool bfloat16_support = false;
