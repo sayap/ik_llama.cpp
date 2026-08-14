@@ -2,7 +2,10 @@
 
 #extension GL_EXT_control_flow_attributes : require
 
+// S_V: head dim (16/32/64/128). Workgroup size is S_V.
+// CS:  column-group size (rows handled per workgroup, <= S_V and a divisor of S_V).
 layout(constant_id = 0) const uint S_V = 128;
+layout(constant_id = 1) const uint CS = 32;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
@@ -26,14 +29,23 @@ layout(binding = 5) readonly buffer S { float state_in[]; };
 layout(binding = 6) buffer D { float dst[]; };
 layout(binding = 7) buffer SAVED { float saved[]; };
 
+const uint NUM_GROUPS = S_V / CS;
+
 shared float s_k[S_V];
 shared float s_q[S_V];
-shared float s_scalars[3];
+shared float s_red[S_V];
+shared float all_sum1[NUM_GROUPS * (CS + 1)];
+shared float all_sum2[NUM_GROUPS * (CS + 1)];
 
 void main() {
     const uint head = gl_WorkGroupID.x;
     const uint seq  = gl_WorkGroupID.y;
-    const uint row  = gl_LocalInvocationID.x;
+    const uint sub  = gl_WorkGroupID.z;
+    const uint tid  = gl_LocalInvocationID.x;
+
+    const uint col_group = tid / CS;
+    const uint row       = tid % CS;
+    const uint row_out   = sub * CS + row;
 
     const uint gqa = p.H_v / p.H_k;
     const uint head_kq = (p.repeat_type == 0u) ? head / gqa : head % (p.H_v / gqa);
@@ -52,69 +64,72 @@ void main() {
     const uint gb_batch_stride = p.n_tokens * p.H_v;
     const uint gb_base = seq * gb_batch_stride + head;
 
-    float state_row[S_V];
-    for (uint c = 0; c < S_V; ++c) {
-        state_row[c] = state_in[state_base + c * S_V + row];
+    // Keep the state in registers: each thread owns CS columns of its row.
+    float state_local[CS];
+    for (uint i = 0; i < CS; ++i) {
+        const uint col = NUM_GROUPS * i + col_group;
+        state_local[i] = state_in[state_base + col * S_V + row_out];
     }
 
-    const float eps = 1e-12f;
-
     for (uint t = 0; t < p.n_tokens; ++t) {
-        s_k[row] = k[q_base + t * S_V + row];
-        s_q[row] = q[q_base + t * S_V + row];
+        // Cooperative load of the current token's q/k. q is pre-scaled so the
+        // recurrent math matches the CPU/CUDA kernels (q/k are already L2-normed).
+        s_k[tid] = k[q_base + t * S_V + tid];
+        s_q[tid] = q[q_base + t * S_V + tid] * p.scale;
 
-        const float beta_raw = b[gb_base + t * p.H_v];
-        const float beta_val = 1.0f / (1.0f + exp(-beta_raw));
-        const float g_val = g[gb_base + t * p.H_v];
-        const float decay = exp(min(g_val, 50.0f));
-
+        // attn = sum_i k[i] * (q[i] * scale)
+        s_red[tid] = s_k[tid] * s_q[tid];
         barrier();
-
-        if (row == 0u) {
-            float q_norm_sq = 0.0f;
-            float k_norm_sq = 0.0f;
-            for (uint i = 0; i < S_V; ++i) {
-                q_norm_sq += s_q[i] * s_q[i];
-                k_norm_sq += s_k[i] * s_k[i];
+        for (uint s = S_V / 2u; s > 0u; s >>= 1u) {
+            if (tid < s) {
+                s_red[tid] += s_red[tid + s];
             }
-            const float q_norm_inv = inversesqrt(q_norm_sq + eps);
-            const float k_norm_inv = inversesqrt(k_norm_sq + eps);
-            float attn = 0.0f;
-            for (uint i = 0; i < S_V; ++i) {
-                attn += (s_k[i] * k_norm_inv) * (s_q[i] * q_norm_inv * p.scale);
-            }
-            s_scalars[0] = q_norm_inv;
-            s_scalars[1] = k_norm_inv;
-            s_scalars[2] = attn;
+            barrier();
         }
-        barrier();
+        const float attn = s_red[0];
 
-        const float q_norm_inv = s_scalars[0];
-        const float k_norm_inv = s_scalars[1];
-        const float attn = s_scalars[2];
+        const float beta_val = 1.0f / (1.0f + exp(-b[gb_base + t * p.H_v]));
+        const float decay = exp(min(g[gb_base + t * p.H_v], 50.0f));
 
-        const float v_val = v[v_base + t * p.v_nb1 + row];
-
+        // Partial sums over this thread's columns.
         float v_prime = 0.0f;
         float out_val = 0.0f;
-        for (uint c = 0; c < S_V; ++c) {
-            const float sc = state_row[c];
-            v_prime += sc * s_k[c];
-            out_val  += sc * s_q[c];
+        for (uint i = 0; i < CS; ++i) {
+            const uint col = NUM_GROUPS * i + col_group;
+            v_prime += state_local[i] * s_k[col];
+            out_val  += state_local[i] * s_q[col];
         }
 
-        const float v_new = v_val * beta_val - v_prime * beta_val * decay * k_norm_inv;
-        dst[out_base + t * out_token_stride + row] = out_val * decay * q_norm_inv * p.scale + v_new * attn;
+        all_sum1[col_group * (CS + 1u) + row] = v_prime;
+        all_sum2[col_group * (CS + 1u) + row] = out_val;
+        barrier();
 
-        for (uint c = 0; c < S_V; ++c) {
-            const float s_new = decay * state_row[c] + v_new * (s_k[c] * k_norm_inv);
-            state_row[c] = clamp(s_new, -1e6f, 1e6f);
+        // Reduce across column groups.
+        v_prime = 0.0f;
+        out_val = 0.0f;
+        for (uint grp = 0; grp < NUM_GROUPS; ++grp) {
+            v_prime += all_sum1[grp * (CS + 1u) + row];
+            out_val  += all_sum2[grp * (CS + 1u) + row];
+        }
+
+        const float v_val = v[v_base + t * p.v_nb1 + row_out];
+        const float v_new = beta_val * (v_val - v_prime * decay);
+
+        if (col_group == 0u) {
+            dst[out_base + t * out_token_stride + row_out] = out_val * decay + v_new * attn;
+        }
+
+        for (uint i = 0; i < CS; ++i) {
+            const uint col = NUM_GROUPS * i + col_group;
+            const float s_new = decay * state_local[i] + v_new * s_k[col];
+            state_local[i] = clamp(s_new, -1e6f, 1e6f);
         }
 
         if (p.has_saved != 0u && t + 1u < p.n_tokens) {
             const uint saved_base = t * (S_V * S_V * p.H_v * p.n_seqs) + state_base;
-            for (uint c = 0; c < S_V; ++c) {
-                saved[saved_base + c * S_V + row] = state_row[c];
+            for (uint i = 0; i < CS; ++i) {
+                const uint col = NUM_GROUPS * i + col_group;
+                saved[saved_base + col * S_V + row_out] = state_local[i];
             }
         }
 
@@ -123,7 +138,8 @@ void main() {
 
     const uint output_size = S_V * p.H_v * p.n_tokens * p.n_seqs;
     const uint state_out_base = output_size + state_base;
-    for (uint c = 0; c < S_V; ++c) {
-        dst[state_out_base + c * S_V + row] = state_row[c];
+    for (uint i = 0; i < CS; ++i) {
+        const uint col = NUM_GROUPS * i + col_group;
+        dst[state_out_base + col * S_V + row_out] = state_local[i];
     }
 }
