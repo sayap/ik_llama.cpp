@@ -17,10 +17,10 @@ layout (binding = 0) readonly buffer A32 { uint data_a32[]; };
 // Combined byte-pair table: entry[q] packs iq4k_values[v1*16 + (q & 0xf)] (low
 // byte) and iq4k_values[v2*16 + (q >> 4)] (high byte), so IQ4_K's two table
 // selectors are one shared load per quantized byte.
-shared uint iq4k_pair_shmem[4][128];
+shared uint iq4k_pair_shmem[4][256];
 
 uint iq4k_pair_entry(uint sel, uint q) {
-    return iq4k_pair_shmem[sel][q / 2u] >> (16u * (q % 2u));
+    return iq4k_pair_shmem[sel][q];
 }
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
@@ -113,10 +113,14 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         const uint d01 = ((b0 >> 16) & 0xffu) | ((b16 >> 16) & 0xff00u);
         const uint d10 = ((b16 >> 16) & 0xffu) | ((b0 >> 16) & 0xff00u);
         const uint d11 = ((b16 >> 16) & 0xffu) | ((b16 >> 16) & 0xff00u);
-        iq4k_pair_shmem[0][idx] = c00 | (d00 << 16);
-        iq4k_pair_shmem[1][idx] = c01 | (d01 << 16);
-        iq4k_pair_shmem[2][idx] = c10 | (d10 << 16);
-        iq4k_pair_shmem[3][idx] = c11 | (d11 << 16);
+        iq4k_pair_shmem[0][2*idx]     = c00;
+        iq4k_pair_shmem[0][2*idx + 1] = d00;
+        iq4k_pair_shmem[1][2*idx]     = c01;
+        iq4k_pair_shmem[1][2*idx + 1] = d01;
+        iq4k_pair_shmem[2][2*idx]     = c10;
+        iq4k_pair_shmem[2][2*idx + 1] = d10;
+        iq4k_pair_shmem[3][2*idx]     = c11;
+        iq4k_pair_shmem[3][2*idx + 1] = d11;
     }
     barrier();
 
