@@ -3619,6 +3619,78 @@ static void ggml_cuda_up_gate_unary(ggml_backend_cuda_context & ctx, ggml_tensor
 
 }
 
+// Host-staged REDUCE fallback for mixed-backend tensor parallelism (e.g. CUDA+Vulkan),
+// where some participants are not CUDA buffers and cudaMemcpyPeerAsync cannot reach them.
+// Returns true if it handled the reduce.
+static bool ggml_cuda_op_reduce_mixed(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    bool foreign = false;
+    if (dst->buffer && !ggml_backend_buffer_is_cuda(dst->buffer)) foreign = true;
+    const int nreduce = dst->op_params[1];
+    for (int j = 0; j < nreduce && !foreign; ++j) {
+        ggml_tensor * src = dst->src[j];
+        if (src && src->buffer && !ggml_backend_buffer_is_cuda(src->buffer)) foreign = true;
+    }
+    if (!foreign) return false;
+
+    GGML_ASSERT(dst->op_params[0] == GGML_OP_ADD);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+
+    ggml_tensor * local_src = dst->view_src;
+    GGML_ASSERT(local_src && dst->data == local_src->data);
+
+    // Make CUDA compute (still in flight on backend streams) visible to the host before
+    // reading any participant. Vulkan's get_tensor flushes its own deferred compute.
+    auto & info = ggml_cuda_info();
+    if (auto it = info.all_ctx.find(ctx.model); it != info.all_ctx.end()) {
+        for (auto * c : it->second) {
+            if (!c) continue;
+            ggml_cuda_set_device(c->device);
+            CUDA_CHECK(cudaStreamSynchronize(c->stream()));
+        }
+    }
+    ggml_cuda_set_device(ctx.device);
+
+    const size_t nelem  = ggml_nelements(dst);
+    const size_t nbytes = ggml_nbytes(dst);
+
+    static thread_local std::vector<float> acc;
+    static thread_local std::vector<uint8_t> tmp;
+    acc.assign(nelem, 0.0f);
+    tmp.resize(nbytes);
+
+    for (int j = 0; j < nreduce; ++j) {
+        ggml_tensor * src = dst->src[j];
+        if (!src) continue;
+        GGML_ASSERT(src->type == dst->type);
+        ggml_backend_tensor_get(src, tmp.data(), 0, nbytes);
+        if (dst->type == GGML_TYPE_F32) {
+            const float * p = (const float *) tmp.data();
+            for (size_t i = 0; i < nelem; ++i) acc[i] += p[i];
+        } else {
+            const ggml_fp16_t * p = (const ggml_fp16_t *) tmp.data();
+            for (size_t i = 0; i < nelem; ++i) acc[i] += ggml_fp16_to_fp32(p[i]);
+        }
+    }
+
+    if (dst->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(dst, acc.data(), 0, nbytes);
+        for (int j = 0; j < nreduce; ++j) {
+            ggml_tensor * src = dst->src[j];
+            if (!src || src == local_src) continue;
+            ggml_backend_tensor_set(src, acc.data(), 0, nbytes);
+        }
+    } else {
+        for (size_t i = 0; i < nelem; ++i) ((ggml_fp16_t *) tmp.data())[i] = ggml_fp32_to_fp16(acc[i]);
+        ggml_backend_tensor_set(dst, tmp.data(), 0, nbytes);
+        for (int j = 0; j < nreduce; ++j) {
+            ggml_tensor * src = dst->src[j];
+            if (!src || src == local_src) continue;
+            ggml_backend_tensor_set(src, tmp.data(), 0, nbytes);
+        }
+    }
+    return true;
+}
+
 static inline bool ops_are_same_device(const ggml_cgraph * cgraph, int first, int last) {
     if (last <= first) return true;
     int device = ((const ggml_backend_cuda_buffer_context *)cgraph->nodes[first]->buffer->context)->device;
@@ -3653,7 +3725,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     //printf("%4d %s(%s) on device %d. time = %ld\n", i, ggml_op_name(dst->op), dst->name, ctx.device, ggml_time_us());
     switch (dst->op) {
         case GGML_OP_REDUCE:
-            ggml_cuda_op_reduce(ctx, dst);
+            if (!ggml_cuda_op_reduce_mixed(ctx, dst)) {
+                ggml_cuda_op_reduce(ctx, dst);
+            }
             break;
         case GGML_OP_BLEND:
             ggml_cuda_op_blend(ctx, dst);
