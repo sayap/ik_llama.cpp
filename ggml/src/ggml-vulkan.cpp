@@ -4609,11 +4609,11 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
 
     if (ctx->device->coopmat2) {
         assert(src1_type == GGML_TYPE_F16);
-        // The IQK/KT families use the flat dequant+F16 fallback: it is faster
-        // than the cm2 inline dequant (scalar or V=4 decode-vector) because the
-        // inline decode is re-done once per N-tile while the flat dequant runs
-        // once per batch (see docs/Vulkan.md).
-        if (ggml_vk_is_iqk_type(src0_type)) {
+        // The IQK/KT families (and Q6_0) use the flat dequant+F16 fallback: it
+        // is faster than the cm2 inline dequant because the inline decode is
+        // re-done once per N-tile while the flat dequant runs once per batch
+        // (see docs/Vulkan.md).
+        if (ggml_vk_is_iqk_type(src0_type) || src0_type == GGML_TYPE_Q6_0) {
             return nullptr;
         }
         vk_matmul_pipeline p = prec == GGML_PREC_DEFAULT ? ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat_f16[src0_type].f32acc;
