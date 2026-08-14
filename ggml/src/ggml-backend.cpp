@@ -339,6 +339,12 @@ bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor *
 }
 
 bool ggml_backend_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
+    // The backend-agnostic split buffer type is a container for per-device sub-buffers;
+    // every backend can "support" it for leaf/placement purposes (the actual data lives in
+    // the per-slot sub-buffers).
+    if (ggml_backend_buft_is_split(buft)) {
+        return true;
+    }
     return backend->iface.supports_buft(backend, buft);
 }
 
@@ -451,6 +457,7 @@ struct ggml_backend_reg {
     char name[128];
     ggml_backend_init_fn init_fn;
     ggml_backend_buffer_type_t default_buffer_type;
+    ggml_backend_get_device_memory_fn get_device_memory_fn;
     void * user_data;
 };
 
@@ -488,7 +495,7 @@ GGML_CALL static void ggml_backend_registry_init(void) {
 
     initialized = true;
 
-    ggml_backend_register("CPU", ggml_backend_reg_cpu_init, ggml_backend_cpu_buffer_type(), NULL);
+    ggml_backend_register("CPU", ggml_backend_reg_cpu_init, ggml_backend_cpu_buffer_type(), NULL, NULL);
 
     // add forward decls here to avoid including the backend headers
 #ifdef GGML_USE_CUDA
@@ -500,7 +507,7 @@ GGML_CALL static void ggml_backend_registry_init(void) {
 #endif
 
 #ifdef GGML_USE_METAL
-    ggml_backend_register("Metal", ggml_backend_reg_metal_init, ggml_backend_metal_buffer_type(), NULL);
+    ggml_backend_register("Metal", ggml_backend_reg_metal_init, ggml_backend_metal_buffer_type(), NULL, NULL);
 #endif
 
 #ifdef GGML_USE_VULKAN
@@ -515,16 +522,18 @@ GGML_CALL static void ggml_backend_registry_init(void) {
 #endif
 }
 
-GGML_CALL void ggml_backend_register(const char * name, ggml_backend_init_fn init_fn, ggml_backend_buffer_type_t default_buffer_type, void * user_data) {
+GGML_CALL void ggml_backend_register(const char * name, ggml_backend_init_fn init_fn,
+        ggml_backend_buffer_type_t default_buffer_type, ggml_backend_get_device_memory_fn get_device_memory_fn, void * user_data) {
     GGML_ASSERT(ggml_backend_registry_count < GGML_REG_MAX_BACKENDS);
 
     size_t id = ggml_backend_registry_count;
 
     ggml_backend_registry[id] = ggml_backend_reg {
-        /* .name                = */ {0},
-        /* .fn                  = */ init_fn,
-        /* .default_buffer_type = */ default_buffer_type,
-        /* .user_data           = */ user_data
+        /* .name                 = */ {0},
+        /* .init_fn              = */ init_fn,
+        /* .default_buffer_type  = */ default_buffer_type,
+        /* .get_device_memory_fn = */ get_device_memory_fn,
+        /* .user_data            = */ user_data
     };
 
     snprintf(ggml_backend_registry[id].name, sizeof(ggml_backend_registry[id].name), "%s", name);
@@ -616,6 +625,413 @@ ggml_backend_buffer_t ggml_backend_reg_alloc_buffer(size_t i, size_t size) {
 
     GGML_ASSERT(i < ggml_backend_registry_count);
     return ggml_backend_buft_alloc_buffer(ggml_backend_registry[i].default_buffer_type, size);
+}
+
+void ggml_backend_reg_get_device_memory(size_t i, size_t * free, size_t * total) {
+    ggml_backend_registry_init();
+
+    GGML_ASSERT(i < ggml_backend_registry_count);
+    *free  = 0;
+    *total = 0;
+    if (ggml_backend_registry[i].get_device_memory_fn) {
+        // user_data stores the raw device id for CUDA/SYCL/Vulkan/CANN backends.
+        const int raw_device = (int) (intptr_t) ggml_backend_registry[i].user_data;
+        ggml_backend_registry[i].get_device_memory_fn(raw_device, free, total);
+    }
+}
+
+//
+// Backend-agnostic split buffer type
+//
+// This mirrors the CUDA/Vulkan/SYCL split buffers but allocates each per-device shard on the
+// buffer type supplied for that slot, so it works both for homogeneous multi-device runs and
+// for mixed-backend runs. The tensor data is distributed through ggml_backend_tensor_set/get,
+// so no backend-specific transfer path is required.
+//
+
+struct ggml_backend_split_buffer_type_context {
+    std::vector<ggml_backend_buffer_type_t> bufts;
+};
+
+struct ggml_backend_split_buffer_context {
+    ~ggml_backend_split_buffer_context() {}
+};
+
+static const char * ggml_backend_split_buffer_get_name(ggml_backend_buffer_t buffer) {
+    return "GGML_SPLIT";
+
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_split_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_backend_split_buffer_context * ctx = (ggml_backend_split_buffer_context *) buffer->context;
+    delete ctx;
+}
+
+static void * ggml_backend_split_buffer_get_base(ggml_backend_buffer_t buffer) {
+    // The per-device pointers are stored in the tensor extras; this is a dummy address
+    // that is never dereferenced (mirrors the CUDA split buffer).
+    return (void *) 0x1000;
+
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_split_buffer_init_tensor([[maybe_unused]] ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    if (!tensor->extra) {
+        return;
+    }
+
+    auto extra = (ggml_split_tensor_t *) tensor->extra;
+    auto * buft_ctx = (ggml_backend_split_buffer_type_context *) buffer->buft->context;
+    GGML_ASSERT(extra->n_device <= (int) buft_ctx->bufts.size());
+
+    for (int i = 0; i < extra->n_device; ++i) {
+        if (!extra->splits[i]) {
+            continue;
+        }
+        auto split = extra->splits[i];
+        GGML_ASSERT(buft_ctx->bufts[i] != nullptr);
+        ggml_backend_buffer_t sub_buffer = ggml_backend_buft_alloc_buffer(buft_ctx->bufts[i], ggml_nbytes(split));
+        GGML_ASSERT(sub_buffer != nullptr);
+
+        split->data = ggml_backend_buffer_get_base(sub_buffer);
+        split->buffer = sub_buffer;
+        ggml_backend_buffer_set_usage(split->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+}
+
+static void ggml_backend_split_buffer_set_tensor([[maybe_unused]] ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (!tensor->extra) {
+        return;
+    }
+
+    // Split tensors are always written in their entirety at once.
+    GGML_ASSERT(offset == 0);
+    GGML_ASSERT(size == ggml_nbytes(tensor));
+
+    auto extra = (ggml_split_tensor_t *) tensor->extra;
+
+    void * extra_ptr = nullptr;
+    memcpy(&extra_ptr, tensor->op_params, sizeof(extra_ptr));
+    auto ranges = extra_ptr ? (const std::vector<std::vector<std::pair<int, int>>> *) extra_ptr : nullptr;
+
+    if (extra->split_dim < 0) {
+        GGML_ASSERT(ggml_is_contiguous(tensor));
+        auto nbytes = ggml_nbytes(tensor);
+        for (int i = 0; i < extra->n_device; ++i) {
+            auto split = extra->splits[i];
+            if (!split) continue;
+            GGML_ASSERT(split->type == tensor->type);
+            GGML_ASSERT(ggml_are_same_shape(tensor, split));
+            GGML_ASSERT(ggml_nbytes(split) == nbytes);
+            ggml_backend_tensor_set(split, data, 0, nbytes);
+        }
+    } else if (extra->split_dim == 0) {
+        // Row split (concat along ne[0]).
+        GGML_ASSERT(ggml_is_contiguous(tensor));
+        auto tt = ggml_internal_get_type_traits(tensor->type);
+        const int64_t bs = tt.blck_size;
+        const size_t ts = tt.type_size;
+        const int64_t nrows = ggml_nrows(tensor);
+
+        if (ranges) {
+            GGML_ASSERT(tensor->ne[2] * tensor->ne[3] == 1);
+            GGML_ASSERT(tt.row_meta_size == 0);
+            GGML_ASSERT(extra->n_device == (int) ranges->size());
+            for (int i = 0; i < extra->n_device; ++i) {
+                auto split = extra->splits[i];
+                if (!split) {
+                    GGML_ASSERT((*ranges)[i].empty());
+                    continue;
+                }
+                GGML_ASSERT(!(*ranges)[i].empty());
+                GGML_ASSERT((int) ggml_nrows(split) == nrows);
+                const size_t split_row_size = ggml_row_size(split->type, split->ne[0]);
+                std::vector<char> host_buffer(nrows * split_row_size);
+                char * dst = host_buffer.data();
+                for (int64_t i01 = 0; i01 < split->ne[1]; ++i01) {
+                    for (auto & p : (*ranges)[i]) {
+                        GGML_ASSERT(p.first  % bs == 0);
+                        GGML_ASSERT(p.second % bs == 0);
+                        auto src = (const char *) data + i01 * tensor->nb[1] + (p.first / bs) * ts;
+                        auto this_size = (p.second / bs) * ts;
+                        memcpy(dst, src, this_size);
+                        dst += this_size;
+                    }
+                }
+                ggml_backend_tensor_set(split, host_buffer.data(), 0, host_buffer.size());
+            }
+        } else {
+            int64_t ne0_acc = 0;
+            for (int i = 0; i < extra->n_device; ++i) {
+                auto split = extra->splits[i];
+                if (!split) continue;
+                GGML_ASSERT(split->type == tensor->type);
+                GGML_ASSERT((int) ggml_nrows(split) == nrows);
+                GGML_ASSERT(split->ne[0] % bs == 0);
+                const size_t split_row_size = ggml_row_size(split->type, split->ne[0]);
+                std::vector<char> host_buffer(nrows * split_row_size);
+                const size_t source_offset = tt.row_meta_size + (ne0_acc / bs) * ts;
+                for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
+                    for (int64_t i01 = 0; i01 < split->ne[1]; ++i01) {
+                        auto dst = host_buffer.data() + (i02 * split->ne[1] + i01) * split_row_size;
+                        auto src = (const char *) data + i02 * tensor->nb[2] + i01 * tensor->nb[1];
+                        if (tt.row_meta_size > 0) {
+                            memcpy(dst, src, tt.row_meta_size);
+                        }
+                        memcpy(dst + tt.row_meta_size, src + source_offset, split_row_size - tt.row_meta_size);
+                    }
+                }
+                ggml_backend_tensor_set(split, host_buffer.data(), 0, host_buffer.size());
+                ne0_acc += split->ne[0];
+            }
+        }
+    } else if (extra->split_dim == 1) {
+        // Column split (concat along ne[1]).
+        const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        if (tensor->ne[2] > 1) {
+            std::vector<char> host_buffer;
+            int64_t ne1_acc = 0;
+            for (int i = 0; i < extra->n_device; ++i) {
+                auto split = extra->splits[i];
+                if (!split) continue;
+                const size_t dev_bytes = ggml_nbytes(split);
+                if (host_buffer.size() < dev_bytes) host_buffer.resize(dev_bytes);
+                if (ranges) {
+                    char * dst = host_buffer.data();
+                    for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
+                        for (auto & p : (*ranges)[i]) {
+                            auto src = (const char *) data + i02 * tensor->nb[2] + p.first * tensor->nb[1];
+                            auto this_size = p.second * tensor->nb[1];
+                            memcpy(dst, src, this_size);
+                            dst += this_size;
+                        }
+                    }
+                } else {
+                    for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
+                        auto src = (const char *) data + i02 * tensor->nb[2] + ne1_acc * tensor->nb[1];
+                        auto dst = host_buffer.data() + i02 * split->ne[1] * row_size;
+                        memcpy(dst, src, split->ne[1] * row_size);
+                    }
+                    ne1_acc += split->ne[1];
+                }
+                ggml_backend_tensor_set(split, host_buffer.data(), 0, dev_bytes);
+            }
+        } else {
+            if (ranges) {
+                GGML_ASSERT(tensor->ne[2] * tensor->ne[3] == 1);
+                GGML_ASSERT(extra->n_device == (int) ranges->size());
+                for (int i = 0; i < extra->n_device; ++i) {
+                    auto split = extra->splits[i];
+                    if (!split) {
+                        GGML_ASSERT((*ranges)[i].empty());
+                        continue;
+                    }
+                    GGML_ASSERT(!(*ranges)[i].empty());
+                    std::vector<char> host_buffer(ggml_nbytes(split));
+                    char * dst = host_buffer.data();
+                    for (auto & p : (*ranges)[i]) {
+                        GGML_ASSERT(p.first >= 0 && p.first < tensor->ne[1]);
+                        GGML_ASSERT(p.second >= 0 && p.first + p.second <= tensor->ne[1]);
+                        auto src = (const char *) data + p.first * tensor->nb[1];
+                        auto this_size = p.second * tensor->nb[1];
+                        memcpy(dst, src, this_size);
+                        dst += this_size;
+                    }
+                    ggml_backend_tensor_set(split, host_buffer.data(), 0, host_buffer.size());
+                }
+            } else {
+                size_t cur_offset = 0;
+                for (int i = 0; i < extra->n_device; ++i) {
+                    auto split = extra->splits[i];
+                    if (!split) continue;
+                    const size_t dev_bytes = ggml_nbytes(split);
+                    ggml_backend_tensor_set(split, (const char *) data + cur_offset, 0, dev_bytes);
+                    cur_offset += dev_bytes;
+                }
+            }
+        }
+    } else if (extra->split_dim == 2) {
+        GGML_ASSERT(!ranges && "split_dim == 2 with explicit ranges is not supported");
+        size_t cur_offset = 0;
+        for (int i = 0; i < extra->n_device; ++i) {
+            auto split = extra->splits[i];
+            if (!split) continue;
+            const size_t dev_bytes = ggml_nbytes(split);
+            ggml_backend_tensor_set(split, (const char *) data + cur_offset, 0, dev_bytes);
+            cur_offset += dev_bytes;
+        }
+    } else {
+        fprintf(stderr, "%s: not implemented for split dim %d\n", __func__, extra->split_dim);
+        GGML_ABORT("fatal error");
+    }
+}
+
+static void ggml_backend_split_buffer_get_tensor([[maybe_unused]] ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    GGML_ASSERT(offset == 0);
+    GGML_ASSERT(size == ggml_nbytes(tensor));
+
+    if (!tensor->extra) {
+        return;
+    }
+
+    auto extra = (ggml_split_tensor_t *) tensor->extra;
+
+    void * extra_ptr = nullptr;
+    memcpy(&extra_ptr, tensor->op_params, sizeof(extra_ptr));
+    GGML_ASSERT(!extra_ptr && "get_tensor with explicit ranges is not implemented");
+
+    if (extra->split_dim < 0) {
+        GGML_ASSERT(ggml_is_contiguous(tensor));
+        for (int i = 0; i < extra->n_device; ++i) {
+            auto split = extra->splits[i];
+            if (!split) continue;
+            GGML_ASSERT(split->type == tensor->type);
+            ggml_backend_tensor_get(split, data, 0, ggml_nbytes(tensor));
+            return;
+        }
+        GGML_ABORT("no device holds a copy of the replicated tensor");
+    } else if (extra->split_dim == 0) {
+        GGML_ASSERT(ggml_is_contiguous(tensor));
+        auto tt = ggml_internal_get_type_traits(tensor->type);
+        GGML_ASSERT(tt.row_meta_size == 0);
+        std::vector<char> host_buffer;
+        int64_t ne0_acc = 0;
+        for (int i = 0; i < extra->n_device; ++i) {
+            auto split = extra->splits[i];
+            if (!split) continue;
+            GGML_ASSERT(split->type == tensor->type);
+            GGML_ASSERT(split->ne[0] % tt.blck_size == 0);
+            const size_t split_row_size = ggml_row_size(split->type, split->ne[0]);
+            const size_t dev_bytes = (size_t) ggml_nrows(split) * split_row_size;
+            if (host_buffer.size() < dev_bytes) host_buffer.resize(dev_bytes);
+            ggml_backend_tensor_get(split, host_buffer.data(), 0, dev_bytes);
+            const size_t source_offset = (ne0_acc / tt.blck_size) * tt.type_size;
+            for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
+                for (int64_t i01 = 0; i01 < split->ne[1]; ++i01) {
+                    const char * src = host_buffer.data() + (i02 * split->ne[1] + i01) * split_row_size;
+                    char * dst = (char *) data + i02 * tensor->nb[2] + i01 * tensor->nb[1] + source_offset;
+                    memcpy(dst, src, split_row_size);
+                }
+            }
+            ne0_acc += split->ne[0];
+        }
+    } else if (extra->split_dim == 1) {
+        const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        if (tensor->ne[2] > 1) {
+            std::vector<char> host_buffer;
+            int64_t ne1_acc = 0;
+            for (int i = 0; i < extra->n_device; ++i) {
+                auto split = extra->splits[i];
+                if (!split) continue;
+                const size_t dev_bytes = ggml_nbytes(split);
+                if (host_buffer.size() < dev_bytes) host_buffer.resize(dev_bytes);
+                ggml_backend_tensor_get(split, host_buffer.data(), 0, dev_bytes);
+                for (int64_t i02 = 0; i02 < split->ne[2]; ++i02) {
+                    const char * src = host_buffer.data() + i02 * split->ne[1] * row_size;
+                    char * dst = (char *) data + i02 * tensor->nb[2] + ne1_acc * tensor->nb[1];
+                    memcpy(dst, src, split->ne[1] * row_size);
+                }
+                ne1_acc += split->ne[1];
+            }
+        } else {
+            size_t cur_offset = 0;
+            for (int i = 0; i < extra->n_device; ++i) {
+                auto split = extra->splits[i];
+                if (!split) continue;
+                ggml_backend_tensor_get(split, (char *) data + cur_offset, 0, ggml_nbytes(split));
+                cur_offset += ggml_nbytes(split);
+            }
+        }
+    } else {
+        GGML_ABORT("get_tensor: not implemented for this split_dim");
+    }
+}
+
+static void ggml_backend_split_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    // Per-device sub-buffers are allocated in init_tensor; like the CUDA split buffer we
+    // do not clear them here (recurrent state is zeroed by the graph's reset step at pos 0).
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(value);
+}
+
+static ggml_backend_buffer_i ggml_backend_split_buffer_interface = {
+    /* .get_name        = */ ggml_backend_split_buffer_get_name,
+    /* .free_buffer     = */ ggml_backend_split_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_split_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_split_buffer_init_tensor,
+    /* .memset_tensor   = */ NULL,
+    /* .set_tensor      = */ ggml_backend_split_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_split_buffer_get_tensor,
+    /* .cpy_tensor      = */ NULL,
+    /* .clear           = */ ggml_backend_split_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
+static const char * ggml_backend_split_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return "GGML_SPLIT";
+
+    GGML_UNUSED(buft);
+}
+
+bool ggml_backend_buft_is_split(ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_split_buffer_type_name;
+}
+
+static ggml_backend_buffer_t ggml_backend_split_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    // Device buffers are allocated per tensor in init_tensor; this buffer only carries the
+    // cumulative size budget returned by get_alloc_size (enforced by ggml-alloc).
+    ggml_backend_split_buffer_context * ctx = new ggml_backend_split_buffer_context();
+    return ggml_backend_buffer_init(buft, ggml_backend_split_buffer_interface, ctx, size);
+}
+
+static size_t ggml_backend_split_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    return 128;
+
+    GGML_UNUSED(buft);
+}
+
+static size_t ggml_backend_split_buffer_type_get_alloc_size([[maybe_unused]] ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    if (!tensor->extra) {
+        return 0;
+    }
+    auto extra = (ggml_split_tensor_t *) tensor->extra;
+
+    size_t total_size = 0;
+    for (int i = 0; i < extra->n_device; ++i) {
+        auto split = extra->splits[i];
+        if (!split) continue;
+        total_size += ggml_nbytes(split);
+    }
+    return total_size;
+}
+
+static bool ggml_backend_split_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    return false;
+
+    GGML_UNUSED(buft);
+}
+
+static ggml_backend_buffer_type_i ggml_backend_split_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_split_buffer_type_name,
+    /* .alloc_buffer     = */ ggml_backend_split_buffer_type_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_split_buffer_type_get_alignment,
+    /* .get_max_size     = */ NULL,
+    /* .get_alloc_size   = */ ggml_backend_split_buffer_type_get_alloc_size,
+    /* .is_host          = */ ggml_backend_split_buffer_type_is_host,
+};
+
+ggml_backend_buffer_type_t ggml_backend_split_buffer_type(ggml_backend_buffer_type_t * bufts, size_t n) {
+    GGML_ASSERT(bufts != nullptr && n > 0);
+
+    auto * ctx = new ggml_backend_split_buffer_type_context();
+    ctx->bufts.assign(bufts, bufts + n);
+
+    auto * buft = new ggml_backend_buffer_type {
+        /* .iface   = */ ggml_backend_split_buffer_type_interface,
+        /* .context = */ ctx,
+    };
+    return buft;
 }
 
 //

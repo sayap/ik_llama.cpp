@@ -249,6 +249,51 @@ Remaining gaps:
   ~870 GB/s, so the remaining IQ4_KS gap is the shared-memory table lookup (removing
   it experimentally lifts decode to ~39 tok/s).
 
+### 11. Graph parallelism plumbing (`-sm graph`)
+
+The pieces the scheduler needs to split a model graph across multiple devices are now
+in place:
+
+- **Backend-agnostic split buffer type** (`ggml_backend_split_buffer_type` in
+  `ggml-backend.cpp`): the `init_tensor`/`set_tensor`/`get_tensor` logic that was
+  originally added as a Vulkan split buffer now lives in ggml core and allocates each
+  `ggml_split_tensor_t` shard on the per-slot buffer type supplied by the caller.
+  `split_dim` -1 (replicated), 0 (row split), 1 (column split) and 2 (contiguous only)
+  are supported; the explicit per-device `ranges` form stored in `tensor->op_params`
+  (used by the gated delta-net qkv/conv/gate weights and by MoE/MLA distributions) is
+  supported for `split_dim` 0 and 1. `get_tensor` implements the inverse for the
+  contiguous -1/0/1 cases (the `ranges` and `split_dim=2` forms are not invertible on the
+  wrapper; the loader reads those per-rank).
+- `ggml_backend_vk_split_buffer_type()` is now a thin wrapper over the generic type with
+  one entry per Vulkan device. `ggml_backend_supports_buft()` accepts the generic split
+  type for every backend (it is a container for per-device sub-buffers).
+- **`GGML_OP_REDUCE`** (`supports_op` + `ggml_vk_op_reduce`): a synchronous host-staged
+  all-reduce. Each partial tensor is pulled with `ggml_backend_tensor_get`, summed in F32
+  (F16/F32 supported), and the full sum is written back to every participant. REDUCE runs
+  as its own scheduler split after the producers have completed, so the host round-trip
+  is correct even though the backend still has no events/async copies. It is slow relative
+  to a peer-to-peer ring reduce, but it is the correct first implementation.
+- `llama_default_buffer_type_split()` keeps the CUDA/SYCL specialized split buffers for
+  homogeneous static builds, and otherwise builds a per-slot buffer-type map from the
+  registry and returns the generic split buffer. This makes `-sm graph` work in
+  `GGML_BACKEND_DL` builds and for mixed-backend device selections, not just static
+  single-backend builds. The Vulkan backend-init path no longer hard-rejects
+  `-sm graph`/`-sm attn`; those modes initialize all Vulkan devices like `-sm layer`.
+
+`tests/test-vk-split.cpp` validates the generic split buffer (contiguous, delta-net
+`ranges`, an IQ4_KS row-meta split, and a mixed Vulkan0+CPU per-slot map) and a
+cross-device reduce through a real Vulkan0+Vulkan1 ggml scheduler.
+
+End-to-end `-sm graph` was validated on Qwen3.6-27B-IQK across Vulkan0 (RTX 3090) +
+Vulkan1 (AMD Strix Halo): output matches the single-device run. Two bugs were found and
+fixed along the way: the split buffer's contiguous row split omitted `row_meta_size` from
+its block-data source offset (corrupting IQ4_KS FFN weights), and `create_split()`'s
+mem_used-adjusted heuristic rounded a small device down to zero shards for lopsided
+memory splits. `create_split()` now uses a largest-remainder proportional split with a
+minimum-one-chunk guarantee per participating device, so the default memory split and
+lopsided `-ts` ratios both work. Still pending: the CUDA foreign-buffer REDUCE fallback
+for mixed CUDA+Vulkan runs and the MLA `-sm attn` `split_dim=2` path.
+
 ## Benchmarks (RTX 3090, Vulkan0)
 
 Qwen2.5-Coder-0.5B-Instruct-Q8_0 (dense, `-c 2048`, single token batch):
@@ -294,8 +339,16 @@ several quant types and batch sizes.
 3. **Indexer / DSA / CSA / HCA / GLM-DSA**: `INDEXER_TOPK`, `MASK_TOPK`, `MASK_TO_IDX`,
    `SINKHORN`, `HC_PRE`, `HC_POST`, `LATENT_ATTN`, `DS4_COMP`. Stateful sparse-attention
    ops (DeepSeek2/4, OpenPangu, GLM-4.5-Air, GLM-DSA).
-4. **`--fit` with `GGML_BACKEND_DL`** — per-device memory reports 0 MiB.
-5. **`-sm graph` / `-sm attn`** split modes.
+4. **`--fit` with `GGML_BACKEND_DL`** — fixed: per-device memory is now queried through
+   the backend registry (`ggml_backend_reg_get_device_memory`), so DL builds report real
+   free memory (and `--fit` no longer sees 0 MiB).
+5. **`-sm graph` / `-sm attn`** split modes. A backend-agnostic **split buffer type**
+   and host-staged **`GGML_OP_REDUCE`** are now implemented, wired into
+   `llama_default_buffer_type_split` for static / `GGML_BACKEND_DL` / mixed-backend
+   selections, and validated end-to-end on Qwen3.6-27B-IQK across two Vulkan devices
+   (see "Graph parallelism plumbing" below). Remaining: the `-sm attn` MLA
+   `split_dim=2` load path, and a CUDA foreign-buffer REDUCE fallback for mixed
+   CUDA+Vulkan runs.
 6. Everything else: Mamba `SSM_SCAN`, the `*_R4` repacks and `IQ1_BN`/`IQ2_BN`, async
    tensor copies/events, the fence busy-wait, and the remaining training/vision ops
    (`GLU`, `RWKV_WKV6/7`, `CONV_2D_DW`, `SIN`/`COS`, ...).
@@ -314,8 +367,8 @@ Vulkan backend, so they fall back to the CPU backend with expensive copies:
   into the result tail and lets the existing state-copy node persist it (the CPU-style
   src[7] fused-copy optimization is not used). Not yet supported (falls back to CPU):
   per-step conv/state checkpointing (`src[4]`/`src[6]` non-null) and multi-sequence
-  `SSM_CONV` routing (`n_kv > 1`). `GGML_OP_REDUCE` is only needed for multi-device
-  splits of the layer.
+  `SSM_CONV` routing (`n_kv > 1`). `GGML_OP_REDUCE` (needed for multi-device splits of
+  the layer) is now implemented as a host-staged all-reduce.
 - **Indexer / DSA / CSA / HCA / GLM-DSA** (DeepSeek2/4, OpenPangu, GLM-4.5-Air, GLM-DSA
   sparse attention): `GGML_OP_INDEXER_TOPK`, `GGML_OP_MASK_TOPK`, `GGML_OP_MASK_TO_IDX`,
   `GGML_OP_SINKHORN`, `GGML_OP_HC_PRE`, `GGML_OP_HC_POST`, `GGML_OP_LATENT_ATTN`,
@@ -353,16 +406,28 @@ Still not supported (their matmuls run on CPU), in priority order:
 
 - No async tensor copies, no events, no transfer/compute queue synchronization. Enabling
   those (as upstream did) would allow true per-decode overlap and remove the per-`graph_compute`
-  fence wait.
+  fence wait. Profiling `-sm graph` decode (2 Vulkan devices) shows the per-split fence wait
+  (which serializes CPU recording against GPU execution) is ~63% of `graph_compute` time and
+  the host-staged REDUCE is ~23%; the GPU kernels themselves are only ~15-20%.
 - The spin in `ggml_vk_wait_for_fence` is still a busy-wait for the final fence; upstream
   keeps the same pattern, but a blocking `vkWaitForFences` for the tail would reduce CPU
-  usage further at a small latency cost.
-- `-sm graph`/`-sm attn` split modes are rejected by the Vulkan backend.
+  usage further at a small latency cost. The final wait is now skipped for host-staged
+  (REDUCE-only) splits, which have no pending compute work.
+- `-sm graph`/`-sm attn` split modes previously fell back to the layer split path
+  because there was no split buffer type available to the generic model loader. A
+  backend-agnostic split buffer type and a host-staged `GGML_OP_REDUCE` are now
+  implemented in ggml core, so the `-sm graph` tensor-parallel path can schedule across
+  multiple Vulkan devices — and across mixed backends in principle (validated with a
+  synthetic cross-device reduce through the ggml scheduler and a mixed Vulkan0+CPU split;
+  not yet validated end-to-end on a real model). `-sm attn` (MLA) still needs the
+  `split_dim=2` load/get path.
 
 ### Integration
 
-- With `GGML_BACKEND_DL`, per-device memory reports 0 MiB (the backend memory functions are
-  not linked into the llama library), so `--fit` does not work in that configuration.
+- Per-device memory is queried through the backend registry
+  (`ggml_backend_reg_get_device_memory`), with each backend publishing its
+  `get_device_memory` function at registration. This works for both static and
+  `GGML_BACKEND_DL` builds, so `--fit` and the device list no longer report 0 MiB in DL.
 - RPC servers are not part of the backend registry; they are appended after the registered
   backends in `model->devices`.
 - The backend now compiles even when `glslc` does not support `GL_EXT_integer_dot_product`

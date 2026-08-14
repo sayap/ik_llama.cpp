@@ -510,6 +510,23 @@ static bool llama_selected_devices_use_backend(const llama_model & model, const 
     return false;
 }
 
+// check whether all selected devices belong to the same backend family
+static bool llama_selected_devices_all_backend(const llama_model & model, const char * prefix) {
+    if (model.devices.empty()) {
+        return false;
+    }
+    for (int dev : model.devices) {
+        if (dev < 0 || dev >= (int) ggml_backend_reg_get_count()) {
+            return false; // RPC device
+        }
+        const char * name = ggml_backend_reg_get_name(dev);
+        if (!name || strncmp(name, prefix, strlen(prefix)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_model & model, int gpu) {
     // gpu refers to an entry in model.devices: a backend registry index for ggml
     // backends, or reg_count + rpc position for RPC devices
@@ -540,25 +557,36 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_
 }
 
 static ggml_backend_buffer_type_t llama_default_buffer_type_split(const llama_model & model, int fallback_gpu) {
-    ggml_backend_buffer_type_t buft = nullptr;
+    const int reg_count = (int) ggml_backend_reg_get_count();
 
+    // Split-mode graph maps model.devices[i] to a per-slot buffer type below; RPC devices
+    // are not in the registry and are not supported by the split-buffer path.
+    for (int dev : model.devices) {
+        if (dev < 0 || dev >= reg_count) {
+            return llama_default_buffer_type_offload(model, fallback_gpu);
+        }
+    }
+
+    // Homogeneous static backends keep their optimized split buffers (fast load paths and
+    // peer-to-peer reduce). Everything else — Vulkan, mixed backends, and dynamically
+    // loaded backends — uses the backend-agnostic split buffer type.
 #ifdef GGML_USE_CUDA
-    if (ggml_backend_cuda_get_device_count() > 1) {
-        buft = ggml_backend_cuda_split_buffer_type(model.splits.data());
+    if (ggml_backend_cuda_get_device_count() > 1 && llama_selected_devices_all_backend(model, "CUDA")) {
+        return ggml_backend_cuda_split_buffer_type(model.splits.data());
     }
 #endif
 
 #ifdef GGML_USE_SYCL
-    if (ggml_backend_sycl_get_device_count() > 1) {
-        buft = ggml_backend_sycl_split_buffer_type(model.splits.data());
+    if (ggml_backend_sycl_get_device_count() > 1 && llama_selected_devices_all_backend(model, "SYCL")) {
+        return ggml_backend_sycl_split_buffer_type(model.splits.data());
     }
 #endif
 
-    if (buft == nullptr) {
-        buft = llama_default_buffer_type_offload(model, fallback_gpu);
+    std::vector<ggml_backend_buffer_type_t> bufts(model.devices.size());
+    for (size_t i = 0; i < model.devices.size(); ++i) {
+        bufts[i] = ggml_backend_reg_get_default_buffer_type(model.devices[i]);
     }
-    return buft;
-
+    return ggml_backend_split_buffer_type(bufts.data(), bufts.size());
 }
 
 int llama_model::device_count() const {
@@ -586,43 +614,15 @@ static size_t llama_get_device_memory(const llama_model & model, int device) {
     }
 #endif
 
-    // dispatch to the backend-specific memory query based on the registry device name
-    const char * name = device >= 0 && device < reg_count ? ggml_backend_reg_get_name(device) : nullptr;
-#if defined(GGML_USE_CUDA)
-    if (name && strncmp(name, "CUDA", 4) == 0) {
-        size_t total;
-        size_t free;
-        ggml_backend_cuda_get_device_memory(llama_device_raw_id(device), &free, &total);
-        return free;
+    // Query through the backend registry so this works for both statically-linked and
+    // dynamically-loaded (GGML_BACKEND_DL) backends.
+    size_t free = 0;
+    size_t total = 0;
+    if (device >= 0 && device < reg_count) {
+        ggml_backend_reg_get_device_memory(device, &free, &total);
     }
-#endif
-#if defined(GGML_USE_SYCL)
-    if (name && strncmp(name, "SYCL", 4) == 0) {
-        size_t total;
-        size_t free;
-        ggml_backend_sycl_get_device_memory(llama_device_raw_id(device), &free, &total);
-        return free;
-    }
-#endif
-#if defined(GGML_USE_VULKAN)
-    if (name && strncmp(name, "Vulkan", 6) == 0) {
-        size_t total;
-        size_t free;
-        ggml_backend_vk_get_device_memory(llama_device_raw_id(device), &free, &total);
-        return free;
-    }
-#endif
-#if defined(GGML_USE_CANN)
-    if (name && strncmp(name, "CANN", 4) == 0) {
-        size_t total;
-        size_t free;
-        ggml_backend_cann_get_device_memory(llama_device_raw_id(device), &free, &total);
-        return free;
-    }
-#endif
-    return 1;
+    return free > 0 ? free : 1;
     GGML_UNUSED(model);
-    GGML_UNUSED(device);
 }
 
 struct llama_context::Prev {
@@ -8468,11 +8468,6 @@ struct llama_context * llama_init_from_model(
         }
 #elif defined(GGML_USE_VULKAN)
         if (llama_selected_devices_use_backend(*model, "Vulkan")) {
-            if (model->split_mode == LLAMA_SPLIT_MODE_GRAPH || model->split_mode == LLAMA_SPLIT_MODE_ATTN) {
-                LLAMA_LOG_ERROR("%s: split mode 'graph' or 'attn' not supported. Failed to initialize Vulkan backend\n", __func__);
-                llama_free(ctx);
-                return nullptr;
-            }
             if (model->split_mode == LLAMA_SPLIT_MODE_NONE) {
                 ggml_backend_t backend = ggml_backend_vk_init(main_gpu_id);
                 if (backend == nullptr) {
@@ -8482,6 +8477,8 @@ struct llama_context * llama_init_from_model(
                 }
                 ggml_backend_add_from_device(ctx, backend);
             } else {
+                // LLAMA_SPLIT_MODE_LAYER/GRAPH/ATTN require a backend for each GPU.
+                // GRAPH/ATTN rely on the Vulkan split buffer type + host-staged REDUCE.
                 for (int device = 0; device < ggml_backend_vk_get_device_count(); ++device) {
                     ggml_backend_t backend = ggml_backend_vk_init(device);
                     if (backend == nullptr) {
