@@ -465,11 +465,7 @@ int main(int argc, char ** argv) {
     }
 
     // MoE: fused and separate weights, with and without bias, single and multi token
-    // (Q6_0 MUL_MAT_ID mat-mat is not wired yet, so skip it here)
     for (ggml_type type_a : types) {
-        if (type_a == GGML_TYPE_Q6_0) {
-            continue;
-        }
         for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_GELU }) {
             for (bool fused : { true, false }) {
                 for (bool bias : { false, true }) {
