@@ -1897,8 +1897,9 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
         if (device->prefer_host_memory) {
             buf = ggml_vk_create_buffer(device, size, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, vk::MemoryPropertyFlagBits::eDeviceLocal);
         } else if (device->uma) {
-            // Fall back to host memory type
-            buf = ggml_vk_create_buffer(device, size, vk::MemoryPropertyFlagBits::eDeviceLocal, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+            // UMA: prefer cached host-visible system memory so host reads/writes (e.g. the
+            // all-reduce) can memcpy directly instead of staging through the transfer queue.
+            buf = ggml_vk_create_buffer(device, size, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached, vk::MemoryPropertyFlagBits::eDeviceLocal);
         } else {
             // use rebar if available, otherwise fallback to device only visible memory
             buf = ggml_vk_create_buffer(device, size, vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent, vk::MemoryPropertyFlagBits::eDeviceLocal);
