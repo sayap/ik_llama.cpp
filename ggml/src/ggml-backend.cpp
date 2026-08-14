@@ -3218,6 +3218,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
+
+        // A REDUCE reads partials from every participating device; synchronize all
+        // backends so their compute is visible to the host-staged all-reduce. (Vulkan
+        // flushes lazily on tensor_get, but e.g. CUDA's get_tensor uses a per-thread
+        // stream and does not drain the backend compute stream.)
+        if (split->graph.n_nodes > 0 && split->graph.nodes[0]->op == GGML_OP_REDUCE) {
+            for (int b = 0; b < sched->n_backends; ++b) {
+                ggml_backend_synchronize(sched->backends[b]);
+            }
+        }
+
         auto ec = ggml_backend_sched_eval(sched, split_backend, split);
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
