@@ -190,11 +190,10 @@ arch list is the only thing forcing F32. Added `LLM_ARCH_QWEN3NEXT`,
 is now supported by `MUL_MAT` and `GET_ROWS`, using the same paths as the other
 legacy quants: native `mul_mat_vec` decode (`dequantize`/`dequantize4` in
 `dequant_funcs.comp`), cm2 inline dequant for coopmat2 prompt processing
-(`dequantFuncQ6_0`), and a flat `dequant_q6_0.comp` for the non-coopmat2 / MoE
-fallback. This lets Qwen3.6-27B IQK models (whose qkv/out projections are `Q6_0`)
-run those matmuls on Vulkan instead of falling back to the CPU. `MUL_MAT_ID`
-mat-mat for `Q6_0` is not wired yet (MoE models with `Q6_0` weights still fall
-back for those experts).
+(`dequantFuncQ6_0`), and a flat `dequant_q6_0.comp` for the non-coopmat2 fallback.
+`MUL_MAT_ID` (MoE experts) is wired too, for both the vec and mat-mat paths.
+This lets Qwen3.6-27B IQK models (whose qkv/out projections are `Q6_0`) run
+those matmuls on Vulkan instead of falling back to the CPU.
 
 ## Benchmarks (RTX 3090, Vulkan0)
 
