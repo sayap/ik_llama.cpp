@@ -349,6 +349,14 @@ Still not supported (their matmuls run on CPU), in priority order:
   not linked into the llama library), so `--fit` does not work in that configuration.
 - RPC servers are not part of the backend registry; they are appended after the registered
   backends in `model->devices`.
+- The backend now compiles even when `glslc` does not support `GL_EXT_integer_dot_product`
+  or `GL_NV_cooperative_matrix_decode_vector` (so `GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT` /
+  `GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT` are undefined). In that configuration
+  `ggml-vulkan.cpp` uses the non-`dot4` IQK/KT `mul_mat_vec` / `mul_mat_vec_id` /
+  flat-dequant shaders (the `_dot4` and Q8_1-activation paths are compiled out, and
+  `ggml_vk_strip_decode_vector()` becomes a no-op). This keeps the backend buildable with
+  older toolchains such as Ubuntu's `shaderc 2023.8` / `glslang 14.0.0`, at the cost of the
+  dot4 decode speedup on integer-dot-capable GPUs.
 
 ### Testing
 
