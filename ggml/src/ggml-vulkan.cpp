@@ -2986,6 +2986,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_MMV_Q8_1(GGML_TYPE_IQ5_KS, iq5_ks)
         CREATE_MMV_Q8_1(GGML_TYPE_IQ5_K, iq5_k)
         CREATE_MMV_Q8_1(GGML_TYPE_IQ6_K, iq6_k)
+        if (device->integer_dot_product) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[GGML_TYPE_Q6_0][i], "mul_mat_vec_q6_0_q8_1_"+std::to_string(i+1), mul_mat_vec_q6_0_q8_1_len, mul_mat_vec_q6_0_q8_1_data, "main", 3, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {device->subgroup_size, 2*rm_stdq, i+1}, 1, true);
+        }
 #undef CREATE_MMV_Q8_1
 #endif
     }
@@ -4494,6 +4497,7 @@ static bool ggml_vk_is_iqk_q8_1_type(ggml_type type) {
         case GGML_TYPE_IQ5_KS:
         case GGML_TYPE_IQ5_K:
         case GGML_TYPE_IQ6_K:
+        case GGML_TYPE_Q6_0:
             return true;
         default:
             return false;
@@ -4726,6 +4730,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_q8_1(ggml_backend_vk_conte
         case GGML_TYPE_IQ5_KS:
         case GGML_TYPE_IQ5_K:
         case GGML_TYPE_IQ6_K:
+        case GGML_TYPE_Q6_0:
             break;
         default:
             return nullptr;

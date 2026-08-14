@@ -200,8 +200,15 @@ initially a naive byte-addressed scalar shader; it is now uint32-load + f16vec4-
 (like the IQK/KT dequants), which cut the Q6_0 projection matmuls ~2× each.
 `MUL_MAT_ID` (MoE experts) is wired too, for both the vec and mat-mat paths. This
 lets Qwen3.6-27B IQK models (whose qkv/out projections are `Q6_0`) run those matmuls
-on Vulkan instead of falling back to the CPU. CUDA instead has a native int8 mmq for
-`Q6_0` (decode to int8 + INT8 tensor cores), which Vulkan does not yet do.
+on Vulkan instead of falling back to the CPU. The single-token decode (`mul_mat_vec`)
+path now has a native Q8_1-activation kernel (`mul_mat_vec_q6_0_q8_1.comp`) as well:
+CUDA's `vec_dot_q6_0_q8_1` is ported 1:1 (2 threads per 32-element block, each decoding
+16 elements to packed int8 with the -32 offset folded into the block-sum correction
+`sumi*d8 - 16*ds.y`), so the Q6_0 FFN/output projections quantize the F32 activations
+to Q8_1 and dot with `dotPacked4x8EXT` instead of the scalar FMA decode. This lifts
+decode ~5% on Qwen3.6-27B (the output projection reaches ~870 GB/s, near the 3090's
+memory peak). CUDA instead has a native int8 mmq for `Q6_0` (decode to int8 + INT8
+tensor cores), which Vulkan does not yet do.
 
 ### 10. Gated delta-net PP/TG performance and remaining gaps
 
@@ -210,8 +217,11 @@ RTX 3090, `llama-server` + tiny warmup prompt, 2870-token prompt / 128-token dec
 
 | | CUDA0 | Vulkan0 | gap |
 |---|---|---|---|
-| PP | ~1345 tok/s | ~1031 tok/s | ~1.30x |
-| TG | ~41.9 tok/s | ~30.2 tok/s | ~1.39x |
+| PP | ~1435 tok/s | ~1110 tok/s | ~1.29x |
+| TG | ~42.7 tok/s | ~31.8 tok/s | ~1.34x |
+
+(TG reflects the Q8_1-activation Q6_0 vec kernel; it was ~30.2 tok/s / ~1.41x
+before that. PP is unchanged — it goes through the dequant-to-F16 + F16 matmul path.)
 
 Per-op profiling of the Vulkan prompt path (per 512-token batch) shows the remaining
 cost is dominated by the quantized matmuls, not the recurrent ops:
@@ -230,8 +240,10 @@ Remaining gaps:
   section for the tuning analysis).
 - **`Q6_0` has no native int8 mmq on Vulkan** (CUDA decodes to int8 and uses INT8
   tensor cores); `coopmat_int_support` is detected but unused.
-- **Decode (`mul_mat_vec`) TG** (~1.39x) is FFN/output-projection bound; the
-  `Q6_0` vec path and the `IQ4_KS`/KT vec path are the likely levers.
+- **Decode (`mul_mat_vec`) TG** (~1.34x) is FFN/output-projection bound. The `Q6_0`
+  vec path is now a native Q8_1 + dot4 kernel (see "Q6_0 quant"); the remaining gap is
+  dominated by the `IQ4_KS` FFN (~51% of decode) whose Q8_1 table-decode kernel runs at
+  ~610-625 GB/s, below the ~870 GB/s the Q6_0 output projection reaches.
 
 ## Benchmarks (RTX 3090, Vulkan0)
 
