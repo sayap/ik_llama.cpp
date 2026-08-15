@@ -517,6 +517,18 @@ Still not supported (their matmuls run on CPU), in priority order:
   `tests/test-vk-p2p.cpp` exercises the underlying mechanisms and showed that NVIDIA does
   not support cross-device semaphore import (SYNC_FD is absent on Blackwell; OPAQUE_FD is
   same-device-only), so the DMA copies are host-fence ordered.
+- **Real device-to-device P2P on NVIDIA Vulkan is not exposed natively**, but it *is*
+  reachable through CUDA interop. A probe (export Vulkan `DEVICE_LOCAL` buffers via
+  `OPAQUE_FD`, `cuImportExternalMemory` + `cuExternalMemoryGetMappedBuffer`, then
+  `cuMemcpyPeer`) round-trips data between the two GPUs and measures **~44 GB/s in both
+  directions** (PCIe P2P). Device groups are *not* a route on this stack: NVIDIA reports
+  one physical device per `VK_KHR_device_group` group with no `VK_MEMORY_HEAP_MULTI_INSTANCE_BIT`
+  heaps, and `VK_EXT_external_memory_dma_buf` is absent. So a true P2P reduce would need to
+  (a) allocate the compute/tensor buffers with `VkExportMemoryAllocateInfo` (OPAQUE_FD),
+  (b) import each buffer's fd into CUDA once and cache the device pointer, and (c) replace
+  the cross-device leg of `GGML_OP_REDUCE` with `cuMemcpyPeer` + a local GPU add, ordered
+  by Vulkan fence waits (CUDA copies are synchronous). That is the most promising remaining
+  lever for closing the CUDA `-sm graph` gap.
 - No events and no async tensor copies yet; the scheduler's `is_async` parallel path is
   still disabled for Vulkan. `-sas` works (it falls back to `synchronize`), but adds only
   ~3% for an equal split and nothing for a lopsided split, because the deferred drain
