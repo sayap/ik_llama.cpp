@@ -10412,6 +10412,49 @@ static void vk_reduce_add(ggml_backend_vk_context * ctx, vk_buffer dst, uint64_t
     ggml_vk_queue_command_pools_cleanup(ctx->device);
 }
 
+// Async device<->host transfer submission for the host-staged -sm graph reduce. Each
+// submits the transfer on the device's transfer queue without waiting, so the two
+// participating devices move their partials in parallel. The device's persistent fence
+// is used (the same fence the synchronous buffer read/write path uses).
+static void ggml_vk_reduce_read_submit(vk_device& dev, vk_buffer src, size_t offset, void * dst, size_t size, std::vector<vk_staging_memcpy>& out_memcpys) {
+    ggml_vk_device_flush_pending_compute(dev);
+    std::lock_guard<std::recursive_mutex> guard(dev->mutex);
+
+    vk_context subctx = ggml_vk_create_temporary_context(dev->transfer_queue.cmd_pool);
+    ggml_vk_ctx_begin(dev, subctx);
+    ggml_vk_buffer_read_async(subctx, src, offset, dst, size, true);
+    ggml_vk_ctx_end(subctx);
+
+    ggml_vk_submit(subctx, dev->fence);
+    out_memcpys = std::move(subctx->out_memcpys);
+}
+
+static void ggml_vk_reduce_write_submit(vk_device& dev, vk_buffer dst, size_t offset, const void * src, size_t size) {
+    ggml_vk_device_flush_pending_compute(dev);
+    std::lock_guard<std::recursive_mutex> guard(dev->mutex);
+
+    vk_context subctx = ggml_vk_create_temporary_context(dev->transfer_queue.cmd_pool);
+    ggml_vk_ctx_begin(dev, subctx);
+    ggml_vk_buffer_write_async(subctx, dst, offset, src, size, true);
+    ggml_vk_ctx_end(subctx);
+
+    // Fill the staging buffer(s) before the copy commands are submitted.
+    for (auto& cpy : subctx->in_memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+
+    ggml_vk_submit(subctx, dev->fence);
+}
+
+static void ggml_vk_reduce_transfer_wait(vk_device& dev, std::vector<vk_staging_memcpy>& memcpys) {
+    dev->device.waitForFences(dev->fence, true, UINT64_MAX);
+    dev->device.resetFences(dev->fence);
+    for (auto& cpy : memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+    ggml_vk_queue_command_pools_cleanup(dev);
+}
+
 // Synchronous all-reduce for -sm graph. For two devices it first tries a shared-buffer
 // DMA path (external_memory_fd + vkCmdCopyBuffer + a GPU add); otherwise it falls back
 // to host staging. REDUCE always runs as its own scheduler split, so producers are
@@ -10449,10 +10492,13 @@ static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node)
         remote_src = src;
     }
 
-    // The shared-buffer path is opt-in: on UMA/mixed setups the host-staged path below
-    // already memcpy's through host-visible buffers, and the DMA+add has more fixed
-    // overhead. GGML_VK_P2P=1 selects the device-local shared-buffer (true P2P) path.
-    const bool want_p2p = getenv("GGML_VK_P2P") != nullptr;
+    // The shared-buffer path has more fixed overhead (several synchronous copies + a
+    // GPU add) but avoids the host memcpys/CPU add, so it wins for large tensors
+    // (prompt processing) while the host-staged path wins for small decode tensors.
+    // GGML_VK_P2P=1 force-enables it; by default it is auto-selected above a size
+    // threshold. The shared-buffer path still needs external_memory_fd on both devices.
+    const bool force_p2p = getenv("GGML_VK_P2P") != nullptr;
+    const bool want_p2p  = force_p2p || nbytes >= 1024 * 1024;
 
     if (want_p2p && !multi_remote && remote_src && remote_src->buffer && ggml_backend_buffer_is_vk(remote_src->buffer)) {
         ggml_backend_vk_buffer_context * rb_ctx = (ggml_backend_vk_buffer_context *) remote_src->buffer->context;
@@ -10502,7 +10548,59 @@ static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node)
         }
     }
 
-    // Fallback: host-staged reduce.
+    // Host-staged reduce. For two Vulkan devices, submit both reads in parallel, wait
+    // once, add on the CPU, then submit both writes in parallel — this replaces four
+    // serial device<->host round-trips with two.
+    const bool overlapped = nhave == 2 && !multi_remote && remote_src && node->buffer && remote_src->buffer &&
+                            ggml_backend_buffer_is_vk(node->buffer) && ggml_backend_buffer_is_vk(remote_src->buffer);
+
+    if (overlapped) {
+        ggml_backend_vk_buffer_context * lb_ctx = (ggml_backend_vk_buffer_context *) node->buffer->context;
+        ggml_backend_vk_buffer_context * rb_ctx = (ggml_backend_vk_buffer_context *) remote_src->buffer->context;
+        vk_device local_dev  = lb_ctx->device.lock();
+        vk_device remote_dev = rb_ctx->device.lock();
+
+        if (local_dev && remote_dev && local_dev != remote_dev) {
+            vk_buffer local_buf  = lb_ctx->dev_buffer;
+            uint64_t  local_off  = vk_tensor_offset(node) + node->view_offs;
+            vk_buffer remote_buf = rb_ctx->dev_buffer;
+            uint64_t  remote_off = vk_tensor_offset(remote_src) + remote_src->view_offs;
+
+            static thread_local std::vector<uint8_t> part0, part1, sum;
+            part0.resize(nbytes);
+            part1.resize(nbytes);
+            sum.resize(nbytes);
+
+            std::vector<vk_staging_memcpy> mc0, mc1;
+            ggml_vk_reduce_read_submit(remote_dev, remote_buf, remote_off, part0.data(), nbytes, mc0);
+            ggml_vk_reduce_read_submit(local_dev, local_buf, local_off, part1.data(), nbytes, mc1);
+
+            ggml_vk_reduce_transfer_wait(remote_dev, mc0);
+            ggml_vk_reduce_transfer_wait(local_dev, mc1);
+
+            if (node->type == GGML_TYPE_F32) {
+                const float * p0 = (const float *) part0.data();
+                const float * p1 = (const float *) part1.data();
+                float * ps = (float *) sum.data();
+                for (size_t i = 0; i < nelem; ++i) ps[i] = p0[i] + p1[i];
+            } else {
+                const ggml_fp16_t * p0 = (const ggml_fp16_t *) part0.data();
+                const ggml_fp16_t * p1 = (const ggml_fp16_t *) part1.data();
+                ggml_fp16_t * ps = (ggml_fp16_t *) sum.data();
+                for (size_t i = 0; i < nelem; ++i) ps[i] = ggml_fp32_to_fp16(ggml_fp16_to_fp32(p0[i]) + ggml_fp16_to_fp32(p1[i]));
+            }
+
+            ggml_vk_reduce_write_submit(local_dev, local_buf, local_off, sum.data(), nbytes);
+            ggml_vk_reduce_write_submit(remote_dev, remote_buf, remote_off, sum.data(), nbytes);
+
+            std::vector<vk_staging_memcpy> empty;
+            ggml_vk_reduce_transfer_wait(local_dev, empty);
+            ggml_vk_reduce_transfer_wait(remote_dev, empty);
+            return;
+        }
+    }
+
+    // General fallback (mixed backends or >2 devices).
     static thread_local std::vector<float> acc;
     static thread_local std::vector<uint8_t> tmp;
     acc.assign(nelem, 0.0f);
