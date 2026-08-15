@@ -2,22 +2,33 @@
 
 #include "dequant_head.comp"
 
+#extension GL_EXT_shader_16bit_storage : require
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) readonly buffer A {block_mxfp4 data_a[];};
-layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+layout (binding = 0) readonly buffer A { block_mxfp4 data_a[]; };
+layout (binding = 0) readonly buffer A32 { uint data_a32[]; };
+layout (binding = 1) writeonly buffer D4 { f16vec4 data_b4[]; };
 
-// OCP MXFP4 4-bit value table (e2m1 values, doubled), matching kvalues_mxfp4.
-const float mxfp4_values[16] = {
-    0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
-    0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f
-};
+// 32-bit load at an arbitrary byte offset (unaligned-safe). The MXFP4 block is
+// 17 bytes so the qs field is never 4-byte aligned.
+uint load_u32(uint byte_off) {
+    const uint w = data_a32[byte_off >> 2];
+    const uint sh = (byte_off & 3u) * 8u;
+    if (sh == 0u) {
+        return w;
+    }
+    return (w >> sh) | (data_a32[(byte_off >> 2) + 1u] << (32u - sh));
+}
 
+// MXFP4 scale: 2^(e-128) for e >= 2, 2^-128 for e == 0 and 2^-127 for e == 1.
 float mxfp4_scale(uint e) {
     return uintBitsToFloat(e >= 2u ? ((e - 1u) << 23u) : (e == 0u ? 0x00200000u : 0x00400000u));
 }
 
 void main() {
+    init_iq_shmem(gl_WorkGroupSize);
+
     const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
 
     const uint tid = gl_LocalInvocationID.x % 64;
@@ -28,14 +39,39 @@ void main() {
         return;
     }
 
-    const uint q_idx = 8 * il;
-    const uint b_idx = 1024 * i + 32 * ir + q_idx;
+    const uint b_idx = 1024 * i + 32 * ir + 8 * il;
 
     const float d = mxfp4_scale(uint(data_a[ib].e));
 
-    [[unroll]] for (uint l = 0; l < 8; ++l) {
-        const uint qs = uint(data_a[ib].qs[q_idx + l]);
-        data_b[b_idx + l +  0] = D_TYPE(d * mxfp4_values[qs & 0xF]);
-        data_b[b_idx + l + 16] = D_TYPE(d * mxfp4_values[qs >> 4]);
-    }
+    const uint block_byte = ib * 17u + 1u + 8u * il;
+    const uint w0 = load_u32(block_byte);
+    const uint w1 = load_u32(block_byte + 4u);
+
+    // Low nibbles of the 8 bytes are elements [8*il, 8*il+8); high nibbles are
+    // elements [16+8*il, 16+8*il+8) (the Q4_0 layout).
+    const vec4 lo0f = vec4(
+        d * kvalues_mxfp4[w0 & 0xFu],
+        d * kvalues_mxfp4[(w0 >> 8) & 0xFu],
+        d * kvalues_mxfp4[(w0 >> 16) & 0xFu],
+        d * kvalues_mxfp4[(w0 >> 24) & 0xFu]);
+    const vec4 hi0f = vec4(
+        d * kvalues_mxfp4[(w0 >> 4) & 0xFu],
+        d * kvalues_mxfp4[(w0 >> 12) & 0xFu],
+        d * kvalues_mxfp4[(w0 >> 20) & 0xFu],
+        d * kvalues_mxfp4[(w0 >> 28) & 0xFu]);
+    const vec4 lo1f = vec4(
+        d * kvalues_mxfp4[w1 & 0xFu],
+        d * kvalues_mxfp4[(w1 >> 8) & 0xFu],
+        d * kvalues_mxfp4[(w1 >> 16) & 0xFu],
+        d * kvalues_mxfp4[(w1 >> 24) & 0xFu]);
+    const vec4 hi1f = vec4(
+        d * kvalues_mxfp4[(w1 >> 4) & 0xFu],
+        d * kvalues_mxfp4[(w1 >> 12) & 0xFu],
+        d * kvalues_mxfp4[(w1 >> 20) & 0xFu],
+        d * kvalues_mxfp4[(w1 >> 28) & 0xFu]);
+
+    data_b4[(b_idx)      >> 2] = f16vec4(lo0f);
+    data_b4[(b_idx + 4)  >> 2] = f16vec4(lo1f);
+    data_b4[(b_idx + 16) >> 2] = f16vec4(hi0f);
+    data_b4[(b_idx + 20) >> 2] = f16vec4(hi1f);
 }
