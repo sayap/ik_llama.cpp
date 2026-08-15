@@ -338,6 +338,7 @@ int main(int argc, char ** argv) {
 
     const ggml_type types[] = {
         GGML_TYPE_Q6_0,
+        GGML_TYPE_MXFP4,
         GGML_TYPE_IQ2_K, GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_K, GGML_TYPE_IQ5_K, GGML_TYPE_IQ6_K,
         GGML_TYPE_IQ2_KS, GGML_TYPE_IQ3_KS, GGML_TYPE_IQ4_KS, GGML_TYPE_IQ4_KSS, GGML_TYPE_IQ5_KS,
         GGML_TYPE_IQ2_KL,

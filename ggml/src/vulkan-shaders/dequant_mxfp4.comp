@@ -1,0 +1,41 @@
+#version 450
+
+#include "dequant_head.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_mxfp4 data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+// OCP MXFP4 4-bit value table (e2m1 values, doubled), matching kvalues_mxfp4.
+const float mxfp4_values[16] = {
+    0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
+    0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f
+};
+
+float mxfp4_scale(uint e) {
+    return uintBitsToFloat(e >= 2u ? ((e - 1u) << 23u) : (e == 0u ? 0x00200000u : 0x00400000u));
+}
+
+void main() {
+    const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
+
+    const uint tid = gl_LocalInvocationID.x % 64;
+    const uint il  = tid / 32;
+    const uint ir  = tid % 32;
+    const uint ib  = 32 * i + ir;
+    if (ib >= p.nel / 32) {
+        return;
+    }
+
+    const uint q_idx = 8 * il;
+    const uint b_idx = 1024 * i + 32 * ir + q_idx;
+
+    const float d = mxfp4_scale(uint(data_a[ib].e));
+
+    [[unroll]] for (uint l = 0; l < 8; ++l) {
+        const uint qs = uint(data_a[ib].qs[q_idx + l]);
+        data_b[b_idx + l +  0] = D_TYPE(d * mxfp4_values[qs & 0xF]);
+        data_b[b_idx + l + 16] = D_TYPE(d * mxfp4_values[qs >> 4]);
+    }
+}
