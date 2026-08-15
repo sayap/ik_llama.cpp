@@ -24,6 +24,7 @@
 #include <mutex>
 #include <future>
 #include <thread>
+#include <unistd.h>
 
 #if defined(_MSC_VER)
 # define NOMINMAX 1
@@ -520,6 +521,7 @@ struct vk_device_struct {
     // ============================== ik_llama.cpp pipelines begin ========================================
 
     vk_pipeline pipeline_fused_rms_norm_f32;
+    vk_pipeline pipeline_fused_rms_norm_f16;
     vk_pipeline pipeline_fused_mul_gelu[2];
     vk_pipeline pipeline_fused_mul_silu[2];
     vk_pipeline pipeline_fused_mul_relu[2];
@@ -3413,6 +3415,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
     // ================================ ik_llama.cpp pipelines begin =========================================
     //
     ggml_vk_create_pipeline(device, device->pipeline_fused_rms_norm_f32, "fused_rms_norm_f32", fused_rms_norm_f32_len, fused_rms_norm_f32_data,
+            "main", 3, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_rms_norm_f16, "fused_rms_norm_f16", fused_rms_norm_f16_len, fused_rms_norm_f16_data,
             "main", 3, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_fused_mul_silu[0], "fused_mul_silu_f32", fused_mul_silu_f32_len, fused_mul_silu_f32_data,
@@ -7575,8 +7579,13 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     //    }
     //    return nullptr;
     case GGML_OP_FUSED_RMS_NORM:
-        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_fused_rms_norm_f32;
+        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            if (src0->type == GGML_TYPE_F32) {
+                return ctx->device->pipeline_fused_rms_norm_f32;
+            }
+            if (src0->type == GGML_TYPE_F16) {
+                return ctx->device->pipeline_fused_rms_norm_f16;
+            }
         }
         return nullptr;
     case GGML_OP_FUSED_MUL_UNARY:
@@ -10220,6 +10229,7 @@ struct vk_reduce_pair {
     bool device_local = false;
     vk_device dev[2];
     vk_buffer shared[2];   // shared buffer view on each device
+    vk_buffer staging[2];  // per-device device-local staging buffer
 };
 
 static std::map<uint64_t, vk_reduce_pair> g_reduce_pairs;
@@ -10264,6 +10274,14 @@ static bool vk_reduce_pair_init(vk_reduce_pair& rp, vk_device dev0, vk_device de
         return false;
     }
 
+    // OPAQUE_FD is same-device-only: importing device-local memory exported through it
+    // on a second device silently yields a non-shared allocation (VUID-00644), so the
+    // cross-device shared buffer must be host-visible on NVIDIA. Device-local sharing
+    // only has a chance with DMA_BUF (mesa) and is kept for that path.
+    if (ht == vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd) {
+        device_local = false;
+    }
+
     vk::MemoryPropertyFlags mem_flags = device_local
         ? vk::MemoryPropertyFlagBits::eDeviceLocal
         : (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
@@ -10297,6 +10315,7 @@ static bool vk_reduce_pair_init(vk_reduce_pair& rp, vk_device dev0, vk_device de
         vk::ImportMemoryFdInfoKHR imfi{ht, fd, &ded1};
         vk::DeviceMemory mem1 = dev1->device.allocateMemory(vk::MemoryAllocateInfo{req1.size, mt1, &imfi});
         dev1->device.bindBufferMemory(b1, mem1, 0);
+        close(fd);
 
         rp.shared[0] = std::make_shared<vk_buffer_struct>();
         rp.shared[0]->buffer = b0;
@@ -10311,6 +10330,15 @@ static bool vk_reduce_pair_init(vk_reduce_pair& rp, vk_device dev0, vk_device de
         rp.shared[1]->memory_property_flags = mem_flags;
         rp.shared[1]->size = size;
         rp.shared[1]->device = dev1;
+
+        // Per-device staging buffers. The shared buffer is moved between devices with
+        // vkCmdCopyBuffer (whose cross-device visibility is reliable on this hardware),
+        // and the GPU ADD then only touches two device-local buffers on the same device.
+        rp.staging[0] = ggml_vk_create_buffer_check(dev0, size, vk::MemoryPropertyFlagBits::eDeviceLocal);
+        rp.staging[1] = ggml_vk_create_buffer_check(dev1, size, vk::MemoryPropertyFlagBits::eDeviceLocal);
+        if (!rp.staging[0] || !rp.staging[1]) {
+            return false;
+        }
 
         rp.valid = true;
         return true;
@@ -10356,8 +10384,23 @@ static void vk_reduce_add(ggml_backend_vk_context * ctx, vk_buffer dst, uint64_t
     subctx->s->buffer.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(pc), &pc);
     subctx->s->buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
     subctx->s->buffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline->layout, 0, { ds }, {});
-    uint32_t wg0 = CEIL_DIV((uint32_t) nelem, pipeline->wg_denoms[0]);
-    subctx->s->buffer.dispatch(wg0, 1, 1);
+
+    // The ADD shader covers 512 elements per workgroup (256 threads x 2 iterations) and
+    // indexes them as gl_GlobalInvocationID.y * 512 + x (+256). Dispatch it like the
+    // regular binary-op path: one 512-wide X group, and CEIL_DIV(nelem, 512) Y groups.
+    uint32_t ne = (uint32_t) nelem;
+    std::array<uint32_t, 3> elements;
+    if (ne > 262144) {
+        elements = { 512, 512, CEIL_DIV(ne, 262144) };
+    } else if (ne > 512) {
+        elements = { 512, CEIL_DIV(ne, 512), 1 };
+    } else {
+        elements = { ne, 1, 1 };
+    }
+    uint32_t wg0 = CEIL_DIV(elements[0], pipeline->wg_denoms[0]);
+    uint32_t wg1 = CEIL_DIV(elements[1], pipeline->wg_denoms[1]);
+    uint32_t wg2 = CEIL_DIV(elements[2], pipeline->wg_denoms[2]);
+    subctx->s->buffer.dispatch(wg0, wg1, wg2);
 
     ggml_vk_ctx_end(subctx);
 
@@ -10444,9 +10487,14 @@ static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node)
                 vk_buffer remote_buf = rb_ctx->dev_buffer;
                 uint64_t  remote_off = vk_tensor_offset(remote_src) + remote_src->view_offs;
 
-                // remote -> shared, local += shared, local -> shared, shared -> remote
+                // remote -> shared (remote device copy), shared -> local staging
+                // (local device copy; vkCmdCopyBuffer observes the remote write), then a
+                // GPU add between two local buffers, then broadcast the sum back through
+                // the shared buffer. The compute add never touches the imported buffer,
+                // whose cross-device storage-buffer coherence is not reliable on NVIDIA.
                 ggml_vk_buffer_copy(rp.shared[remote_slot], 0, remote_buf, remote_off, nbytes);
-                vk_reduce_add(ctx, local_buf, local_off, rp.shared[local_slot], 0, nelem, node->type);
+                ggml_vk_buffer_copy(rp.staging[local_slot], 0, rp.shared[local_slot], 0, nbytes);
+                vk_reduce_add(ctx, local_buf, local_off, rp.staging[local_slot], 0, nelem, node->type);
                 ggml_vk_buffer_copy(rp.shared[local_slot], 0, local_buf, local_off, nbytes);
                 ggml_vk_buffer_copy(remote_buf, remote_off, rp.shared[remote_slot], 0, nbytes);
                 return;
@@ -10609,10 +10657,19 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         return false;
     }
 
-    // REDUCE is a cross-device host-side all-reduce and has no GPU pipeline; it runs
-    // synchronously in the real pass (the scheduler guarantees the producers are done).
+    // REDUCE is a cross-device all-reduce. The host-staged path has no GPU pipeline,
+    // but the optional shared-buffer path (GGML_VK_P2P=1) dispatches a manual ADD, so
+    // request that pipeline during the dryrun or it may never be compiled (the manual
+    // dispatch does not go through ggml_vk_op_f32).
     if (node->op == GGML_OP_REDUCE) {
-        if (!dryrun) {
+        if (dryrun) {
+            vk_pipeline reduce_add = node->type == GGML_TYPE_F16
+                ? ctx->device->pipeline_add[1][1][1]
+                : ctx->device->pipeline_add[0][0][0];
+            if (reduce_add) {
+                ggml_pipeline_request_descriptor_sets(ctx, reduce_add, 1);
+            }
+        } else {
             ggml_vk_op_reduce(ctx, node);
         }
         return false;
@@ -10681,6 +10738,14 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                 // These operations all go through ggml_vk_op_f32, so short-circuit and
                 // do the only thing needed for the dryrun.
                 vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, src0, src1, src2, node, node->op);
+                if (!pipeline) {
+                    fprintf(stderr, "ggml_vulkan: null pipeline for op %s (src0=%s, src1=%s, dst=%s)\n",
+                            ggml_op_name(node->op),
+                            src0 ? ggml_type_name(src0->type) : "-",
+                            src1 ? ggml_type_name(src1->type) : "-",
+                            ggml_type_name(node->type));
+                    GGML_ABORT("fatal error");
+                }
                 ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
                 return false;
             }
@@ -11484,6 +11549,11 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
 
     ggml_vk_cleanup(ctx);
 
+    // Destroy any shared-buffer reduce pairs while the Vulkan devices are still alive.
+    // They live in a static map, so leaving them until static destruction would free the
+    // imported/exported memory after the device has been torn down.
+    g_reduce_pairs.clear();
+
     delete ctx;
     delete backend;
 }
@@ -12267,9 +12337,12 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
-        case GGML_OP_RMS_NORM:
-        case GGML_OP_FUSED_RMS_NORM:
             return true;
+        case GGML_OP_RMS_NORM:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_FUSED_RMS_NORM:
+            return op->src[1] != nullptr && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
         case GGML_OP_NORM:
         case GGML_OP_GROUP_NORM:
             return ggml_is_contiguous(op->src[0]);

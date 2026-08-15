@@ -750,6 +750,7 @@ void process_shaders() {
     // ============================== ik_llama.cpp
     //
     string_to_spv("fused_rms_norm_f32", "fused_rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("fused_rms_norm_f16", "fused_rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
 
     string_to_spv("fused_mul_gelu_f16",   "fused_mul_gelu.comp",   {{"A_TYPE", "float16_t"},   {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
     string_to_spv("fused_mul_gelu_f32",   "fused_mul_gelu.comp",   {{"A_TYPE", "float"},       {"B_TYPE", "float"},     {"D_TYPE", "float"}});

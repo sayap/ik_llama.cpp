@@ -7761,7 +7761,10 @@ size_t llama_max_devices(void) {
 #elif defined(GGML_USE_CANN)
     return GGML_CANN_MAX_DEVICES;
 #else
-    return 1;
+    // Dynamic-backend builds load CUDA/Vulkan/etc. at runtime; the registry is not
+    // available at argument-parse time, so report the same generous maximum as the
+    // static backends (upstream returns 16 unconditionally).
+    return 16;
 #endif
 }
 
