@@ -51,6 +51,7 @@ const std::vector<std::string> type_names = {
     "q5_1",
     "q6_0",
     "q8_0",
+    "mxfp4",
     "q2_k",
     "q3_k",
     "q4_k",
@@ -388,6 +389,11 @@ void matmul_shaders(bool fp16, bool matmul_id, bool coopmat, bool coopmat2, bool
         if (tname == "bf16") {
             continue;
         }
+        // MXFP4 has no native matmul shaders: the mat-mat path uses the
+        // dequant-to-F16 fallback (see the IQK/KT handling and docs/Vulkan.md).
+        if (tname == "mxfp4") {
+            continue;
+        }
 
         std::string data_a_key = "DATA_A_" + to_uppercase(tname);
         // For unaligned, load one at a time for f32/f16, or two at a time for quants
@@ -475,6 +481,8 @@ void process_shaders() {
                 continue;
             }
             if (tname == "bf16") continue;
+            // MXFP4 has no flash-attention dequant shader.
+            if (tname == "mxfp4") continue;
 
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
             if (tname == "f16") {

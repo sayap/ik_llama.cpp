@@ -453,6 +453,17 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_MXFP4)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
+    return vec2(kvalues_mxfp4[vui & 0xF], kvalues_mxfp4[vui >> 4]);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const uint vui = uint(data_a[a_offset + ib].qs[iqs]) | (uint(data_a[a_offset + ib].qs[iqs + 1]) << 8);
+    return vec4(kvalues_mxfp4[vui & 0xF], kvalues_mxfp4[(vui >> 4) & 0xF], kvalues_mxfp4[(vui >> 8) & 0xF], kvalues_mxfp4[vui >> 12]);
+}
+#endif
+
 #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(0, 0);
@@ -477,5 +488,16 @@ vec2 get_dm(uint ib, uint a_offset) {
 #if defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), float(data_a[a_offset + ib].m));
+}
+#endif
+
+#if defined(DATA_A_MXFP4)
+// MXFP4 has a single shared E8M0 exponent per 32-element block. The scale is a
+// power of two: 2^(e-128) for e >= 2, 2^-128 for e == 0 and 2^-127 for e == 1
+// (mirrors ggml_e8m0_to_fp32_half).
+vec2 get_dm(uint ib, uint a_offset) {
+    const uint e = uint(data_a[a_offset + ib].e);
+    const float d = uintBitsToFloat(e >= 2u ? ((e - 1u) << 23u) : (e == 0u ? 0x00200000u : 0x00400000u));
+    return vec2(d, 0);
 }
 #endif

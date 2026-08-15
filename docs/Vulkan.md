@@ -17,8 +17,10 @@ ik_llama.cpp, what has been fixed, how to get good performance, and what is stil
   supported** by the Vulkan backend (see "What we fixed"): single-token decode runs a native
   `mul_mat_vec` kernel per type and prompt processing runs a flat-dequant-to-F16 + tensor-core
   matmul (the dequant kernels are vectorized and the quantized weights are read once; see
-  "vs CUDA" for the measured result). The `*_R4` repack variants and `MXFP4`,
-  `IQ1_BN`, `IQ2_BN` are still not supported and fall back to the CPU backend.
+  "vs CUDA" for the measured result). `MXFP4` is now supported too (native
+  `mul_mat_vec` / `MUL_MAT_ID` / `GET_ROWS` plus the flat-dequant-to-F16 prompt path; see
+  "MXFP4" below). The `*_R4` repack variants and `IQ1_BN`, `IQ2_BN` are still not
+  supported and fall back to the CPU backend.
 
 ## What we fixed
 
@@ -210,6 +212,30 @@ decode ~5% on Qwen3.6-27B (the output projection reaches ~870 GB/s, near the 309
 memory peak). CUDA instead has a native int8 mmq for `Q6_0` (decode to int8 + INT8
 tensor cores), which Vulkan does not yet do.
 
+### 9b. MXFP4 quant
+
+`MXFP4` (OCP microscaling 4-bit: 32 4-bit e2m1 values per block plus one shared E8M0
+scale exponent, 17-byte blocks) is now supported by `MUL_MAT`, `MUL_MAT_ID` and
+`GET_ROWS`. It is treated like the other 32-element-block legacy quants:
+
+- **decode (`mul_mat_vec`)**: the generic `mul_mat_vec.comp` with a `DATA_A_MXFP4`
+  `dequantize`/`dequantize4`/`get_dm` (`dequant_funcs.comp`). The 16-entry value table
+  is kept in shared memory, and `get_dm` reconstructs the power-of-two scale from the
+  E8M0 byte, mirroring `ggml_e8m0_to_fp32_half`.
+- **prompt (`mul_mat`)**: the flat `dequant_mxfp4.comp` shader feeds the F16 matmul.
+  There is no native mmq/cm2 matmul for MXFP4; the cm2 inline-dequant path is skipped
+  and `ggml_vk_get_mul_mat_mat_pipeline` falls back to dequant+F16 (the same structure
+  the IQK/KT families use on coopmat2).
+- **`MUL_MAT_ID`**: the mat-mat-id path uses the dequant-to-F16 fallback and the vec
+  path uses a native `mul_mat_vec_id_mxfp4` shader.
+- **`GET_ROWS`**: the generic `get_rows_quant.comp` with the MXFP4 dequant.
+
+`supports_op` accepts MXFP4 for `MUL_MAT`, `MUL_MAT_ID`, `GET_ROWS` and
+`FUSED_UP_GATE`/`MOE_FUSED_UP_GATE`. Correctness is covered by
+`tests/test-iqk-quants.cpp` (MXFP4 added to the type list); all cases pass on
+`Vulkan0` and `Vulkan1`. A Qwen2.5-Coder-32B MXFP4 model runs end-to-end on
+`Vulkan0` (~29 tok/s decode, ~324 tok/s prompt at 300 tokens), fully offloaded.
+
 ### 10. Gated delta-net PP/TG performance and remaining gaps
 
 Qwen3.6-27B-IQK (17 GB; qkv/gate/ssm_out/attn projections are `Q6_0`, FFN is `IQ4_KS`),
@@ -368,7 +394,7 @@ record PP tok/s and TG tok/s for both.
 
 ### Priority (highest first)
 
-1. **`MXFP4`** — the micro-scaling 4-bit format.
+1. **`MXFP4`** — the micro-scaling 4-bit format (now supported, see "MXFP4 quant").
 3. **Indexer / DSA / CSA / HCA / GLM-DSA**: `INDEXER_TOPK`, `MASK_TOPK`, `MASK_TO_IDX`,
    `SINKHORN`, `HC_PRE`, `HC_POST`, `LATENT_ATTN`, `DS4_COMP`. Stateful sparse-attention
    ops (DeepSeek2/4, OpenPangu, GLM-DSA). MLA-only arches are not gated on these.
@@ -423,17 +449,17 @@ To close the remaining gaps, implement the missing ops as Vulkan kernels and ext
 
 ### Quant type coverage
 
-The Vulkan `MUL_MAT` supports `F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K,
-Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL` plus
-the full **IQK/K-family** (`IQ2_K, IQ3_K, IQ4_K, IQ5_K, IQ6_K, IQ2_KS, IQ3_KS, IQ4_KS, IQ4_KSS,
-IQ5_KS, IQ2_KL`) and **KT-family** (`IQ1_KT, IQ2_KT, IQ3_KT, IQ4_KT`). The decode path uses
+The Vulkan `MUL_MAT` supports `F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q6_0, Q8_0, MXFP4,
+Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
+IQ4_NL` plus the full **IQK/K-family** (`IQ2_K, IQ3_K, IQ4_K, IQ5_K, IQ6_K, IQ2_KS, IQ3_KS,
+IQ4_KS, IQ4_KSS, IQ5_KS, IQ2_KL`) and **KT-family** (`IQ1_KT, IQ2_KT, IQ3_KT, IQ4_KT`). The
+decode path uses
 native per-type `mul_mat_vec` kernels; prompt processing uses the flat dequant-to-F16 +
 tensor-core matmul (the cm2 per-element inline dequant, scalar or V=4, turned out slower and
 is no longer used for these types).
 
 Still not supported (their matmuls run on CPU), in priority order:
 
-- `MXFP4` (the highest-value missing quant).
 - `IQ1_BN`, `IQ2_BN`, and the `*_R4` repacks (`IQ2_K_R4`, `IQ3_K_R4`, `IQ4_K_R4`,
   `IQ5_K_R4`, `IQ4_KS_R4`, `IQ5_KS_R4`, `IQ1_S_R4`, `IQ1_M_R4`).
 
