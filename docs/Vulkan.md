@@ -320,6 +320,30 @@ minimum-one-chunk guarantee per participating device, so the default memory spli
 lopsided `-ts` ratios both work. Still pending: the CUDA foreign-buffer REDUCE fallback
 for mixed CUDA+Vulkan runs and the MLA `-sm attn` `split_dim=2` path.
 
+Re-validated end-to-end on two NVIDIA RTX PRO 4000 Blackwell GPUs (`Vulkan0,Vulkan1`,
+`-sm graph`, Qwen3.6-27B-IQK): default split, `-smf32`, `-ts 8,1` and `GGML_VK_P2P=1` all
+run and produce coherent output (the default f16-reduce and the P2P path are bit-identical
+on a 32-token decode). Three additional bugs were found and fixed along the way:
+
+- **`llama_max_devices()` returned 1 in `GGML_BACKEND_DL` builds** (no `GGML_USE_*` macro
+  is defined), so `-ts 8,1` was rejected as "invalid parameter". It now returns 16, matching
+  upstream, which also fixes `llama-bench`'s tensor-split handling in DL builds.
+- **`FUSED_RMS_NORM` had no f16 source pipeline**, but with `-sm graph` the default f16
+  reduce feeds f16 activations into the next layer's fused RMS norm, so the default
+  (`-smf16`) split crashed on prompt processing with a null pipeline. A `fused_rms_norm_f16`
+  shader variant is now generated (`A_TYPE=f16`, f32 weight/dst), and `supports_op`/pipeline
+  selection accept the f16-source form. `RMS_NORM`/`FUSED_RMS_NORM` `supports_op` now match
+  the actually-supported type combinations instead of returning `true` unconditionally.
+- **The opt-in `GGML_VK_P2P=1` shared-buffer reduce was broken on NVIDIA in three ways**: the
+  manual ADD dispatch used the wrong workgroup layout (only the first ~half of each tensor was
+  reduced, with overlapping workgroups), the device-local `OPAQUE_FD` import silently produced
+  a non-shared allocation (so the shared buffer is now host-visible on NVIDIA), and the
+  cross-device storage-buffer read was not coherent (the remote partial is now first copied
+  into a per-device device-local staging buffer with `vkCmdCopyBuffer`, and the ADD only touches
+  two local buffers). The import fd is now closed, the reduce-add pipeline is requested during
+  the dryrun so it is actually compiled, and the static reduce-pair map is cleared in
+  `ggml_backend_vk_free` so the imported/exported memory is not freed after device teardown.
+
 ## Benchmarks (RTX 3090, Vulkan0)
 
 Qwen2.5-Coder-0.5B-Instruct-Q8_0 (dense, `-c 2048`, single token batch):
@@ -481,15 +505,18 @@ Still not supported (their matmuls run on CPU), in priority order:
   instead of staging through the transfer queue (the iGPU get+set pair dropped from ~42 us
   to ~0.15 us). This lifts `-sm graph` decode further to ~24.5 tok/s (`-ts 8,1`),
   ~17.0 tok/s (`-ts 1,1`) and ~12.4 tok/s (default split).
-- An opt-in **shared-buffer DMA reduce** (`GGML_VK_P2P=1`) is wired: it shares a
-  `DEVICE_LOCAL` buffer via `external_memory_fd` (OPAQUE_FD on NVIDIA, DMA_BUF on mesa)
-  and reduces with `vkCmdCopyBuffer` + a GPU add. It is off by default because (a) the
-  host-staged reduce is already near-optimal for UMA devices, and (b) device-local
-  cross-device import is a spec violation and crashes RADV/mesa without
-  `CONFIG_DMABUF_MOVE_NOTIFY`; it is intended for same-vendor NVIDIA-only setups. The
-  diagnostic `tests/test-vk-p2p.cpp` exercises the underlying mechanisms and showed that
-  NVIDIA does not support cross-device semaphore import (SYNC_FD is absent on Blackwell;
-  OPAQUE_FD is same-device-only), so the DMA copies are host-fence ordered.
+- An opt-in **shared-buffer DMA reduce** (`GGML_VK_P2P=1`) is wired: it shares a buffer
+  via `external_memory_fd` (host-visible on NVIDIA/OPAQUE_FD, where device-local import is
+  same-device-only; `DEVICE_LOCAL` + DMA_BUF is kept for mesa) and reduces with
+  `vkCmdCopyBuffer` + a GPU add. The remote partial is first copied into a per-device
+  device-local staging buffer (also with `vkCmdCopyBuffer`), so the GPU add only ever touches
+  two local buffers — cross-device storage-buffer coherence is not reliable on NVIDIA. It is
+  off by default because the host-staged reduce is already near-optimal for UMA devices and
+  the extra copies add fixed overhead; on two NVIDIA Blackwell GPUs it is numerically
+  identical to the host-staged path on a 32-token decode. The diagnostic
+  `tests/test-vk-p2p.cpp` exercises the underlying mechanisms and showed that NVIDIA does
+  not support cross-device semaphore import (SYNC_FD is absent on Blackwell; OPAQUE_FD is
+  same-device-only), so the DMA copies are host-fence ordered.
 - No events and no async tensor copies yet; the scheduler's `is_async` parallel path is
   still disabled for Vulkan. `-sas` works (it falls back to `synchronize`), but adds only
   ~3% for an equal split and nothing for a lopsided split, because the deferred drain
