@@ -1130,6 +1130,12 @@ struct ggml_backend_vk_context {
     uint32_t descriptor_set_idx {};
     uint32_t pipeline_descriptor_set_requirements {};
 
+    // dryrun results cached for a reused cgraph (llama graph_reuse)
+    ggml_cgraph * cached_cgraph = nullptr;
+    int cached_n_nodes = 0;
+    uint32_t cached_descriptor_set_requirements = 0;
+    uint64_t cached_total_mat_mul_bytes = 0;
+
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
 
@@ -11832,17 +11838,29 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     uint64_t total_mat_mul_bytes = 0;
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        if (!ctx->device->disable_fusion && ggml_vk_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
-            ctx->num_additional_fused_ops = 1;
+    if (ctx->cached_cgraph == cgraph && ctx->cached_n_nodes == cgraph->n_nodes) {
+        // The graph is reused across decode steps (llama graph_reuse); the dryrun
+        // results are identical, so restore the cached descriptor-set count and
+        // matmul-byte estimate instead of re-walking every node.
+        ctx->pipeline_descriptor_set_requirements = ctx->cached_descriptor_set_requirements;
+        total_mat_mul_bytes = ctx->cached_total_mat_mul_bytes;
+    } else {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (!ctx->device->disable_fusion && ggml_vk_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+                ctx->num_additional_fused_ops = 1;
+            }
+            ggml_vk_build_graph(ctx, cgraph, i, nullptr, 0, true, false, false, false);
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT || cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID ||
+                cgraph->nodes[i]->op == GGML_OP_FUSED_UP_GATE || cgraph->nodes[i]->op == GGML_OP_MOE_FUSED_UP_GATE) {
+                total_mat_mul_bytes += ggml_nbytes(cgraph->nodes[i]->src[0]);
+            }
+            i += ctx->num_additional_fused_ops;
+            ctx->num_additional_fused_ops = 0;
         }
-        ggml_vk_build_graph(ctx, cgraph, i, nullptr, 0, true, false, false, false);
-        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT || cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID ||
-            cgraph->nodes[i]->op == GGML_OP_FUSED_UP_GATE || cgraph->nodes[i]->op == GGML_OP_MOE_FUSED_UP_GATE) {
-            total_mat_mul_bytes += ggml_nbytes(cgraph->nodes[i]->src[0]);
-        }
-        i += ctx->num_additional_fused_ops;
-        ctx->num_additional_fused_ops = 0;
+        ctx->cached_cgraph = cgraph;
+        ctx->cached_n_nodes = cgraph->n_nodes;
+        ctx->cached_descriptor_set_requirements = ctx->pipeline_descriptor_set_requirements;
+        ctx->cached_total_mat_mul_bytes = total_mat_mul_bytes;
     }
     if (ctx->device->need_compiles) {
         ggml_vk_load_shaders(ctx->device);
