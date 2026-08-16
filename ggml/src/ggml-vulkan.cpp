@@ -10778,6 +10778,7 @@ static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node)
                 g_cuda.cuCtxSetCurrent(local_ctx);
                 CUresult r = g_cuda.cuMemcpyPeer(staging_base, local_ctx, remote_base + remote_off, remote_ctx, nbytes);
                 if (r == CUDA_SUCCESS) {
+                    g_cuda.cuCtxSynchronize();
                     vk_reduce_add(ctx, local_buf, local_off, staging, 0, nelem, node->type);
 
                     g_cuda.cuCtxSetCurrent(remote_ctx);
