@@ -120,6 +120,26 @@ float16_t dequantFuncQ8_0(const in decodeBufQ8_0 bl, const in uint blockCoords[2
     return ret;
 }
 
+// MXFP4 (OCP microscaling 4-bit): 32 4-bit values + one shared E8M0 scale
+// exponent per 17-byte block. The block is byte-addressed (17 is not a power
+// of two), so the buffer reference uses align 1 and reads the nibble directly.
+#if defined(DATA_A_MXFP4)
+layout(buffer_reference, std430, buffer_reference_align = 1) buffer decodeBufMXFP4 {
+   block_mxfp4 block;
+};
+
+float16_t dequantFuncMXFP4(const in decodeBufMXFP4 bl, const in uint blockCoords[2], const in uint coordInBlock[2])
+{
+    const uint e = uint(bl.block.e);
+    const float16_t d = float16_t(uintBitsToFloat(e >= 2u ? ((e - 1u) << 23u) : (e == 0u ? 0x00200000u : 0x00400000u)));
+    const uint idx = coordInBlock[1];
+    // Low nibbles of bytes 0..15 are elements 0..15; high nibbles are 16..31.
+    const uint qs = uint(bl.block.qs[idx & 0xFu]);
+    const uint nibble = (idx & 0x10u) != 0u ? (qs >> 4u) : (qs & 0xFu);
+    return d * float16_t(kvalues_mxfp4[nibble]);
+}
+#endif
+
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer decodeBufQ2_K {
    block_q2_K block;
 };
@@ -689,6 +709,8 @@ float16_t dequantFuncIQ4_NL(const in decodeBufIQ4_NL bl, const in uint blockCoor
 #define dequantFuncA dequantFuncQ6_0
 #elif defined(DATA_A_Q8_0)
 #define dequantFuncA dequantFuncQ8_0
+#elif defined(DATA_A_MXFP4)
+#define dequantFuncA dequantFuncMXFP4
 #elif defined(DATA_A_Q2_K)
 #define dequantFuncA dequantFuncQ2_K
 #elif defined(DATA_A_Q3_K)
