@@ -2382,6 +2382,7 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
         break;
     case GGML_TYPE_IQ4_NL:
     case GGML_TYPE_IQ4_XS:
+    case GGML_TYPE_MXFP4:
         lut_size = 4*16;
         break;
     default:
@@ -2747,6 +2748,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_1], matmul_q5_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q6_0], matmul_q6_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q8_0], matmul_q8_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_MXFP4], matmul_mxfp4_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q2_K], matmul_q2_k_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q3_K], matmul_q3_k_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
         CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_K], matmul_q4_k_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
@@ -2805,6 +2807,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_MM(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q5_1].f16acc, matmul_id_q5_1_f16, , mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 4)
         CREATE_MM(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q6_0].f16acc, matmul_id_q6_0_f16, , mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 4)
         CREATE_MM(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q8_0].f16acc, matmul_id_q8_0_f16, , mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 4)
+        CREATE_MM(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_MXFP4].f16acc, matmul_id_mxfp4_f16, , mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 4)
         CREATE_MM(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q2_K].f16acc, matmul_id_q2_k_f16, , mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 4)
         CREATE_MM(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q3_K].f16acc, matmul_id_q3_k_f16, , mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 4)
         CREATE_MM(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_Q4_K].f16acc, matmul_id_q4_k_f16, , mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 4)
@@ -4987,6 +4990,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q6_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
@@ -5161,6 +5165,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q6_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
@@ -13275,9 +13280,10 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                 const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *)backend->context;
                 const vk_device& device = ctx->device;
                 if (op->op == GGML_OP_MUL_MAT_ID) {
-                    // IQK/KT (and MXFP4) quants use the dequant-to-F16 fallback
-                    // for the mat-mat-id path (no native mat_mat_id pipelines)
-                    if (!ggml_vk_is_iqk_type(src0_type) && src0_type != GGML_TYPE_MXFP4) {
+                    // IQK/KT quants use the dequant-to-F16 fallback for the
+                    // mat-mat-id path (no native mat_mat_id pipelines). MXFP4
+                    // now has a native cm2 matmul_id.
+                    if (!ggml_vk_is_iqk_type(src0_type)) {
                         if (!device->mul_mat_id_s[src0_type] && !device->mul_mat_id_m[src0_type] && !device->mul_mat_id_l[src0_type]) {
                             // If there's not enough shared memory for row_ids and the result tile, fallback to CPU
                             return false;

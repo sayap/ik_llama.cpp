@@ -222,12 +222,15 @@ scale exponent, 17-byte blocks) is now supported by `MUL_MAT`, `MUL_MAT_ID` and
   `dequantize`/`dequantize4`/`get_dm` (`dequant_funcs.comp`). The 16-entry value table
   is kept in shared memory, and `get_dm` reconstructs the power-of-two scale from the
   E8M0 byte, mirroring `ggml_e8m0_to_fp32_half`.
-- **prompt (`mul_mat`)**: the flat `dequant_mxfp4.comp` shader feeds the F16 matmul.
-  There is no native mmq/cm2 matmul for MXFP4; the cm2 inline-dequant path is skipped
-  and `ggml_vk_get_mul_mat_mat_pipeline` falls back to dequant+F16 (the same structure
-  the IQK/KT families use on coopmat2).
-- **`MUL_MAT_ID`**: the mat-mat-id path uses the dequant-to-F16 fallback and the vec
-  path uses a native `mul_mat_vec_id_mxfp4` shader.
+- **prompt (`mul_mat`)**: on `NV_coopmat2` devices, a native cm2 inline-dequant
+  matmul (`mul_mm_cm2.comp` + `dequantFuncMXFP4`) reads the 17-byte blocks directly;
+  `ggml_vk_get_mul_mat_mat_pipeline` no longer falls back to dequant+F16 for MXFP4.
+  Non-coopmat2 devices keep the flat `dequant_mxfp4.comp` → F16 matmul fallback.
+- **`MUL_MAT_ID`**: the mat-mat-id path now uses the same native cm2 inline-dequant
+  matmul on coopmat2 (this matters for large MoE models: the old dequant-to-F16 path
+  dequantized the *entire* expert matrix — 8 GiB of F16 for DeepSeek-V4's fused
+  256×4096×4096 gate+up experts — and OOM'd). The vec path uses a native
+  `mul_mat_vec_id_mxfp4` shader.
 - **`GET_ROWS`**: the generic `get_rows_quant.comp` with the MXFP4 dequant.
 
 `supports_op` accepts MXFP4 for `MUL_MAT`, `MUL_MAT_ID`, `GET_ROWS` and

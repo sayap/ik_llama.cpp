@@ -389,9 +389,9 @@ void matmul_shaders(bool fp16, bool matmul_id, bool coopmat, bool coopmat2, bool
         if (tname == "bf16") {
             continue;
         }
-        // MXFP4 has no native matmul shaders: the mat-mat path uses the
-        // dequant-to-F16 fallback (see the IQK/KT handling and docs/Vulkan.md).
-        if (tname == "mxfp4") {
+        // MXFP4 has a cm2 (coopmat2) inline-dequant matmul; scalar/coopmat
+        // devices keep the dequant-to-F16 fallback.
+        if (tname == "mxfp4" && !coopmat2) {
             continue;
         }
 
