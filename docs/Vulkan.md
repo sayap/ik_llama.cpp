@@ -523,6 +523,9 @@ record PP tok/s and TG tok/s for both.
 3. **Indexer / DSA / CSA / HCA / GLM-DSA**: `INDEXER_TOPK`, `MASK_TOPK`, `MASK_TO_IDX`,
    `SINKHORN`, `HC_PRE`, `HC_POST`, `LATENT_ATTN`, `DS4_COMP`. Stateful sparse-attention
    ops (DeepSeek2/4, OpenPangu, GLM-DSA). MLA-only arches are not gated on these.
+   **See `docs/handover-DSA-ops.md` for the full task breakdown (op→arch mapping, CUDA/CPU
+   references, Vulkan integration checklist, test harness, pitfalls) — this is the
+   active next task.**
 4. **`--fit` with `GGML_BACKEND_DL`** — fixed: per-device memory is now queried through
    the backend registry (`ggml_backend_reg_get_device_memory`), so DL builds report real
    free memory (and `--fit` no longer sees 0 MiB).
