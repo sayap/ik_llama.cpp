@@ -529,6 +529,25 @@ Still not supported (their matmuls run on CPU), in priority order:
   the cross-device leg of `GGML_OP_REDUCE` with `cuMemcpyPeer` + a local GPU add, ordered
   by Vulkan fence waits (CUDA copies are synchronous). That is the most promising remaining
   lever for closing the CUDA `-sm graph` gap.
+
+  The CUDA interop layer is now implemented and **probe-gated** (see `ggml_vk_cuda_*` in
+  `ggml-vulkan.cpp`): device-local buffers are allocated `OPAQUE_FD`-exportable, `libcuda.so.1`
+  is dlopen'd at runtime, and a one-time probe verifies the import maps the same physical
+  memory. Two hard-won details:
+
+  - `cuMemcpyHtoD`/`cuMemcpyDtoH` must be dlsym'd as `cuMemcpyHtoD_v2`/`cuMemcpyDtoH_v2`:
+    `cuda.h` remaps the unversioned names to the `_v2` variants, and the unversioned symbols
+    in `libcuda.so.1` are legacy stubs that return `CUDA_ERROR_INVALID_CONTEXT`. Using the
+    stubs made the import look like it mapped a fresh zeroed allocation.
+  - The CUDA copy engine and the Vulkan compute/transfer engines do **not** share a coherent
+    cache domain on NVIDIA. The probe validates CUDA-write→Vulkan-transfer-read (OK), but the
+    reduce's compute add reading a CUDA-written staging buffer (and the peer copy reading a
+    compute-written sum) is racy; routing through `vkCmdCopyBuffer` helps but is still not
+    deterministic without a real cross-engine sync. The `cuMemcpyPeer` reduce is therefore
+    opt-in (`GGML_VK_CUDA_P2P=1`) and off by default. A robust fix needs either a same-device
+    CUDA↔Vulkan external semaphore (import the Vulkan timeline semaphore into CUDA with
+    `cuImportExternalSemaphore` + `cuWaitExternalSemaphoresAsync`/`cuSignalExternalSemaphoresAsync`)
+    or doing the whole reduce on the CUDA side.
 - No events and no async tensor copies yet; the scheduler's `is_async` parallel path is
   still disabled for Vulkan. `-sas` works (it falls back to `synchronize`), but adds only
   ~3% for an equal split and nothing for a lopsided split, because the deferred drain
