@@ -54,7 +54,7 @@ void main() {
             sum_den += wp + wc;
             sum_num += wp*sp + wc*sc;
         }
-        dst[ib*p.ne0 + i0] = sum_num / sum_den;
+        dst[ib*p.ne0 + i0] = sum_den > 0.0f ? (sum_num / sum_den) : 0.0f;
     } else {
         float max_v = NEG_INF;
         for (uint ir = 0; ir < p.ratio; ++ir) {

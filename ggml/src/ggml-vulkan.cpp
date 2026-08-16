@@ -338,6 +338,7 @@ enum FaHeadSizes {
     FA_HEAD_SIZE_192,
     FA_HEAD_SIZE_192_128,
     FA_HEAD_SIZE_256,
+    FA_HEAD_SIZE_512,
     FA_HEAD_SIZE_576_512,
     FA_HEAD_SIZE_UNSUPPORTED,
     FA_HEAD_SIZE_COUNT = FA_HEAD_SIZE_UNSUPPORTED,
@@ -2259,6 +2260,7 @@ static FaHeadSizes fa_get_head_sizes(uint32_t hsk, uint32_t hsv) {
             return FA_HEAD_SIZE_UNSUPPORTED;
         }
     case 256: return FA_HEAD_SIZE_256;
+    case 512: return FA_HEAD_SIZE_512;
     case 576:
         if (hsv == 512) {
             return FA_HEAD_SIZE_576_512;
@@ -2666,6 +2668,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA2(TYPE, NAMELC, FAPATH, SUFFIX, 192, 192, 192) \
         CREATE_FA2(TYPE, NAMELC, FAPATH, SUFFIX, 192, 128, 192_128) \
         CREATE_FA2(TYPE, NAMELC, FAPATH, SUFFIX, 256, 256, 256) \
+        CREATE_FA2(TYPE, NAMELC, FAPATH, SUFFIX, 512, 512, 512) \
         CREATE_FA2(TYPE, NAMELC, FAPATH, SUFFIX, 576, 512, 576_512)
 
     CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, )
@@ -13345,6 +13348,13 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                     return false;
                 }
                 if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                // The Vulkan flash-attn shader only implements plain dense FA
+                // (src[0..3]). Sinks (src[4]) and the indexed variant (src[5])
+                // are not implemented; claim them unsupported so they fall back
+                // to CPU instead of silently computing the wrong attention.
+                if (op->src[4] != NULL || op->src[5] != NULL) {
                     return false;
                 }
                 // It's straightforward to support different K/V dequant, but would
