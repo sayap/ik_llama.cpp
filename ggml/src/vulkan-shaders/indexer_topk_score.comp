@@ -1,0 +1,61 @@
+#version 450
+
+#include "types.comp"
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n_kv;
+    uint Dk;
+    uint n_head;
+    uint tile_rows;
+    uint first_row;   // first query row of this tile
+    uint k_nb1;       // k row stride (A_TYPE elements)
+    uint q_nb1;       // q head stride (floats)
+    uint q_nb2;       // q row stride (floats)
+    uint w_nb1;       // w row stride (floats)
+    uint m_nb1;       // mask row stride (floats)
+} p;
+
+#if defined(DATA_A_F16)
+layout(binding = 0) readonly buffer K { uint16_t k[]; };
+#else
+layout(binding = 0) readonly buffer K { float k[]; };
+#endif
+layout(binding = 1) readonly buffer Q { float q[]; };
+layout(binding = 2) readonly buffer W { float w[]; };
+layout(binding = 3) readonly buffer M { float mask[]; };
+layout(binding = 4) buffer SCORE { float score[]; };
+
+#if defined(DATA_A_F16)
+float k_val(uint idx) {
+    return unpackHalf2x16(uint(k[idx])).x;
+}
+#else
+float k_val(uint idx) {
+    return k[idx];
+}
+#endif
+
+void main() {
+    const uint id = gl_GlobalInvocationID.x;
+    const uint total = p.n_kv * p.tile_rows;
+    if (id >= total) {
+        return;
+    }
+    const uint kv = id % p.n_kv;
+    const uint iq_local = id / p.n_kv;
+    const uint iq = p.first_row + iq_local;
+
+    float s = mask[iq*p.m_nb1 + kv];
+    for (uint h = 0u; h < p.n_head; ++h) {
+        float dot = 0.0f;
+        for (uint d = 0u; d < p.Dk; ++d) {
+            dot += k_val(kv*p.k_nb1 + d) * q[h*p.q_nb1 + iq*p.q_nb2 + d];
+        }
+        s += max(dot, 0.0f) * w[iq*p.w_nb1 + h];
+    }
+    score[iq_local*p.n_kv + kv] = s;
+}

@@ -217,6 +217,9 @@ llama_build_and_test(test-iqk-cm2-time.cpp LABEL "main")
 # gated delta-net recurrent op correctness (CPU vs backend comparison)
 llama_build_and_test(test-delta-net.cpp LABEL "main" ARGS Vulkan0)
 
+# DSA / GLM-DSA / DeepSeek-V4 sparse-attention op correctness (CPU vs backend comparison)
+llama_build_and_test(test-dsa.cpp LABEL "main" ARGS Vulkan0)
+
 # Vulkan split buffer type + cross-device REDUCE (the -sm graph plumbing).
 # These symbols live in libggml in static Vulkan builds; in GGML_BACKEND_DL builds they
 # are in the dynamically loaded ggml-vulkan module, which this test does not link.

@@ -1,0 +1,76 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint T;
+    uint S;
+    uint iters;
+    float eps;
+    uint src0_nb1;   // in floats
+} p;
+
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer SCALE { float scale[]; };
+layout(binding = 2) readonly buffer BIAS { float bias[]; };
+layout(binding = 3) buffer D { float dst[]; };
+
+void main() {
+    const uint t = gl_GlobalInvocationID.x;
+    if (t >= p.T) {
+        return;
+    }
+
+    const uint S = p.S;
+    float m[64];
+
+    const uint base = t * p.src0_nb1;
+
+    for (uint i = 0; i < S; ++i) {
+        float val = x[base + i] * scale[0] + bias[i];
+        val = 1.0f / (1.0f + exp(-val));
+        dst[S*t + i] = val + p.eps;
+    }
+    for (uint i = 0; i < S; ++i) {
+        float val = x[base + S + i] * scale[1] + bias[S + i];
+        val = 1.0f / (1.0f + exp(-val));
+        dst[S*(p.T + t) + i] = 2.0f * val;
+    }
+
+    for (uint i = 0; i < S*S; ++i) {
+        m[i] = x[base + 2u*S + i] * scale[2] + bias[2u*S + i];
+    }
+
+    for (uint r = 0; r < S; ++r) {
+        float mx = m[r*S];
+        for (uint c = 1; c < S; ++c) mx = max(mx, m[r*S + c]);
+        float sum = 0.0f;
+        for (uint c = 0; c < S; ++c) {
+            m[r*S + c] = exp(m[r*S + c] - mx);
+            sum += m[r*S + c];
+        }
+        for (uint c = 0; c < S; ++c) m[r*S + c] = m[r*S + c]/sum + p.eps;
+    }
+    for (uint c = 0; c < S; ++c) {
+        float sum = p.eps;
+        for (uint r = 0; r < S; ++r) sum += m[r*S + c];
+        for (uint r = 0; r < S; ++r) m[r*S + c] /= sum;
+    }
+    for (uint i = 0; i < p.iters - 1u; ++i) {
+        for (uint r = 0; r < S; ++r) {
+            float sum = p.eps;
+            for (uint c = 0; c < S; ++c) sum += m[r*S + c];
+            for (uint c = 0; c < S; ++c) m[r*S + c] /= sum;
+        }
+        for (uint c = 0; c < S; ++c) {
+            float sum = p.eps;
+            for (uint r = 0; r < S; ++r) sum += m[r*S + c];
+            for (uint r = 0; r < S; ++r) m[r*S + c] /= sum;
+        }
+    }
+
+    const uint out_off = 2u*S*p.T + S*S*t;
+    for (uint i = 0; i < S*S; ++i) dst[out_off + i] = m[i];
+}

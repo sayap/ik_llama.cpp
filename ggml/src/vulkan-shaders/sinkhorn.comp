@@ -1,0 +1,67 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint T;
+    uint S;
+    uint iters;
+    float eps;
+    uint transposed;
+    uint src0_nb1;   // in floats
+} p;
+
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) buffer D { float dst[]; };
+
+void main() {
+    const uint t = gl_GlobalInvocationID.x;
+    if (t >= p.T) {
+        return;
+    }
+
+    const uint S = p.S;
+    float m[64];
+
+    const uint base = t * p.src0_nb1;
+    // softmax over columns c for each row r; flat input is row-major (c fastest)
+    for (uint r = 0; r < S; ++r) {
+        float mx = x[base + r*S];
+        for (uint c = 1; c < S; ++c) mx = max(mx, x[base + r*S + c]);
+        float sum = 0.0f;
+        for (uint c = 0; c < S; ++c) {
+            m[r*S + c] = exp(x[base + r*S + c] - mx);
+            sum += m[r*S + c];
+        }
+        for (uint c = 0; c < S; ++c) m[r*S + c] = m[r*S + c]/sum + p.eps;
+    }
+    // column normalization first, then (iters - 1) rounds of row + column: ends on columns
+    for (uint c = 0; c < S; ++c) {
+        float sum = p.eps;
+        for (uint r = 0; r < S; ++r) sum += m[r*S + c];
+        for (uint r = 0; r < S; ++r) m[r*S + c] /= sum;
+    }
+    for (uint i = 0; i < p.iters - 1u; ++i) {
+        for (uint r = 0; r < S; ++r) {
+            float sum = p.eps;
+            for (uint c = 0; c < S; ++c) sum += m[r*S + c];
+            for (uint c = 0; c < S; ++c) m[r*S + c] /= sum;
+        }
+        for (uint c = 0; c < S; ++c) {
+            float sum = p.eps;
+            for (uint r = 0; r < S; ++r) sum += m[r*S + c];
+            for (uint r = 0; r < S; ++r) m[r*S + c] /= sum;
+        }
+    }
+
+    const uint out_off = t * S * S;
+    if (p.transposed != 0u) {
+        for (uint c = 0; c < S; ++c) {
+            for (uint r = 0; r < S; ++r) dst[out_off + c*S + r] = m[r*S + c];
+        }
+    } else {
+        for (uint k = 0; k < S*S; ++k) dst[out_off + k] = m[k];
+    }
+}

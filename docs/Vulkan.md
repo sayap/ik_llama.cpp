@@ -445,6 +445,65 @@ on a 32-token decode). Three additional bugs were found and fixed along the way:
   the dryrun so it is actually compiled, and the static reduce-pair map is cleared in
   `ggml_backend_vk_free` so the imported/exported memory is not freed after device teardown.
 
+### 12. DSA / GLM-DSA / DeepSeek-V4 sparse-attention ops
+
+All 8 missing sparse-attention ops from `docs/handover-DSA-ops.md` are now implemented:
+
+- `INDEXER_TOPK` — two-kernel implementation (a score kernel `indexer_topk_score.comp`
+  with F32/F16 `k` variants, plus `indexer_topk_select.comp` for the per-row top-k). Query
+  rows are tiled so the score scratch buffer is bounded; the select kernel reads the score
+  buffer and does a threshold-rescan tournament (no big register arrays, which avoided a
+  driver crash on Blackwell).
+- `MASK_TOPK` / `MASK_TO_IDX` — F32/F16 variants; `mask_to_idx` preserves increasing
+  source-position order like the CPU reference.
+- `SINKHORN` / `HC_PRE` / `HC_POST` — one thread per token / one thread per output element.
+- `DS4_COMP` — both type 0 and type 1.
+- `LATENT_ATTN` — dense (mode 0) and indexed (mode 1), F32/F16/Q8_0 cache, one thread
+  per query row with online softmax.
+
+`tests/test-dsa.cpp` validates every op against the CPU reference (all S sizes, both DS4
+compression types, F32/F16/Q8_0 latent caches, F32/F16 indexer/mask types); 50/50 pass on
+`Vulkan0` and `CPU`. `INDEXER_TOPK` is compared as a *set* per row because the CPU
+reference's `iqk_bucket_topk` (used when `n_rows < n_threads`) returns most buckets in
+original order rather than sorted.
+
+### 13. SET_ROWS is enabled (KV-cache scatter)
+
+`GGML_OP_SET_ROWS` was disabled since the Vulkan backend rewrite (`ggml_vk_set_rows` was
+`#if 0` and the shader only handled I64 indices as `uvec2`). It is now wired up
+(`supports_op` / `build_graph` / `compute_forward` / `ggml_vk_op_get_pipeline`), and the
+`copy_to_quant.comp` SET_ROWS mode gained an I32-index variant (`set_rows_*_i32`),
+selected at runtime from `src[1]->type`. This unblocks the DeepSeek-V4 KV-cache writes
+(`raw_k_write_idxs` are I32), which previously forced the whole cache-write split onto the
+CPU backend and crashed.
+
+### 14. Dryrun cache now fingerprints the graph content
+
+The `cached_cgraph == cgraph` dryrun cache (added for llama graph_reuse) could false-hit
+when a freed cgraph was reallocated at the same address with a *different* graph, skipping
+pipeline compilation and crashing on a null pipeline (reproducible as `test-delta-net`
+SIGSEGVing at softplus in DL builds). The cache key now also includes a fingerprint of
+every node and source (`op`, `type`, `ne`, `nb`, `op_params`, plus tensor identity pointers
+for the RMS_NORM+MUL fusion topology).
+
+### 15. Known gap: hybrid CPU/GPU view-allocation (ROPE_BACK)
+
+Running DeepSeek-V4-Flash-0731-full with
+`-dev Vulkan0,Vulkan1,Vulkan2 -sm layer -ngl 99 -cmoe` (attention on Vulkan, MoE FFN on
+CPU) now gets past SET_ROWS but crashes in `ggml_vk_op_f32` for `ROPE`:
+
+    ggml_vk_op_f32: null dst device buffer for op ROPE on Vulkan0
+      dst=attn-0 buft=CPU
+      src0=Vulkan0#attn_raw-0 (reshaped)#0 buft=Vulkan0
+
+`ggml_rope_ext_inplace` (ROPE_BACK) produces a *view* tensor. The scheduler runs it on
+Vulkan0, but the gallocr allocated that view's dst on the CPU buffer because the next
+consumer (the MoE FFN) is on CPU under `-cmoe`. `ggml_backend_view_init` is supposed to
+inherit `view_src->buffer` (Vulkan0), so this looks like a ggml-core scheduler/gallocr
+bug for in-place view ops at a GPU→CPU boundary, not a Vulkan-backend issue. It is only
+visible with hybrid CPU/GPU placement (`-cmoe`/`-ncmoe`). A defensive null-buffer check in
+`ggml_vk_op_f32` now aborts with the tensor/backend details instead of segfaulting.
+
 ## Benchmarks (RTX 3090, Vulkan0)
 
 Qwen2.5-Coder-0.5B-Instruct-Q8_0 (dense, `-c 2048`, single token batch):
@@ -521,11 +580,14 @@ record PP tok/s and TG tok/s for both.
 
 1. **`MXFP4`** — the micro-scaling 4-bit format (now supported, see "MXFP4 quant").
 3. **Indexer / DSA / CSA / HCA / GLM-DSA**: `INDEXER_TOPK`, `MASK_TOPK`, `MASK_TO_IDX`,
-   `SINKHORN`, `HC_PRE`, `HC_POST`, `LATENT_ATTN`, `DS4_COMP`. Stateful sparse-attention
-   ops (DeepSeek2/4, OpenPangu, GLM-DSA). MLA-only arches are not gated on these.
-   **See `docs/handover-DSA-ops.md` for the full task breakdown (op→arch mapping, CUDA/CPU
-   references, Vulkan integration checklist, test harness, pitfalls) — this is the
-   active next task.**
+   `SINKHORN`, `HC_PRE`, `HC_POST`, `LATENT_ATTN`, `DS4_COMP` — **now implemented** (see
+   "DSA / GLM-DSA / DeepSeek-V4 sparse-attention ops" above and `tests/test-dsa.cpp`).
+   End-to-end DeepSeek-V4 is now blocked by a separate ggml-core scheduler/gallocr bug for
+   in-place view ops at a GPU→CPU boundary (see "Known gap: hybrid CPU/GPU view-allocation").
+4. **Hybrid CPU/GPU view-allocation (`ROPE_BACK`)** — with `-sm layer -cmoe`, an
+   in-place view op scheduled on Vulkan gets its dst view allocated on the CPU buffer when
+   the downstream consumer is on CPU. Crashes DeepSeek-V4-Flash decode; needs a ggml-core
+   scheduler/gallocr fix (or a Vulkan-side workaround).
 4. **`--fit` with `GGML_BACKEND_DL`** — fixed: per-device memory is now queried through
    the backend registry (`ggml_backend_reg_get_device_memory`), so DL builds report real
    free memory (and `--fit` no longer sees 0 MiB).
@@ -559,11 +621,10 @@ Vulkan backend, so they fall back to the CPU backend with expensive copies:
 - **Indexer / DSA / CSA / HCA / GLM-DSA** (DeepSeek2/4, OpenPangu, GLM-DSA sparse
   attention): `GGML_OP_INDEXER_TOPK`, `GGML_OP_MASK_TOPK`, `GGML_OP_MASK_TO_IDX`,
   `GGML_OP_SINKHORN`, `GGML_OP_HC_PRE`, `GGML_OP_HC_POST`, `GGML_OP_LATENT_ATTN`,
-  `GGML_OP_DS4_COMP`. CUDA implements all of these; Vulkan has none, so these
-  architectures fall back to the CPU backend (with the same stateful round-trip problem
-  as delta-net). MLA ops (`mul_mat`/`mul_mat_id`/`concat`/`permute`/`flash_attn_ext`) are
-  already supported, so MLA-only models run on Vulkan; only the `-sm attn` MLA
-  `split_dim=2` load path remains.
+  `GGML_OP_DS4_COMP` — **now implemented** (see "DSA / GLM-DSA / DeepSeek-V4
+  sparse-attention ops" above). MLA ops (`mul_mat`/`mul_mat_id`/`concat`/`permute`/
+  `flash_attn_ext`) are already supported, so MLA-only models run on Vulkan; only the
+  `-sm attn` MLA `split_dim=2` load path remains.
 - `GGML_OP_MULTI_ADD` exists but check the specific fused-mul-multiadd variants
   (`fused_mmad`); `-no-mmad` disables them
 
@@ -720,6 +781,11 @@ Still not supported (their matmuls run on CPU), in priority order:
   repeat types, several head sizes (the multi-token CPU reference is only trustworthy for
   head_dim 64/128 where `iqk_fused_delta_net` handles the v strides). Run as
   `test-delta-net CPU|Vulkan0|CUDA0`.
+- `tests/test-dsa.cpp` validates `SINKHORN`, `HC_PRE`, `HC_POST`, `DS4_COMP`, `MASK_TOPK`,
+  `MASK_TO_IDX`, `INDEXER_TOPK` and `LATENT_ATTN` against the CPU reference on a target
+  backend (all S sizes, F32/F16/Q8_0 latent caches, both DS4 compression types, dense +
+  indexed latent attention). Run as `test-dsa CPU|Vulkan0|CUDA0`. INDEXER_TOPK is compared
+  as a per-row *set* because the CPU reference's bucket top-k is not sorted.
 - `tests/test-iqk-quants.cpp` validates the 15 IQK/KT types against the scalar dequant
   reference (the format definition): single-token decode, small batches, larger K,
   multi-token (dequant-to-F16 path), MoE (`MUL_MAT_ID`) and `GET_ROWS` (quantized token

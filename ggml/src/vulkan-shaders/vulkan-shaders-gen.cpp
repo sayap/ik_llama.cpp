@@ -611,6 +611,8 @@ void process_shaders() {
     for (std::string t : {"f32", "f16", "bf16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
         string_to_spv("set_rows_" + t, "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("set_rows_" + t + "_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
+        string_to_spv("set_rows_" + t + "_i32", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"SET_ROWS_I32", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+        string_to_spv("set_rows_" + t + "_i32_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"SET_ROWS_I32", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
     }
 
     auto get_type_str = [](bool f16) {
@@ -777,6 +779,22 @@ void process_shaders() {
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {});
     string_to_spv("ssm_conv_final_state_f32", "ssm_conv_final_state.comp", {});
     string_to_spv("delta_net_f32", "delta_net.comp", {});
+
+    // DSA / GLM-DSA / DeepSeek-V4 sparse-attention ops
+    string_to_spv("sinkhorn_f32", "sinkhorn.comp", {});
+    string_to_spv("hc_pre_f32", "hc_pre.comp", {});
+    string_to_spv("hc_post_f32", "hc_post.comp", {});
+    string_to_spv("ds4_comp_f32", "ds4_comp.comp", {});
+    string_to_spv("mask_topk_f32", "mask_topk.comp", {{ "DATA_A_F32", "1" }});
+    string_to_spv("mask_topk_f16", "mask_topk.comp", {{ "DATA_A_F16", "1" }});
+    string_to_spv("mask_to_idx_f32", "mask_to_idx.comp", {{ "DATA_A_F32", "1" }});
+    string_to_spv("mask_to_idx_f16", "mask_to_idx.comp", {{ "DATA_A_F16", "1" }});
+    string_to_spv("indexer_topk_score_f32", "indexer_topk_score.comp", {{ "DATA_A_F32", "1" }});
+    string_to_spv("indexer_topk_score_f16", "indexer_topk_score.comp", {{ "DATA_A_F16", "1" }});
+    string_to_spv("indexer_topk_select_f32", "indexer_topk_select.comp", {});
+    string_to_spv("latent_attn_f32", "latent_attn.comp", {{ "DATA_A_F32", "1" }});
+    string_to_spv("latent_attn_f16", "latent_attn.comp", {{ "DATA_A_F16", "1" }});
+    string_to_spv("latent_attn_q8_0", "latent_attn.comp", {{ "DATA_A_Q8_0", "1" }});
     //
     // ============================== end ik_llama.cpp
 
