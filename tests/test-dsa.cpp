@@ -697,11 +697,6 @@ static void test_flash_attn_indexed(ggml_backend_t backend_cpu, ggml_backend_t b
         } else if (strcmp(t->name, "mask") == 0) {
             std::vector<ggml_fp16_t> m(KV * mask_T, ggml_fp32_to_fp16(0.0f));
             ggml_backend_tensor_set(t, m.data(), 0, m.size() * sizeof(ggml_fp16_t));
-        } else if (strcmp(t->name, "sinks") == 0 && T == 1) {
-            // The CPU iqk single-token indexed path reads sinks[0] for every head,
-            // so use a uniform sink value for the T==1 cases.
-            std::vector<float> s(H, 0.25f);
-            ggml_backend_tensor_set(t, s.data(), 0, s.size() * sizeof(float));
         } else {
             init_tensor_uniform(t, -1.0f, 1.0f);
         }
