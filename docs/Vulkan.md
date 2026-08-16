@@ -486,23 +486,31 @@ SIGSEGVing at softplus in DL builds). The cache key now also includes a fingerpr
 every node and source (`op`, `type`, `ne`, `nb`, `op_params`, plus tensor identity pointers
 for the RMS_NORM+MUL fusion topology).
 
-### 15. Known gap: hybrid CPU/GPU view-allocation (ROPE_BACK)
+### 15. Hybrid CPU/GPU view-allocation (ROPE_BACK) — fixed
 
 Running DeepSeek-V4-Flash-0731-full with
 `-dev Vulkan0,Vulkan1,Vulkan2 -sm layer -ngl 99 -cmoe` (attention on Vulkan, MoE FFN on
-CPU) now gets past SET_ROWS but crashes in `ggml_vk_op_f32` for `ROPE`:
+CPU) exposed a ggml-core scheduler bug: `ggml_rope_ext_inplace` (ROPE_BACK) produces a
+*view* tensor; the scheduler could run it on Vulkan while the gallocr allocated its dst
+view on the CPU buffer (because the next consumer — the MoE FFN — is on CPU under
+`-cmoe`). `ggml_backend_view_init` then inherited the wrong buffer and dispatch hit a null
+device buffer. Fixed in the scheduler: ops that produce a view and write it in-place now
+stay on the same backend as the view source.
 
-    ggml_vk_op_f32: null dst device buffer for op ROPE on Vulkan0
-      dst=attn-0 buft=CPU
-      src0=Vulkan0#attn_raw-0 (reshaped)#0 buft=Vulkan0
+### 16. DSV4 flash-attention coverage
 
-`ggml_rope_ext_inplace` (ROPE_BACK) produces a *view* tensor. The scheduler runs it on
-Vulkan0, but the gallocr allocated that view's dst on the CPU buffer because the next
-consumer (the MoE FFN) is on CPU under `-cmoe`. `ggml_backend_view_init` is supposed to
-inherit `view_src->buffer` (Vulkan0), so this looks like a ggml-core scheduler/gallocr
-bug for in-place view ops at a GPU→CPU boundary, not a Vulkan-backend issue. It is only
-visible with hybrid CPU/GPU placement (`-cmoe`/`-ncmoe`). A defensive null-buffer check in
-`ggml_vk_op_f32` now aborts with the tensor/backend details instead of segfaulting.
+- Added FA head size **512** (K=V=512) for DSV4 raw attention; previously
+  `fa_get_head_sizes` rejected it and the whole attention fell back to CPU.
+- The Vulkan FA shader only implements dense FA (`src[0..3]`). Sinks (`src[4]`) and the
+  indexed variant (`src[5]`) were silently ignored, so `supports_op` now rejects them and
+  they fall back to the CPU backend (correct, but slow). DSV4 uses both, so its attention
+  currently runs on CPU in hybrid `-cmoe` runs.
+- **Remaining**: end-to-end DSV4 decode is not yet byte-identical to CUDA. All Vulkan DSA
+  kernels (HC_PRE/HC_POST/DS4_COMP/MASK_TOPK/MASK_TO_IDX/SET_ROWS) match the CPU
+  reference at real shapes in `tests/test-dsa.cpp`, so the divergence traces to the CPU
+  fallback of the DSV4 indexed+sinks flash attention (or a hybrid CPU/GPU boundary issue),
+  not the Vulkan DSA ops. A defensive null-buffer abort in `ggml_vk_op_f32` turns any
+  future cross-backend miss into a clear error instead of a segfault.
 
 ## Benchmarks (RTX 3090, Vulkan0)
 
@@ -584,10 +592,14 @@ record PP tok/s and TG tok/s for both.
    "DSA / GLM-DSA / DeepSeek-V4 sparse-attention ops" above and `tests/test-dsa.cpp`).
    End-to-end DeepSeek-V4 is now blocked by a separate ggml-core scheduler/gallocr bug for
    in-place view ops at a GPU→CPU boundary (see "Known gap: hybrid CPU/GPU view-allocation").
-4. **Hybrid CPU/GPU view-allocation (`ROPE_BACK`)** — with `-sm layer -cmoe`, an
-   in-place view op scheduled on Vulkan gets its dst view allocated on the CPU buffer when
-   the downstream consumer is on CPU. Crashes DeepSeek-V4-Flash decode; needs a ggml-core
-   scheduler/gallocr fix (or a Vulkan-side workaround).
+4. **Hybrid CPU/GPU view-allocation (`ROPE_BACK`)** — **fixed**: the scheduler now keeps
+   in-place view ops on the view source's backend, so `-sm layer -cmoe` no longer crashes
+   on a null device buffer (see "Hybrid CPU/GPU view-allocation" above).
+5. **DSV4 flash-attention indexed + sinks** — the Vulkan FA shader only implements dense
+   FA; DSV4's sinks (`src[4]`) and indexed (`src[5]`) variants fall back to CPU. This is
+   correct but slow, and end-to-end DSV4 decode is not yet byte-identical to CUDA (the
+   divergence traces to that CPU FA fallback, not the Vulkan DSA ops). Implementing
+   indexed FA + sinks on Vulkan is the next lever.
 4. **`--fit` with `GGML_BACKEND_DL`** — fixed: per-device memory is now queried through
    the backend registry (`ggml_backend_reg_get_device_memory`), so DL builds report real
    free memory (and `--fit` no longer sees 0 MiB).
