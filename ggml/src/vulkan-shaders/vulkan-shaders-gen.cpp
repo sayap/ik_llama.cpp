@@ -795,6 +795,10 @@ void process_shaders() {
     string_to_spv("latent_attn_f32", "latent_attn.comp", {{ "DATA_A_F32", "1" }});
     string_to_spv("latent_attn_f16", "latent_attn.comp", {{ "DATA_A_F16", "1" }});
     string_to_spv("latent_attn_q8_0", "latent_attn.comp", {{ "DATA_A_Q8_0", "1" }});
+    // Indexed flash attention (DSV4 sinks + top-k row gather). Only F16 and Q8_0 KV
+    // caches reach this path (matching the CUDA DSA reader).
+    string_to_spv("flash_attn_indexed_f16", "flash_attn_indexed.comp", {{ "DATA_A_F16", "1" }});
+    string_to_spv("flash_attn_indexed_q8_0", "flash_attn_indexed.comp", {{ "DATA_A_Q8_0", "1" }});
     //
     // ============================== end ik_llama.cpp
 

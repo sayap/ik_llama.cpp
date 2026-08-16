@@ -1,0 +1,150 @@
+#version 450
+
+#include "types.comp"
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Indexed flash attention for the DSV4 sparse-attention path:
+//   O[t,h] = softmax(scale * q[t,h] . k[ idx[t,k] ] + mask[t, idx[t,k]]
+//                     (+ sink[h] as an extra virtual logit with no value vector))
+//            over the top-k gathered keys, dotted against v[ idx[t,k] ].
+// idx[t,k] < 0 means "no key" (padding) and contributes -inf.
+//
+// K and V are F16 or Q8_0 (the two KV-cache types the CUDA DSA path accepts);
+// Q, sinks and the destination are F32 and the mask is F16.
+
+layout(push_constant) uniform PC {
+    uint Dk;          // key/query head size
+    uint Dv;          // value head size
+    uint T;           // query rows (tokens)
+    uint H;           // heads
+    uint KV;          // cache rows (unused, kept for symmetry)
+    uint topk;        // gathered keys per row
+    float scale;      // 1/sqrt(Dk), pre-divided by softcap when softcap != 0
+    float softcap;    // 0 or the logit softcap factor
+    uint k_nb1;       // K row stride (A_TYPE elements)
+    uint v_nb1;       // V row stride (A_TYPE elements)
+    uint q_nb1;       // q token stride (floats)  [nb[1]]
+    uint q_nb2;       // q head stride (floats)   [nb[2]]
+    uint mask_nb1;    // mask row stride (f16 elements)
+    uint indices_nb1; // indices row stride (int32)
+    uint sinks_nb0;   // sinks stride (floats)
+    uint has_mask;
+    uint has_sinks;
+    uint dst_nb1;     // dst head stride (floats)
+    uint dst_nb2;     // dst token stride (floats)
+} p;
+
+layout(binding = 0) readonly buffer Q   { float     q[]; };
+layout(binding = 1) readonly buffer K   { A_TYPE    k[]; };
+layout(binding = 2) readonly buffer V   { A_TYPE    v[]; };
+layout(binding = 3) readonly buffer M   { float16_t mask[]; };
+layout(binding = 4) readonly buffer IDX { int       indices[]; };
+layout(binding = 5) readonly buffer SNK { float     sinks[]; };
+layout(binding = 6) buffer D            { float     dst[]; };
+
+#if defined(DATA_A_Q8_0)
+float k_get(uint n, uint d) {
+    const uint blk = n*p.k_nb1 + d/32u;
+    return float(k[blk].d) * float(k[blk].qs[d % 32u]);
+}
+float v_get(uint n, uint d) {
+    const uint blk = n*p.v_nb1 + d/32u;
+    return float(v[blk].d) * float(v[blk].qs[d % 32u]);
+}
+#else
+float k_get(uint n, uint d) {
+    return float(k[n*p.k_nb1 + d]);
+}
+float v_get(uint n, uint d) {
+    return float(v[n*p.v_nb1 + d]);
+}
+#endif
+
+void main() {
+    const uint r = gl_GlobalInvocationID.x;
+    const uint total = p.T * p.H;
+    if (r >= total) {
+        return;
+    }
+    const uint t = r % p.T;  // token (query row)
+    const uint h = r / p.T;  // head
+
+    const uint qbase = t*p.q_nb1 + h*p.q_nb2;
+    const uint dbase = h*p.dst_nb1 + t*p.dst_nb2;
+
+    const float NEG_INF = uintBitsToFloat(0xFF800000u);
+
+    for (uint d = 0u; d < p.Dv; ++d) {
+        dst[dbase + d] = 0.0f;
+    }
+
+    float mx = NEG_INF;
+    float sum = 0.0f;
+
+    const uint idx_base = t*p.indices_nb1;
+    const uint m_base = t*p.mask_nb1;
+
+    for (uint kk = 0u; kk < p.topk; ++kk) {
+        const int idx = indices[idx_base + kk];
+        if (idx < 0) {
+            continue;
+        }
+        const uint n = uint(idx);
+
+        float s = 0.0f;
+        for (uint d = 0u; d < p.Dk; ++d) {
+            s += q[qbase + d] * k_get(n, d);
+        }
+        s *= p.scale;
+        if (p.softcap != 0.0f) {
+            s = p.softcap * tanh(s);
+        }
+        if (p.has_mask != 0u) {
+            s += float(mask[m_base + n]);
+        }
+
+        if (mx == NEG_INF && s == NEG_INF) {
+            continue;
+        }
+
+        if (s > mx) {
+            const float rescale = exp(mx - s);
+            sum = sum*rescale + 1.0f;
+            for (uint d = 0u; d < p.Dv; ++d) {
+                dst[dbase + d] = dst[dbase + d]*rescale + v_get(n, d);
+            }
+            mx = s;
+        } else {
+            const float e = exp(s - mx);
+            sum += e;
+            for (uint d = 0u; d < p.Dv; ++d) {
+                dst[dbase + d] += e * v_get(n, d);
+            }
+        }
+    }
+
+    // Attention sink: an extra virtual logit per head that has no value vector.
+    // It participates in the max/renormalization and the softmax denominator only.
+    if (p.has_sinks != 0u) {
+        const float s = sinks[h*p.sinks_nb0];
+        if (s > mx) {
+            const float rescale = exp(mx - s);
+            sum = sum*rescale + 1.0f;
+            for (uint d = 0u; d < p.Dv; ++d) {
+                dst[dbase + d] *= rescale;
+            }
+        } else {
+            sum += exp(s - mx);
+        }
+    }
+
+    const float inv = sum > 0.0f ? 1.0f/sum : 0.0f;
+    for (uint d = 0u; d < p.Dv; ++d) {
+        dst[dbase + d] *= inv;
+    }
+}

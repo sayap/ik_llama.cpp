@@ -636,6 +636,105 @@ static void test_latent_attn(ggml_backend_t backend_cpu, ggml_backend_t backend_
     ggml_free(ctx_tgt);
 }
 
+// Indexed flash attention (GGML_OP_FLASH_ATTN_EXT with src[5] == indices and an
+// optional per-head sink in src[4]), the DSV4 sparse-attention path. The CPU
+// reference routes through iqk_flash_attn_noalibi, which requires F32 q, F16 mask,
+// max_bias == 0, single KV head/batch, top_k < n_kv, and a top_k whose "last valid
+// + 1" rounds up to a multiple of 32 (so keep topk a multiple of 32).
+static void test_flash_attn_indexed(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt,
+        ggml_type kvtype, int Dk, int Dv, int T, int H, int KV, int topk, bool with_sinks, bool with_padding) {
+    char name[256];
+    snprintf(name, sizeof(name), "flash_attn_indexed kv=%s Dk=%d Dv=%d T=%d H=%d KV=%d topk=%d sinks=%d pad=%d",
+            ggml_type_name(kvtype), Dk, Dv, T, H, KV, topk, with_sinks ? 1 : 0, with_padding ? 1 : 0);
+
+    GGML_ASSERT(topk % 32 == 0);
+    GGML_ASSERT(topk < KV);
+
+    ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
+    ggml_context * ctx_cpu = ggml_init(params);
+    ggml_context * ctx_tgt = ggml_init(params);
+
+    const int64_t mask_T = GGML_PAD(T, GGML_KQ_MASK_PAD);
+
+    auto build = [&](ggml_context * ctx) {
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Dk, T, H);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_2d(ctx, kvtype, Dk, KV);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_2d(ctx, kvtype, Dv, KV);
+        ggml_set_name(v, "v");
+        ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, KV, mask_T);
+        ggml_set_name(mask, "mask");
+        ggml_tensor * sinks = nullptr;
+        if (with_sinks) {
+            sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+            ggml_set_name(sinks, "sinks");
+        }
+        ggml_tensor * indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, topk, T);
+        ggml_set_name(indices, "indices");
+
+        const float scale = 1.0f / sqrtf((float) Dk);
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        if (with_sinks) {
+            ggml_flash_attn_ext_add_sinks(out, sinks);
+        }
+        out->src[5] = indices;
+        return out;
+    };
+
+    ggml_tensor * out_c = build(ctx_cpu);
+    ggml_tensor * out_t = build(ctx_tgt);
+
+    ggml_backend_alloc_ctx_tensors(ctx_cpu, backend_cpu);
+    ggml_backend_alloc_ctx_tensors(ctx_tgt, backend_tgt);
+
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx_cpu); t != NULL; t = ggml_get_next_tensor(ctx_cpu, t)) {
+        if (t->data == nullptr || t->view_src != nullptr || t->op == GGML_OP_VIEW) continue;
+        if (strcmp(t->name, "indices") == 0 || t->type == GGML_TYPE_I32) continue;
+        if ((strcmp(t->name, "k") == 0 || strcmp(t->name, "v") == 0) && kvtype == GGML_TYPE_Q8_0) {
+            init_tensor_q8_0(t);
+        } else if (strcmp(t->name, "mask") == 0) {
+            std::vector<ggml_fp16_t> m(KV * mask_T, ggml_fp32_to_fp16(0.0f));
+            ggml_backend_tensor_set(t, m.data(), 0, m.size() * sizeof(ggml_fp16_t));
+        } else if (strcmp(t->name, "sinks") == 0 && T == 1) {
+            // The CPU iqk single-token indexed path reads sinks[0] for every head,
+            // so use a uniform sink value for the T==1 cases.
+            std::vector<float> s(H, 0.25f);
+            ggml_backend_tensor_set(t, s.data(), 0, s.size() * sizeof(float));
+        } else {
+            init_tensor_uniform(t, -1.0f, 1.0f);
+        }
+    }
+
+    std::vector<int32_t> idx_data(topk * T);
+    std::mt19937 rng(12345);
+    for (int i = 0; i < topk * T; i++) {
+        idx_data[i] = (int32_t)(rng() % KV);
+    }
+    if (with_padding) {
+        // trailing -1 per row; last_found+1 must still round to a multiple of 32
+        GGML_ASSERT(topk >= 32);
+        for (int t = 0; t < T; t++) {
+            for (int j = topk - 16; j < topk; j++) {
+                idx_data[t*topk + j] = -1;
+            }
+        }
+    }
+    ggml_backend_tensor_set(ggml_get_tensor(ctx_cpu, "indices"), idx_data.data(), 0, idx_data.size() * sizeof(int32_t));
+
+    copy_tensors_by_name(ctx_cpu, ctx_tgt);
+    {
+        std::vector<int32_t> idx2(topk * T);
+        ggml_backend_tensor_get(ggml_get_tensor(ctx_cpu, "indices"), idx2.data(), 0, idx2.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx_tgt, "indices"), idx2.data(), 0, idx2.size() * sizeof(int32_t));
+    }
+
+    check_float(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, 5e-3);
+    ggml_free(ctx_cpu);
+    ggml_free(ctx_tgt);
+}
+
 int main(int argc, char ** argv) {
     const char * tgt_name = argc > 1 ? argv[1] : "CPU";
 
@@ -693,6 +792,16 @@ int main(int argc, char ** argv) {
     test_latent_attn(backend_cpu, backend_tgt, GGML_TYPE_F16, 64, 2, 2, 4, 2, 3, true);
     test_latent_attn(backend_cpu, backend_tgt, GGML_TYPE_Q8_0, 64, 2, 2, 4, 2, 3, false);
     test_latent_attn(backend_cpu, backend_tgt, GGML_TYPE_Q8_0, 64, 2, 2, 4, 2, 3, true);
+
+    // Indexed flash attention + sinks (DSV4 sparse attention).
+    test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_F16, 64, 64, 2, 3, 128, 32, false, false);
+    test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_F16, 64, 64, 2, 3, 128, 32, true,  false);
+    test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_F16, 64, 64, 1, 4, 128, 32, true,  false);
+    test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_F16, 64, 64, 2, 3, 128, 64, true,  true);
+    test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_F16, 128, 128, 1, 2, 256, 32, true, false);
+    test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_Q8_0, 64, 64, 2, 3, 128, 32, true, false);
+    test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_Q8_0, 64, 64, 1, 4, 128, 32, true, false);
+    test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_F16, 512, 512, 1, 2, 1024, 32, true, false);
 
     test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F32, 32, 128, 4, 4, 8);
     test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F32, 16, 64, 3, 2, 6);
