@@ -51,9 +51,11 @@ layout (push_constant) uniform parameter {
 } p;
 
 #define MASK_ENABLE_BIT (1<<16)
+#define SINK_ENABLE_BIT (1<<17)
 #define N_LOG2_MASK 0xFFFF
 
 layout (binding = 4) writeonly buffer O {D_TYPE data_o[];};
+layout (binding = 5) readonly buffer SNK {float data_sinks[];};
 
 #if defined(A_TYPE_PACKED16)
 #define BINDING_IDX_K 0

@@ -51,6 +51,22 @@ ACC_TYPE Max(const in uint32_t row, const in uint32_t col, const in ACC_TYPE ele
     return max(elem0, elem1);
 }
 
+// Attention sink (DSV4): per-head virtual logit with no value vector. The
+// per-row rescale/add are computed into shared memory, then applied to L and O
+// via coopMatPerElementNV (which supplies explicit row coordinates).
+shared float sink_rescale[Br];
+shared float sink_add[Br];
+
+ACC_TYPE sinkApplyL(const in uint32_t row, const in uint32_t col, const in ACC_TYPE elem, const in uint32_t dummy)
+{
+    return ACC_TYPE(float(elem) * sink_rescale[row] + sink_add[row]);
+}
+
+ACC_TYPE sinkApplyO(const in uint32_t row, const in uint32_t col, const in ACC_TYPE elem, const in uint32_t dummy)
+{
+    return ACC_TYPE(float(elem) * sink_rescale[row]);
+}
+
 #if defined(BLOCK_SIZE)
 #define DECODEFUNC , DEQUANTFUNC
 #else
@@ -241,6 +257,27 @@ void main() {
         coopMatPerElementNV(L, L, perElemOpStoreCol0, o_offset, iq2, N);
         coopMatPerElementNV(M, M, perElemOpStoreCol0, o_offset + p.ne1, iq2, N);
         return;
+    }
+
+    // Attention sink (DSV4): a per-head virtual logit with no value vector. It
+    // participates in the max/denominator exactly like the CPU generic-FA path.
+    // (The host disables split_k when sinks are present, so this runs only on
+    // the non-split path.)
+    if ((p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0) {
+        [[unroll]] for (uint r = 0; r < Br; ++r) {
+            const float s = data_sinks[iq2 + (r % p.gqa_ratio)];
+            const float m = float(M[r * Bc]);
+            if (s > m) {
+                sink_rescale[r] = exp(m - s);
+                sink_add[r] = 1.0f;
+            } else {
+                sink_rescale[r] = 1.0f;
+                sink_add[r] = exp(s - m);
+            }
+        }
+        barrier();
+        coopMatPerElementNV(L, L, sinkApplyL, 0u);
+        coopMatPerElementNV(O, O, sinkApplyO, 0u);
     }
 
     coopmat<ACC_TYPE, gl_ScopeWorkgroup, Br, HSV, gl_MatrixUseAccumulator> Ldiag;

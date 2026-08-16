@@ -278,6 +278,23 @@ void main() {
         }
     }
 
+    // Attention sink (DSV4): a per-head virtual logit with no value vector. It
+    // participates in the max/denominator exactly like the CPU generic-FA path
+    // (ggml_compute_forward_flash_attn_ext_f16).
+    if ((p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0) {
+        [[unroll]] for (uint32_t r = 0; r < Br; ++r) {
+            const float s = data_sinks[iq2 + (r % p.gqa_ratio)];
+            if (s > Mf[r]) {
+                const float rescale = exp(Mf[r] - s);
+                Lf[r] = Lf[r]*rescale + 1.0f;
+                [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+                    Of[r][d] *= rescale;
+                }
+            } else {
+                Lf[r] += exp(s - Mf[r]);
+            }
+        }
+    }
 
     // If there is split_k, then the split_k resolve shader does the final
     // division by L. Store the intermediate O value and per-row m and L values.
