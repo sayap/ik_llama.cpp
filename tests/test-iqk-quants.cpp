@@ -369,6 +369,13 @@ int main(int argc, char ** argv) {
         check_get_rows(backend_tgt, type_a, 4096, 128, 5);
     }
 
+    // DSV4 FFN shapes (large M): the MXFP4 cm2 matmul tiles M in BM-sized
+    // blocks; exercise m=2048/4096 which the loop above does not cover.
+    check_mul_mat(backend_tgt, GGML_TYPE_MXFP4, 4096, 2048, 4);
+    check_mul_mat(backend_tgt, GGML_TYPE_MXFP4, 4096, 4096, 4);
+    check_mul_mat_id(backend_tgt, GGML_TYPE_MXFP4, 4, 2, 2048, 4096, 4);
+    check_mul_mat_id(backend_tgt, GGML_TYPE_MXFP4, 4, 2, 4096, 4096, 4);
+
     printf("%s: %d failures\n", tgt_name, n_failures);
     return n_failures == 0 ? 0 : 1;
 }
