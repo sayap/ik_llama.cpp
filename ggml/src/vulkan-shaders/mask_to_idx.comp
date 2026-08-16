@@ -1,0 +1,82 @@
+#version 450
+
+#include "types.comp"
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint ne00;      // src->ne[0]
+    uint ne0;       // dst->ne[0]
+    uint ne1;       // shared ne1
+    uint ne2;       // shared ne2
+    uint ne3;       // shared ne3
+    uint src_nb1;   // src row stride (elements)
+    uint src_nb2;   // src ne2 stride (elements)
+    uint src_nb3;   // src ne3 stride (elements)
+    uint dst_nb1;   // dst row stride (int32)
+    uint dst_nb2;   // dst ne2 stride (int32)
+    uint dst_nb3;   // dst ne3 stride (int32)
+} p;
+
+layout(binding = 0) readonly buffer M { A_TYPE mask[]; };
+layout(binding = 1) buffer D { int dst[]; };
+
+shared uint s_counts[256];
+shared uint s_starts[256];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= p.ne1*p.ne2*p.ne3) {
+        return;
+    }
+    const uint i1 = row % p.ne1;
+    const uint tmp = row / p.ne1;
+    const uint i2 = tmp % p.ne2;
+    const uint i3 = tmp / p.ne2;
+
+    const uint mbase = i1*p.src_nb1 + i2*p.src_nb2 + i3*p.src_nb3;
+    const uint dbase = i1*p.dst_nb1 + i2*p.dst_nb2 + i3*p.dst_nb3;
+
+    const uint tid = gl_LocalInvocationID.x;
+
+    // initialize dst row to -1
+    for (uint j = tid; j < p.ne0; j += 256u) {
+        dst[dbase + j] = -1;
+    }
+
+    // each thread owns a contiguous chunk of the source row; count zeros in order
+    const uint chunk = (p.ne00 + 255u) / 256u;
+    const uint begin = tid * chunk;
+    const uint end = min(begin + chunk, p.ne00);
+    uint count = 0u;
+    for (uint j = begin; j < end; ++j) {
+        if (float(mask[mbase + j]) == 0.0f) {
+            count++;
+        }
+    }
+    s_counts[tid] = count;
+    barrier();
+
+    // exclusive prefix sum over the 256 thread counts (serial scan is fine)
+    if (tid == 0u) {
+        uint acc = 0u;
+        for (uint i = 0; i < 256u; ++i) {
+            s_starts[i] = acc;
+            acc += s_counts[i];
+        }
+    }
+    barrier();
+
+    // write zeros in chunk order, preserving increasing source position order
+    uint pos = s_starts[tid];
+    for (uint j = begin; j < end; ++j) {
+        if (float(mask[mbase + j]) == 0.0f) {
+            if (pos < p.ne0) {
+                dst[dbase + pos] = int(j);
+            }
+            pos++;
+        }
+    }
+}

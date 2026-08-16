@@ -1,0 +1,77 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint type;          // 0 or 1
+    uint ne0;           // dst->ne[0]
+    uint nblock;        // dst->ne[1]
+    uint ratio;
+    uint state_stride;  // floats
+    uint score_stride;  // floats
+} p;
+
+layout(binding = 0) readonly buffer STATE { float state[]; };
+layout(binding = 1) readonly buffer SCORE { float score[]; };
+layout(binding = 2) readonly buffer IDX { int idx[]; };
+layout(binding = 3) buffer D { float dst[]; };
+
+void main() {
+    const uint ii = gl_GlobalInvocationID.x;
+    const uint nelem = p.ne0 * p.nblock;
+    if (ii >= nelem) {
+        return;
+    }
+    const uint ib = ii / p.ne0;
+    const uint i0 = ii % p.ne0;
+
+    const float NEG_INF = uintBitsToFloat(0xFF800000u);
+
+    if (p.type == 0u) {
+        const uint nidx = p.ratio * p.nblock;
+
+        float max_v = NEG_INF;
+        for (uint ir = 0; ir < p.ratio; ++ir) {
+            const int row_p = idx[p.ratio*ib + ir];
+            const int row_c = idx[p.ratio*ib + ir + nidx];
+            max_v = max(max_v, score[uint(row_p)*p.score_stride + i0]);
+            max_v = max(max_v, score[uint(row_c)*p.score_stride + i0 + p.ne0]);
+        }
+
+        float sum_num = 0.0f;
+        float sum_den = 0.0f;
+        for (uint ir = 0; ir < p.ratio; ++ir) {
+            const int row_p = idx[p.ratio*ib + ir];
+            const int row_c = idx[p.ratio*ib + ir + nidx];
+            const float vp = score[uint(row_p)*p.score_stride + i0];
+            const float vc = score[uint(row_c)*p.score_stride + i0 + p.ne0];
+            const float sp = state[uint(row_p)*p.state_stride + i0];
+            const float sc = state[uint(row_c)*p.state_stride + i0 + p.ne0];
+            const float wp = exp(vp - max_v);
+            const float wc = exp(vc - max_v);
+            sum_den += wp + wc;
+            sum_num += wp*sp + wc*sc;
+        }
+        dst[ib*p.ne0 + i0] = sum_num / sum_den;
+    } else {
+        float max_v = NEG_INF;
+        for (uint ir = 0; ir < p.ratio; ++ir) {
+            const int row = idx[p.ratio*ib + ir];
+            max_v = max(max_v, score[uint(row)*p.score_stride + i0]);
+        }
+
+        float sum_num = 0.0f;
+        float sum_den = 0.0f;
+        for (uint ir = 0; ir < p.ratio; ++ir) {
+            const int row = idx[p.ratio*ib + ir];
+            const float v = score[uint(row)*p.score_stride + i0];
+            const float s = state[uint(row)*p.state_stride + i0];
+            const float w = exp(v - max_v);
+            sum_den += w;
+            sum_num += w*s;
+        }
+        dst[ib*p.ne0 + i0] = sum_num / sum_den;
+    }
+}

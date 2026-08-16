@@ -1,0 +1,163 @@
+#version 450
+
+#include "types.comp"
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint Dk;
+    uint T;
+    uint H;
+    uint N;       // cache rows (mode 0)
+    uint P;       // prefix rows
+    uint topk;    // gathered rows (mode 1)
+    uint dv;
+    uint dv_off;
+    uint mode;    // 0 = dense, 1 = indexed
+    float scale;
+    uint cache_nb1;  // cache row stride (A_TYPE elements)
+    uint q_nb1;      // q head stride (floats)
+    uint q_nb2;      // q row stride (floats)
+    uint pk_nb1;     // prefix_k row stride (floats)
+    uint pv_nb1;     // prefix_v row stride (floats)
+    uint mask_nb1;   // mask row stride (floats)
+    uint has_mask;
+    uint indices_nb1;// indices row stride (int32)
+    uint dst_nb1;    // dst token stride (floats)
+    uint dst_nb2;    // dst head stride (floats)
+} p;
+
+layout(binding = 0) readonly buffer Q { float q[]; };
+layout(binding = 1) readonly buffer C { A_TYPE cache[]; };
+layout(binding = 2) readonly buffer PK { float pk[]; };
+layout(binding = 3) readonly buffer PV { float pv[]; };
+layout(binding = 4) readonly buffer M { float mask[]; };
+layout(binding = 5) readonly buffer IDX { int indices[]; };
+layout(binding = 6) buffer D { float dst[]; };
+
+#if defined(DATA_A_Q8_0)
+float cache_get(uint n, uint d) {
+    const uint blk = n*p.cache_nb1 + d/32u;
+    return float(cache[blk].d) * float(cache[blk].qs[d % 32u]);
+}
+#else
+float cache_get(uint n, uint d) {
+    return float(cache[n*p.cache_nb1 + d]);
+}
+#endif
+
+void main() {
+    const uint r = gl_GlobalInvocationID.x;
+    const uint total = p.T * p.H;
+    if (r >= total) {
+        return;
+    }
+    const uint t = r % p.T;
+    const uint h = r / p.T;
+
+    const uint qbase = t*p.q_nb1 + h*p.q_nb2;
+    const uint dbase = t*p.dst_nb1 + h*p.dst_nb2;
+
+    const float NEG_INF = uintBitsToFloat(0xFF800000u);
+
+    for (uint d = 0u; d < p.dv; ++d) {
+        dst[dbase + d] = 0.0f;
+    }
+
+    float mx = NEG_INF;
+    float sum = 0.0f;
+
+    // prefix rows are always visible (no mask)
+    for (uint p_ = 0u; p_ < p.P; ++p_) {
+        float s = 0.0f;
+        for (uint d = 0u; d < p.Dk; ++d) {
+            s += q[qbase + d] * pk[p_*p.pk_nb1 + d];
+        }
+        s *= p.scale;
+
+        if (s > mx) {
+            const float rescale = exp(mx - s);
+            sum = sum*rescale + 1.0f;
+            for (uint d = 0u; d < p.dv; ++d) {
+                dst[dbase + d] = dst[dbase + d]*rescale + pv[d*p.pv_nb1 + p_];
+            }
+            mx = s;
+        } else {
+            const float e = exp(s - mx);
+            sum += e;
+            for (uint d = 0u; d < p.dv; ++d) {
+                dst[dbase + d] += e * pv[d*p.pv_nb1 + p_];
+            }
+        }
+    }
+
+    if (p.mode == 0u) {
+        for (uint n = 0u; n < p.N; ++n) {
+            float s = 0.0f;
+            for (uint d = 0u; d < p.Dk; ++d) {
+                s += q[qbase + d] * cache_get(n, d);
+            }
+            s *= p.scale;
+            if (p.has_mask != 0u) {
+                s += mask[t*p.mask_nb1 + n];
+            }
+
+            if (mx == NEG_INF && s == NEG_INF) {
+                continue;
+            }
+            if (s > mx) {
+                const float rescale = exp(mx - s);
+                sum = sum*rescale + 1.0f;
+                for (uint d = 0u; d < p.dv; ++d) {
+                    dst[dbase + d] = dst[dbase + d]*rescale + cache_get(n, p.dv_off + d);
+                }
+                mx = s;
+            } else {
+                const float e = exp(s - mx);
+                sum += e;
+                for (uint d = 0u; d < p.dv; ++d) {
+                    dst[dbase + d] += e * cache_get(n, p.dv_off + d);
+                }
+            }
+        }
+    } else {
+        for (uint k = 0u; k < p.topk; ++k) {
+            const int idx = indices[t*p.indices_nb1 + k];
+            const uint n = uint(idx);
+
+            float s = 0.0f;
+            for (uint d = 0u; d < p.Dk; ++d) {
+                s += q[qbase + d] * cache_get(n, d);
+            }
+            s *= p.scale;
+            if (p.has_mask != 0u) {
+                s += mask[t*p.mask_nb1 + n];
+            }
+
+            if (mx == NEG_INF && s == NEG_INF) {
+                continue;
+            }
+            if (s > mx) {
+                const float rescale = exp(mx - s);
+                sum = sum*rescale + 1.0f;
+                for (uint d = 0u; d < p.dv; ++d) {
+                    dst[dbase + d] = dst[dbase + d]*rescale + cache_get(n, p.dv_off + d);
+                }
+                mx = s;
+            } else {
+                const float e = exp(s - mx);
+                sum += e;
+                for (uint d = 0u; d < p.dv; ++d) {
+                    dst[dbase + d] += e * cache_get(n, p.dv_off + d);
+                }
+            }
+        }
+    }
+
+    const float inv = sum > 0.0f ? 1.0f/sum : 0.0f;
+    for (uint d = 0u; d < p.dv; ++d) {
+        dst[dbase + d] *= inv;
+    }
+}

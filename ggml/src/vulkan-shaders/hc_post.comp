@@ -1,0 +1,47 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint ne0;      // x->ne[0] (== res->ne[0] == dst->ne[0])
+    uint T;        // x->ne[1]
+    uint S;        // post->ne[0]
+    uint x_nb1;    // floats
+    uint post_nb1; // floats
+    uint comb_nb2; // floats
+    uint res_nb1;  // floats
+    uint res_nb2;  // floats
+    uint dst_nb1;  // floats
+    uint dst_nb2;  // floats
+} p;
+
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer POST { float post[]; };
+layout(binding = 2) readonly buffer RES { float res[]; };
+layout(binding = 3) readonly buffer COMB { float comb[]; };
+layout(binding = 4) buffer D { float dst[]; };
+
+void main() {
+    const uint ii = gl_GlobalInvocationID.x;
+    const uint nelem = p.ne0 * p.T;
+    if (ii >= nelem) {
+        return;
+    }
+    const uint i0 = ii % p.ne0;
+    const uint i1 = ii / p.ne0;
+
+    float r[8];
+    for (uint j = 0; j < p.S; ++j) {
+        r[j] = res[i1*p.res_nb2 + j*p.res_nb1 + i0];
+    }
+
+    for (uint i = 0; i < p.S; ++i) {
+        float sum = x[i1*p.x_nb1 + i0] * post[i1*p.post_nb1 + i];
+        for (uint j = 0; j < p.S; ++j) {
+            sum += comb[i1*p.comb_nb2 + j*p.S + i] * r[j];
+        }
+        dst[i1*p.dst_nb2 + i*p.dst_nb1 + i0] = sum;
+    }
+}

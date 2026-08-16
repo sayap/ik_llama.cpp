@@ -1,0 +1,68 @@
+#version 450
+
+#include "types.comp"
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint ne0;        // mask/dst ne0
+    uint ntopk;      // topk->ne[0]
+    uint topk_ne1;   // topk->ne[1]
+    uint ne1;        // mask/dst ne1
+    uint ne2;        // mask/dst ne2
+    uint ne3;        // mask/dst ne3
+    uint src0_nb1;   // mask row stride (elements)
+    uint src0_nb2;   // mask ne2 stride (elements)
+    uint src0_nb3;   // mask ne3 stride (elements)
+    uint src1_nb1;   // topk row stride (int32)
+    uint src1_nb2;   // topk ne2 stride (int32)
+    uint src1_nb3;   // topk ne3 stride (int32)
+    uint dst_nb1;    // dst row stride (elements)
+    uint dst_nb2;    // dst ne2 stride (elements)
+    uint dst_nb3;    // dst ne3 stride (elements)
+} p;
+
+layout(binding = 0) readonly buffer M { A_TYPE mask[]; };
+layout(binding = 1) readonly buffer I { int idx[]; };
+layout(binding = 2) buffer D { A_TYPE dst[]; };
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    if (row >= p.ne1*p.ne2*p.ne3) {
+        return;
+    }
+    const uint i1 = row % p.ne1;
+    const uint tmp = row / p.ne1;
+    const uint i2 = tmp % p.ne2;
+    const uint i3 = tmp / p.ne2;
+
+    const uint mbase = i1*p.src0_nb1 + i2*p.src0_nb2 + i3*p.src0_nb3;
+    const uint ibase = i1*p.src1_nb1 + i2*p.src1_nb2 + i3*p.src1_nb3;
+    const uint dbase = i1*p.dst_nb1 + i2*p.dst_nb2 + i3*p.dst_nb3;
+
+    const float NEG_INF = uintBitsToFloat(0xFF800000u);
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (i1 < p.topk_ne1) {
+        for (uint j = tid; j < p.ne0; j += 256u) {
+            dst[dbase + j] = A_TYPE(NEG_INF);
+        }
+        barrier();
+        for (uint j = tid; j < p.ntopk; j += 256u) {
+            const int id = idx[ibase + j];
+            if (id >= 0 && uint(id) < p.ne0) {
+                dst[dbase + uint(id)] = A_TYPE(0.0f);
+            }
+        }
+        barrier();
+        for (uint j = tid; j < p.ne0; j += 256u) {
+            dst[dbase + j] = A_TYPE(float(dst[dbase + j]) + float(mask[mbase + j]));
+        }
+    } else {
+        for (uint j = tid; j < p.ne0; j += 256u) {
+            dst[dbase + j] = mask[mbase + j];
+        }
+    }
+}

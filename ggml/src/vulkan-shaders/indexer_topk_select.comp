@@ -1,0 +1,63 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint n_kv;
+    uint n_top_k;
+    uint first_row;
+    uint dst_nb1;   // dst row stride (int32)
+} p;
+
+layout(binding = 0) readonly buffer SCORE { float score[]; };
+layout(binding = 1) buffer D { int dst[]; };
+
+shared float s_val[256];
+shared int s_idx[256];
+
+void main() {
+    const uint iq_local = gl_WorkGroupID.x;
+    const uint iq = p.first_row + iq_local;
+    const uint tid = gl_LocalInvocationID.x;
+
+    const float NEG_INF = uintBitsToFloat(0xFF800000u);
+    const float POS_INF = uintBitsToFloat(0x7F800000u);
+
+    const uint base = iq_local * p.n_kv;
+    float threshold = POS_INF;
+
+    for (uint slot = 0u; slot < p.n_top_k; ++slot) {
+        float best = NEG_INF;
+        int best_j = -1;
+        for (uint j = tid; j < p.n_kv; j += 256u) {
+            const float v = score[base + j];
+            if (v < threshold && v > best) {
+                best = v;
+                best_j = int(j);
+            }
+        }
+        s_val[tid] = best;
+        s_idx[tid] = best_j;
+        barrier();
+
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (tid < s) {
+                const bool better = (s_val[tid + s] > s_val[tid]) ||
+                                    (s_val[tid + s] == s_val[tid] && s_idx[tid + s] < s_idx[tid]);
+                if (better) {
+                    s_val[tid] = s_val[tid + s];
+                    s_idx[tid] = s_idx[tid + s];
+                }
+            }
+            barrier();
+        }
+
+        if (tid == 0u) {
+            dst[iq*p.dst_nb1 + slot] = s_idx[0];
+        }
+        threshold = s_val[0];
+        barrier();
+    }
+}
