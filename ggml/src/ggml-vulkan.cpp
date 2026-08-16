@@ -462,6 +462,14 @@ struct vk_device_struct {
     CUdevice  cuda_dev = -1;
     vk_buffer cuda_staging;   // touched by the CUDA copy engine
 
+    // Persistent mapped staging for the host-staged -sm graph reduce. The read staging
+    // receives the partial via a compute-queue vkCmdCopyBuffer (ordered after pending
+    // compute, so a single fence wait per device covers both); the write staging feeds
+    // the fire-and-forget copy back, which subsequent compute on the same queue observes
+    // by queue order. Lazily grown to the largest reduce seen.
+    vk_buffer reduce_read_staging;
+    vk_buffer reduce_write_staging;
+
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
     uint32_t subgroup_max_size;
@@ -663,6 +671,8 @@ struct vk_device_struct {
 
         ggml_vk_destroy_buffer(sync_staging);
         ggml_vk_destroy_buffer(cuda_staging);
+        ggml_vk_destroy_buffer(reduce_read_staging);
+        ggml_vk_destroy_buffer(reduce_write_staging);
 
         compute_queue.cmd_pool.destroy(device);
         transfer_queue.cmd_pool.destroy(device);
@@ -1220,7 +1230,7 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     bool almost_ready_fence_pending {};
     // true when compute work has been submitted but not yet synchronized
-    bool submit_pending {};
+    std::atomic<bool> submit_pending {};
 
     vk_buffer buffer_pool[MAX_VK_BUFFERS];
 
@@ -1373,6 +1383,7 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
 }
 
 static void ggml_vk_flush_pending_compute(ggml_backend_vk_context * ctx);
+static void ggml_vk_flush_pending_reduces();
 
 // Flush any pending compute on a device before a host/transfer operation touches its
 // buffers. graph_compute defers its drain, so a transfer that reads or overwrites a
@@ -5540,6 +5551,8 @@ static void ggml_vk_buffer_read_async(vk_context subctx, vk_buffer& src, size_t 
 static void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_read(" << src->buffer << ", " << offset << ", " << size << ")");
 
+    // A host read may observe the result of a deferred reduce exchange.
+    ggml_vk_flush_pending_reduces();
     ggml_vk_device_flush_pending_compute(src->device);
 
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
@@ -5594,6 +5607,8 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
     } else {
         VK_LOG_DEBUG("ggml_vk_buffer_copy(MULTI_DEVICE, " << size << ")");
         // Copy device to device; both queues must be done with these buffers first.
+        // Any deferred reduce exchange must complete so the source holds the sum.
+        ggml_vk_flush_pending_reduces();
         ggml_vk_device_flush_pending_compute(src->device);
         ggml_vk_device_flush_pending_compute(dst->device);
 
@@ -10542,48 +10557,184 @@ static void vk_reduce_add(ggml_backend_vk_context * ctx, vk_buffer dst, uint64_t
     ggml_vk_queue_command_pools_cleanup(ctx->device);
 }
 
-// Async device<->host transfer submission for the host-staged -sm graph reduce. Each
-// submits the transfer on the device's transfer queue without waiting, so the two
-// participating devices move their partials in parallel. The device's persistent fence
-// is used (the same fence the synchronous buffer read/write path uses).
-static void ggml_vk_reduce_read_submit(vk_device& dev, vk_buffer src, size_t offset, void * dst, size_t size, std::vector<vk_staging_memcpy>& out_memcpys) {
-    ggml_vk_device_flush_pending_compute(dev);
+// Persistent mapped staging for the host-staged -sm graph reduce (see vk_device_struct).
+static vk_buffer ggml_vk_reduce_staging(vk_device& dev, vk_buffer& slot, size_t size) {
+    if (slot && slot->size >= size) {
+        return slot;
+    }
+    const size_t grow = slot ? slot->size * 2 : 0;
+    slot = ggml_vk_create_buffer_check(dev, std::max(size, grow),
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent |
+        vk::MemoryPropertyFlagBits::eHostCached);
+    return slot;
+}
+
+// A partial read that has been submitted to a device's compute queue but not yet waited.
+struct vk_reduce_read {
+    vk_device dev;
+    void * mapped;
+};
+
+// Submit a partial -> host staging copy on the device's compute queue, ordered after
+// any pending compute (queue order) and fenced so the host can wait for it later.
+static vk_reduce_read ggml_vk_reduce_read_submit2(vk_device& dev, vk_buffer src, uint64_t offset, size_t size) {
     std::lock_guard<std::recursive_mutex> guard(dev->mutex);
 
-    vk_context subctx = ggml_vk_create_temporary_context(dev->transfer_queue.cmd_pool);
+    vk_buffer staging = ggml_vk_reduce_staging(dev, dev->reduce_read_staging, size);
+
+    vk_context subctx = ggml_vk_create_temporary_context(dev->compute_queue.cmd_pool);
     ggml_vk_ctx_begin(dev, subctx);
-    ggml_vk_buffer_read_async(subctx, src, offset, dst, size, true);
+    // The partial was produced by compute shaders earlier on this queue; the copy reads
+    // it in the TRANSFER stage, which needs an explicit COMPUTE->TRANSFER memory
+    // barrier (there is no implicit dependency between stages).
+    subctx->s->buffer.pipelineBarrier(
+        vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer,
+        {},
+        { { { vk::AccessFlagBits::eShaderWrite }, { vk::AccessFlagBits::eTransferRead } } },
+        {}, {});
+    subctx->s->buffer.copyBuffer((VkBuffer) src->buffer, (VkBuffer) staging->buffer, { { offset, 0, size } });
     ggml_vk_ctx_end(subctx);
 
+    dev->device.resetFences({ dev->fence });
     ggml_vk_submit(subctx, dev->fence);
-    out_memcpys = std::move(subctx->out_memcpys);
+
+    return { dev, staging->ptr };
 }
 
-static void ggml_vk_reduce_write_submit(vk_device& dev, vk_buffer dst, size_t offset, const void * src, size_t size) {
-    ggml_vk_device_flush_pending_compute(dev);
+// Wait for a single previously submitted partial read; returns the mapped staging
+// pointer holding the partial.
+static void * ggml_vk_reduce_read_wait(vk_reduce_read& rd) {
+    rd.dev->device.waitForFences({ rd.dev->fence }, true, UINT64_MAX);
+    // Leave the fence unsignaled: the shared helpers submit with dev->fence and rely on
+    // it being reset (submitting an already-signaled fence makes their waits return
+    // immediately and race with the copy).
+    rd.dev->device.resetFences({ rd.dev->fence });
+
+    // Everything previously submitted to this device has now completed.
+    if (rd.dev->backend_ctx) {
+        rd.dev->backend_ctx->submit_pending = false;
+    }
+
+    return rd.mapped;
+}
+
+// Copy the reduced sum back into a device tensor without waiting: the copy is submitted
+// on the compute queue and later submissions to the same queue (the next split's
+// compute) observe it by queue order. submit_pending is set so any path that would
+// reset the command pools first drains the queue.
+static void ggml_vk_reduce_write_back(vk_device& dev, vk_buffer dst, uint64_t offset, const void * data, size_t size) {
     std::lock_guard<std::recursive_mutex> guard(dev->mutex);
 
-    vk_context subctx = ggml_vk_create_temporary_context(dev->transfer_queue.cmd_pool);
+    vk_buffer staging = ggml_vk_reduce_staging(dev, dev->reduce_write_staging, size);
+    memcpy(staging->ptr, data, size);
+
+    vk_context subctx = ggml_vk_create_temporary_context(dev->compute_queue.cmd_pool);
     ggml_vk_ctx_begin(dev, subctx);
-    ggml_vk_buffer_write_async(subctx, dst, offset, src, size, true);
+    subctx->s->buffer.copyBuffer((VkBuffer) staging->buffer, (VkBuffer) dst->buffer, { { 0, offset, size } });
+    // The copy is a TRANSFER-stage write; the consumers are compute shaders submitted
+    // after this on the same queue. A COMPUTE->COMPUTE barrier does not cover the copy,
+    // so use an explicit TRANSFER->COMPUTE memory barrier.
+    subctx->s->buffer.pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
+        {},
+        { { { vk::AccessFlagBits::eTransferWrite }, { vk::AccessFlagBits::eShaderRead } } },
+        {}, {});
     ggml_vk_ctx_end(subctx);
 
-    // Fill the staging buffer(s) before the copy commands are submitted.
-    for (auto& cpy : subctx->in_memcpys) {
-        memcpy(cpy.dst, cpy.src, cpy.n);
+    ggml_vk_submit(subctx, vk::Fence{});
+    if (dev->backend_ctx) {
+        dev->backend_ctx->submit_pending = true;
     }
-
-    ggml_vk_submit(subctx, dev->fence);
 }
 
-static void ggml_vk_reduce_transfer_wait(vk_device& dev, std::vector<vk_staging_memcpy>& memcpys) {
-    dev->device.waitForFences(dev->fence, true, UINT64_MAX);
-    dev->device.resetFences(dev->fence);
-    for (auto& cpy : memcpys) {
-        memcpy(cpy.dst, cpy.src, cpy.n);
-    }
-    ggml_vk_queue_command_pools_cleanup(dev);
+// Lazy reduce bookkeeping: a REDUCE split only stashes the exchange parameters and
+// returns immediately, so the scheduler can go on recording the next split while both
+// devices are still executing. The partial reads are submitted right away (appended to
+// the producing compute on each queue); the waits, the CPU add and the write-back
+// copies run later, at the point where the result becomes observable.
+// One participating device's partial tensor in a deferred all-reduce.
+struct vk_reduce_part {
+    vk_device dev;
+    vk_buffer buf;
+    uint64_t  off;
+};
+struct vk_pending_reduce {
+    size_t      nelem, nbytes;
+    ggml_type   type;
+    std::vector<vk_reduce_part> parts;  // one entry per participating device
+    std::vector<vk_reduce_read> reads;  // submitted partial reads, same order as parts
+};
+// Queued exchanges whose partial reads are already submitted; processed by
+// ggml_vk_flush_pending_reduces at the points where their result becomes observable.
+static std::mutex g_reduce_worker_mutex;
+static std::vector<vk_pending_reduce> g_reduce_worker_queue;
+
+static bool ggml_vk_have_pending_reduces() {
+    std::lock_guard<std::mutex> lock(g_reduce_worker_mutex);
+    return !g_reduce_worker_queue.empty();
 }
+
+// Wait for every staged partial read (each fence on its own device), then add on the
+// CPU and write the sum back to every participant with fire-and-forget compute-queue
+// copies.
+static void ggml_vk_reduce_finish(vk_pending_reduce& pr, std::vector<uint8_t>& sum) {
+    const size_t nelem = pr.nelem, nbytes = pr.nbytes;
+    const int n = (int) pr.parts.size();
+
+    // Wait for every partial read and reset its fence. The waits are sequential; after
+    // the first (longest) completes the rest are already signaled and return at once.
+    for (int i = 0; i < n; ++i) {
+        vk_reduce_read& rd = pr.reads[i];
+        rd.dev->device.waitForFences({ rd.dev->fence }, true, UINT64_MAX);
+        rd.dev->device.resetFences({ rd.dev->fence });
+        if (rd.dev->backend_ctx) {
+            rd.dev->backend_ctx->submit_pending = false;
+        }
+    }
+
+    // Sum the partials on the CPU.
+    sum.resize(nbytes);
+    if (pr.type == GGML_TYPE_F32) {
+        float * ps = (float *) sum.data();
+        for (int i = 0; i < n; ++i) {
+            const float * p = (const float *) pr.reads[i].mapped;
+            for (size_t k = 0; k < nelem; ++k) {
+                ps[k] = i == 0 ? p[k] : ps[k] + p[k];
+            }
+        }
+    } else {
+        ggml_fp16_t * ps = (ggml_fp16_t *) sum.data();
+        for (int i = 0; i < n; ++i) {
+            const ggml_fp16_t * p = (const ggml_fp16_t *) pr.reads[i].mapped;
+            for (size_t k = 0; k < nelem; ++k) {
+                ps[k] = i == 0 ? p[k] : ggml_fp32_to_fp16(ggml_fp16_to_fp32(ps[k]) + ggml_fp16_to_fp32(p[k]));
+            }
+        }
+    }
+
+    // Broadcast the sum back to every participant.
+    for (int i = 0; i < n; ++i) {
+        ggml_vk_reduce_write_back(pr.parts[i].dev, pr.parts[i].buf, pr.parts[i].off, sum.data(), nbytes);
+    }
+}
+
+static void ggml_vk_flush_pending_reduces() {
+    // Process any queued exchanges inline (their partial reads were already submitted).
+    std::vector<uint8_t> sum;
+    while (true) {
+        vk_pending_reduce pr;
+        {
+            std::lock_guard<std::mutex> lock(g_reduce_worker_mutex);
+            if (g_reduce_worker_queue.empty()) {
+                break;
+            }
+            pr = std::move(g_reduce_worker_queue.front());
+            g_reduce_worker_queue.erase(g_reduce_worker_queue.begin());
+        }
+        ggml_vk_reduce_finish(pr, sum);
+    }
+}
+
 
 // CUDA driver-API interop: map a Vulkan device to its CUDA context, and map a Vulkan
 // buffer to a CUDA device pointer (by exporting the OPAQUE_FD and importing it into CUDA
@@ -10702,7 +10853,7 @@ static vk_buffer ggml_vk_cuda_staging(vk_device dev, size_t size) {
 // DMA path (external_memory_fd + vkCmdCopyBuffer + a GPU add); otherwise it falls back
 // to host staging. REDUCE always runs as its own scheduler split, so producers are
 // flushed before the partials are moved.
-static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node) {
+static void ggml_vk_op_reduce_impl(ggml_backend_vk_context * ctx, ggml_tensor * node) {
     GGML_ASSERT(node->op == GGML_OP_REDUCE);
     GGML_ASSERT(node->op_params[0] == GGML_OP_ADD);
 
@@ -10848,54 +10999,43 @@ static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node)
         }
     }
 
-    // Host-staged reduce. For two Vulkan devices, submit both reads in parallel, wait
-    // once, add on the CPU, then submit both writes in parallel — this replaces four
-    // serial device<->host round-trips with two.
-    const bool overlapped = nhave == 2 && !multi_remote && remote_src && node->buffer && remote_src->buffer &&
-                            ggml_backend_buffer_is_vk(node->buffer) && ggml_backend_buffer_is_vk(remote_src->buffer);
-
-    if (overlapped) {
-        ggml_backend_vk_buffer_context * lb_ctx = (ggml_backend_vk_buffer_context *) node->buffer->context;
-        ggml_backend_vk_buffer_context * rb_ctx = (ggml_backend_vk_buffer_context *) remote_src->buffer->context;
-        vk_device local_dev  = lb_ctx->device.lock();
-        vk_device remote_dev = rb_ctx->device.lock();
-
-        if (local_dev && remote_dev && local_dev != remote_dev) {
-            vk_buffer local_buf  = lb_ctx->dev_buffer;
-            uint64_t  local_off  = vk_tensor_offset(node) + node->view_offs;
-            vk_buffer remote_buf = rb_ctx->dev_buffer;
-            uint64_t  remote_off = vk_tensor_offset(remote_src) + remote_src->view_offs;
-
-            static thread_local std::vector<uint8_t> part0, part1, sum;
-            part0.resize(nbytes);
-            part1.resize(nbytes);
-            sum.resize(nbytes);
-
-            std::vector<vk_staging_memcpy> mc0, mc1;
-            ggml_vk_reduce_read_submit(remote_dev, remote_buf, remote_off, part0.data(), nbytes, mc0);
-            ggml_vk_reduce_read_submit(local_dev, local_buf, local_off, part1.data(), nbytes, mc1);
-
-            ggml_vk_reduce_transfer_wait(remote_dev, mc0);
-            ggml_vk_reduce_transfer_wait(local_dev, mc1);
-
-            if (node->type == GGML_TYPE_F32) {
-                const float * p0 = (const float *) part0.data();
-                const float * p1 = (const float *) part1.data();
-                float * ps = (float *) sum.data();
-                for (size_t i = 0; i < nelem; ++i) ps[i] = p0[i] + p1[i];
-            } else {
-                const ggml_fp16_t * p0 = (const ggml_fp16_t *) part0.data();
-                const ggml_fp16_t * p1 = (const ggml_fp16_t *) part1.data();
-                ggml_fp16_t * ps = (ggml_fp16_t *) sum.data();
-                for (size_t i = 0; i < nelem; ++i) ps[i] = ggml_fp32_to_fp16(ggml_fp16_to_fp32(p0[i]) + ggml_fp16_to_fp32(p1[i]));
+    // Host-staged reduce: collect every participating Vulkan partial, defer the
+    // exchange (see vk_pending_reduce), submit a partial->host read on each device's
+    // compute queue, and complete the exchange (waits + CPU add + write-backs) at the
+    // point where the result becomes observable.
+    if (nhave >= 2 && node->buffer && ggml_backend_buffer_is_vk(node->buffer)) {
+        vk_pending_reduce pr;
+        pr.nelem = nelem; pr.nbytes = nbytes; pr.type = node->type;
+        bool all_vk = true;
+        for (int j = 0; j < nreduce; ++j) {
+            ggml_tensor * src = node->src[j];
+            if (!src) continue;
+            if (!src->buffer || !ggml_backend_buffer_is_vk(src->buffer)) { all_vk = false; break; }
+            ggml_backend_vk_buffer_context * bctx = (ggml_backend_vk_buffer_context *) src->buffer->context;
+            vk_device dev = bctx->device.lock();
+            if (!dev) { all_vk = false; break; }
+            for (const auto& p : pr.parts) {
+                if (p.dev == dev) { all_vk = false; break; }  // two partials on one device
             }
-
-            ggml_vk_reduce_write_submit(local_dev, local_buf, local_off, sum.data(), nbytes);
-            ggml_vk_reduce_write_submit(remote_dev, remote_buf, remote_off, sum.data(), nbytes);
-
-            std::vector<vk_staging_memcpy> empty;
-            ggml_vk_reduce_transfer_wait(local_dev, empty);
-            ggml_vk_reduce_transfer_wait(remote_dev, empty);
+            if (!all_vk) break;
+            uint64_t off = (src == local_src)
+                ? vk_tensor_offset(node) + node->view_offs
+                : vk_tensor_offset(src) + src->view_offs;
+            pr.parts.push_back({ dev, bctx->dev_buffer, off });
+        }
+        if (all_vk && pr.parts.size() >= 2) {
+            // A still-pending exchange must complete first -- the same activation
+            // buffer may be reused by the next layer's reduce.
+            ggml_vk_flush_pending_reduces();
+            for (const auto& p : pr.parts) {
+                vk_device dev = p.dev;
+                vk_buffer buf = p.buf;
+                pr.reads.push_back(ggml_vk_reduce_read_submit2(dev, buf, p.off, nbytes));
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_reduce_worker_mutex);
+                g_reduce_worker_queue.push_back(std::move(pr));
+            }
             return;
         }
     }
@@ -10938,6 +11078,9 @@ static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node)
     }
 }
 
+static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node) {
+    ggml_vk_op_reduce_impl(ctx, node);
+}
 // Returns true if node has enqueued work into the queue, false otherwise
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
 static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool dryrun, bool last_node, bool almost_ready, bool submit){
@@ -11578,6 +11721,13 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
 
+        // A deferred reduce exchange must enqueue its write-back copies on the compute
+        // queues before this batch is submitted, so the batch observes the reduced
+        // activations (queue order guarantees the copies execute first).
+        if (ggml_vk_have_pending_reduces()) {
+            ggml_vk_flush_pending_reduces();
+        }
+
         if (almost_ready && !ctx->almost_ready_fence_pending && !use_fence) {
             ggml_vk_submit(subctx, ctx->almost_ready_fence);
             ctx->almost_ready_fence_pending = true;
@@ -12053,6 +12203,10 @@ static void ggml_vk_flush_pending_compute(ggml_backend_vk_context * ctx) {
 }
 
 static void ggml_vk_synchronize_ctx(ggml_backend_vk_context * ctx) {
+    // Complete any deferred reduce exchange first: its result must be visible before
+    // anything the caller observes through synchronize.
+    ggml_vk_flush_pending_reduces();
+
     // flush pending transfer work (the async interface is currently unused, but the
     // path is kept for completeness)
     if (!ctx->transfer_ctx.expired()) {

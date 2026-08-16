@@ -293,12 +293,73 @@ in place:
 - `ggml_backend_vk_split_buffer_type()` is now a thin wrapper over the generic type with
   one entry per Vulkan device. `ggml_backend_supports_buft()` accepts the generic split
   type for every backend (it is a container for per-device sub-buffers).
-- **`GGML_OP_REDUCE`** (`supports_op` + `ggml_vk_op_reduce`): a synchronous host-staged
+- **`GGML_OP_REDUCE`** (`supports_op` + `ggml_vk_op_reduce`): a host-staged
   all-reduce. Each partial tensor is pulled with `ggml_backend_tensor_get`, summed in F32
   (F16/F32 supported), and the full sum is written back to every participant. REDUCE runs
   as its own scheduler split after the producers have completed, so the host round-trip
   is correct even though the backend still has no events/async copies. It is slow relative
   to a peer-to-peer ring reduce, but it is the correct first implementation.
+
+### 11b. Lean lazy host-staged reduce (dual-NVIDIA decode)
+
+The two-Vulkan-device host-staged reduce was rewritten to cut the per-exchange driver
+overhead and overlap the exchange with scheduler work:
+
+- **Lazy stash**: the REDUCE node no longer performs the exchange. It submits the two
+  partial→host-staging reads right away (as `vkCmdCopyBuffer` on each device's **compute
+  queue**, so they are queue-ordered after the producing kernels) and returns. The fence
+  waits, the CPU add and the fire-and-forget sum write-backs run later, at the first
+  point where the result becomes observable (just before the next compute batch is
+  submitted, at `synchronize`, or at any host read of a device tensor).
+- **Proper cross-stage memory barriers**: the copies read a compute-written tensor and
+  feed compute-consumed tensors, so they use explicit `COMPUTE→TRANSFER` and
+  `TRANSFER→COMPUTE` pipeline barriers. The generic `ggml_vk_sync_buffers` barrier uses
+  the queue's own stage flags on both sides, which does *not* cover a transfer-stage copy
+  on the compute queue — without the fix the copies silently read/write stale data.
+- **Fence lifecycle**: `dev->fence` is reset **after** every wait. Leaving it signaled
+  makes the next `vkQueueSubmit(…, dev->fence)` + `waitForFences` return immediately and
+  race with the copy (this was the source of a hard-to-find decode corruption).
+- **One combined wait**: the partial reads are fenced and then waited per-device
+  (each fence on its own device); the sum is written back with fire-and-forget
+  compute-queue copies (visible to the next split by queue order). The previous
+  sequence (per-device flush, transfer-queue read, wait, transfer-queue write, wait)
+  used ~6 submissions + ~6 fence waits per exchange; the new one uses N read submits +
+  N waits + N write submits for N devices.
+- **N devices**: the lazy host-staged path now handles any number of participating
+  Vulkan devices (previously `>2` devices fell back to the slow `tensor_get` loop).
+  Each device contributes one partial; the reads are submitted on all devices' compute
+  queues at stash time and the N-way sum is broadcast back to every participant.
+- `ggml_backend_sched_compute_splits` no longer `synchronize`s Vulkan backends before a
+  REDUCE split (their exchange flushes itself at the right point); non-Vulkan
+  participants (mixed CUDA runs) still get the host-staged sync.
+
+On two NVIDIA RTX PRO 4000 (Blackwell) GPUs, Qwen3.6-27B-IQK:
+
+| decode (`-n 128`, `--temp 0`) | tok/s | | prompt (1141 tok) | tok/s |
+|---|---|---|---|---|
+| single Vulkan0 | ~23.1 | | single Vulkan0 | ~500 |
+| `-sm graph` 2 GPUs | **~25.1** | | `-sm graph` 2 GPUs | **~611** |
+| `-sm graph` 3 GPUs | ~21.8 | | `-sm graph` 3 GPUs | ~122 |
+
+All `-sm graph` runs are **byte-identical** to the single-GPU reference (96-token
+greedy decode). Two devices now beat a single GPU for both decode and prompt
+eval; three devices do not: the per-layer exchange skew grows with the number of
+participants, the split count (and per-split scheduler latency) rises with device
+count, and the recurrent/attention ops are not split three ways — the marginal
+shard parallelism no longer pays for the added serialization. The 3-GPU prompt
+number is also host-bound: `nbytes >= 1MB` prompts take the N-way host-staged path
+(the shared-buffer P2P path is 2-device only), so each reduce moves the full tensor
+across PCIe several times.
+
+Remaining gap to CUDA's `-sm graph` (~44 tok/s on the same pair): CUDA's reduce is
+`cudaMemcpyPeerAsync` + on-stream kernels (no host round trip, no per-layer drain),
+while the Vulkan host-staged reduce must wait for every device to finish each layer's
+shard before the next layer can start. A no-op reduce (fence waits skipped) measures
+~32 tok/s, so even a free exchange only reaches ~1.4× single-GPU here — the rest is
+split imbalance and per-split scheduler latency. Closing the gap needs an on-device
+cross-device copy (the CUDA-interop `cuMemcpyPeer` path) ordered against Vulkan
+compute via a same-device external-semaphore import (see "Performance / architecture"
+below).
 - `llama_default_buffer_type_split()` keeps the CUDA/SYCL specialized split buffers for
   homogeneous static builds, and otherwise builds a per-slot buffer-type map from the
   registry and returns the generic split buffer. This makes `-sm graph` work in
