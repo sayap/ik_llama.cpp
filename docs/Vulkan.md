@@ -520,24 +520,21 @@ stay on the same backend as the view source.
   `src[4] != NULL && src[5] == NULL` (split_k is disabled when sinks are present).
   `tests/test-dsa.cpp` validates it (`test_flash_attn_dense_sinks`) against the CPU
   reference.
-- **Remaining**: end-to-end DSV4 decode is not yet byte-identical to CUDA. All Vulkan DSA
-  kernels (HC_PRE/HC_POST/DS4_COMP/MASK_TOPK/MASK_TO_IDX/SET_ROWS) and the indexed FA
-  match the CPU reference at real shapes in `tests/test-dsa.cpp`; the dense-with-sinks FA
-  also matches. The remaining divergence is a **scheduling/routing issue, not an FA
-  shader bug**:
-
-  - DeepSeek-V4's `attention.compress_ratios` is `[0, 0, 4, 128, 4, 128, ...]`, so layers
-    0..1 are **full-attention layers** (dense FA, `dsv4_build_attn(..., -1)`, no indexer)
-    and layers 2..42 are compressed (indexed FA).
-  - Instrumentation shows the `GGML_OP_FLASH_ATTN_EXT` node **never reaches the Vulkan
-    backend** for `-ngl 40/43 -ot exps=CPU` — the whole DSV4 attention (indexed *and*
-    dense) is scheduled on CPU while its Q/K/V tensors live on Vulkan. That cross-device
-    boundary (CPU FA reading Vulkan-side Q/K/V) is what corrupts the logits; bisect
-    (`-ngl 40` OK, `-ngl 41` first broken) traces it to the first offloaded compressed
-    layer. Fixing this means understanding why the FA is CPU-scheduled when its inputs
-    are on Vulkan, not changing the FA shaders. A defensive null-buffer abort in
-    `ggml_vk_op_f32` turns any future cross-backend miss into a clear error instead of a
-    segfault.
+- **Remaining → fixed**: end-to-end DSV4 decode was not byte-identical to CUDA. All
+  Vulkan DSA kernels (HC_PRE/HC_POST/DS4_COMP/MASK_TOPK/MASK_TO_IDX/SET_ROWS) and the
+  indexed FA match the CPU reference at real shapes in `tests/test-dsa.cpp`; the
+  dense-with-sinks FA also matches. The actual root cause of the remaining gibberish
+  was the **"flipped" rope** (`op_params[15] == 1`, used by DSV4 to place the rotated
+  dims at the *end* of the 512-wide head instead of the start). The Vulkan rope
+  shaders ignored that flag and always rotated the leading `n_dims` dims, corrupting
+  the Q/K/V positions for every attention layer. Fixed by threading a `rope_offset`
+  push constant into the `rope_neox`/`rope_norm` shaders (the leading non-rope dims
+  are copied verbatim and the trailing `n_dims` dims are rotated), matching
+  `ggml_compute_forward_rope_f32`. `DeepSeek-V4-Flash-0731-full` now decodes
+  coherently on `-dev Vulkan0,Vulkan1,Vulkan2 -sm layer -cmoe` (byte-identical to
+  CUDA on the tested greedy prompt). A defensive null-buffer abort in
+  `ggml_vk_op_f32` turns any future cross-backend miss into a clear error instead of
+  a segfault.
 
 ## Benchmarks (RTX 3090, Vulkan0)
 
@@ -627,9 +624,10 @@ record PP tok/s and TG tok/s for both.
    run in a dedicated scalar kernel (`flash_attn_indexed.comp`) for F16/Q8_0 KV caches,
    matching the CUDA DSA reader and validated in `tests/test-dsa.cpp` (see "DSV4
    flash-attention coverage"). Dense FA *with* sinks (no indexer) is now implemented
-   too (scalar + cm2 paths). **Remaining DSV4 gap**: the `GGML_OP_FLASH_ATTN_EXT` node
-   is scheduled on CPU (never reaching Vulkan) while its Q/K/V live on Vulkan; that
-   cross-device boundary — not the FA shaders — is the cause of the end-to-end gibberish.
+   too (scalar + cm2 paths). **Remaining DSV4 gap → fixed**: the end-to-end gibberish
+   was not an FA scheduling issue — it was the DSV4 "flipped" rope (see "DSV4
+   flash-attention coverage"); the rope shaders now honor `op_params[15]` and the
+   model decodes coherently on Vulkan.
 4. **`--fit` with `GGML_BACKEND_DL`** — fixed: per-device memory is now queried through
    the backend registry (`ggml_backend_reg_get_device_memory`), so DL builds report real
    free memory (and `--fit` no longer sees 0 MiB).

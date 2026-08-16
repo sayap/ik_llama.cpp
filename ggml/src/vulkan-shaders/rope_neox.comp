@@ -16,8 +16,38 @@ void main() {
     const uint row_x     = row_dst % ne1;
     const uint channel_x = row_dst / ne1;
 
-    const uint idst = row_dst*ne0 + i0/2;
-    const uint ix   = channel_x*p.s2 + row_x*p.s1 + i0/2;
+    const uint row_base  = channel_x*p.s2 + row_x*p.s1;
+    const uint drow_base = row_dst*ne0;
+
+    if (p.rope_offset != 0) {
+        // "Flipped" rope (DSV4): the rotated dims live at the end of the head.
+        // Copy the leading non-rope dims, rotate the trailing n_dims dims.
+        if (i0 < p.rope_offset) {
+            data_d[drow_base + i0 + 0] = data_a[row_base + i0 + 0];
+            data_d[drow_base + i0 + 1] = data_a[row_base + i0 + 1];
+            return;
+        }
+
+        const uint k = (i0 - p.rope_offset) / 2;
+
+        const float theta_base = data_pos[channel_x] * pow(p.theta_scale, float(k));
+
+        const float freq_factor = p.has_ff != 0 ? data_ff[k] : 1.0f;
+
+        float cos_theta, sin_theta;
+        rope_yarn(theta_base / freq_factor, 2*k, cos_theta, sin_theta);
+
+        const float x0 = float(data_a[row_base + p.rope_offset + k]);
+        const float x1 = float(data_a[row_base + p.rope_offset + k + p.n_dims/2]);
+
+        data_d[drow_base + p.rope_offset + k]          = D_TYPE(x0*cos_theta - x1*sin_theta);
+        data_d[drow_base + p.rope_offset + k + p.n_dims/2] = D_TYPE(x0*sin_theta + x1*cos_theta);
+
+        return;
+    }
+
+    const uint idst = drow_base + i0/2;
+    const uint ix   = row_base + i0/2;
 
     if (i0 >= p.n_dims) {
         data_d[idst + i0/2 + 0] = data_a[ix + i0/2 + 0];
