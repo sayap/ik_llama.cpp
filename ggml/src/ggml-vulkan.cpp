@@ -3950,8 +3950,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
         if (GGML_VK_SUBALLOCATION_BLOCK_SIZE != nullptr) {
             device->suballocation_block_size = std::stoul(GGML_VK_SUBALLOCATION_BLOCK_SIZE);
         } else {
-            // Limit batching of allocations to 1GB by default to avoid fragmentation issues
-            device->suballocation_block_size = 1024*1024*1024;
+            // Default to the driver's max single-allocation size instead of a hard
+            // 1 GiB cap: large fused MoE expert weights (e.g. DeepSeek-V4's ~2.3 GiB
+            // ffn_gate_up_exps tensors) must live in a single contiguous buffer and
+            // were previously rejected with "too large to fit in a Vulkan buffer".
+            // GGML_VK_SUBALLOCATION_BLOCK_SIZE can still cap it to reduce fragmentation.
+            device->suballocation_block_size = device->max_memory_allocation_size;
         }
         device->suballocation_block_size = std::min(device->suballocation_block_size, device->max_memory_allocation_size);
 
@@ -4360,6 +4364,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
 #endif
 #endif
         device->name = GGML_VK_NAME + std::to_string(idx);
+
+        GGML_LOG_INFO("ggml_vulkan: %s max single allocation size: %.1f GiB, suballocation block size: %.1f GiB\n",
+            device->name.c_str(),
+            device->max_memory_allocation_size / (1024.0*1024.0*1024.0),
+            device->suballocation_block_size / (1024.0*1024.0*1024.0));
 
         device_create_info = {
             vk::DeviceCreateFlags(),
