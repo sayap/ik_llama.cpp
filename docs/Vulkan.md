@@ -501,16 +501,23 @@ stay on the same backend as the view source.
 
 - Added FA head size **512** (K=V=512) for DSV4 raw attention; previously
   `fa_get_head_sizes` rejected it and the whole attention fell back to CPU.
-- The Vulkan FA shader only implements dense FA (`src[0..3]`). Sinks (`src[4]`) and the
-  indexed variant (`src[5]`) were silently ignored, so `supports_op` now rejects them and
-  they fall back to the CPU backend (correct, but slow). DSV4 uses both, so its attention
-  currently runs on CPU in hybrid `-cmoe` runs.
+- The dense Vulkan FA shader implements only `src[0..3]`. The DSV4 **indexed** variant
+  (`src[5]`, a per-row top-k I32 gather) and the per-head **attention sinks** (`src[4]`)
+  are now implemented by a dedicated scalar kernel `flash_attn_indexed.comp` (one thread
+  per (query row, head), online softmax over the gathered keys, sink folded into the
+  denominator/max exactly like the CPU reference). K/V F16 and Q8_0 are supported,
+  matching the CUDA DSA reader. `supports_op` routes indexed FA to it when the graph is
+  single-KV-head / single-batch (the shape the DSV4 builder and `dsa_attn.cu` produce),
+  and `tests/test-dsa.cpp` now validates it against the CPU reference (single- and
+  multi-token, F16/Q8_0 KV, with/without sinks, with trailing `-1` index padding, and the
+  DSV4 512/512 head shape). Dense FA *with* sinks (no indexer) still falls back to CPU.
 - **Remaining**: end-to-end DSV4 decode is not yet byte-identical to CUDA. All Vulkan DSA
-  kernels (HC_PRE/HC_POST/DS4_COMP/MASK_TOPK/MASK_TO_IDX/SET_ROWS) match the CPU
-  reference at real shapes in `tests/test-dsa.cpp`, so the divergence traces to the CPU
-  fallback of the DSV4 indexed+sinks flash attention (or a hybrid CPU/GPU boundary issue),
-  not the Vulkan DSA ops. A defensive null-buffer abort in `ggml_vk_op_f32` turns any
-  future cross-backend miss into a clear error instead of a segfault.
+  kernels (HC_PRE/HC_POST/DS4_COMP/MASK_TOPK/MASK_TO_IDX/SET_ROWS) and the indexed FA
+  match the CPU reference at real shapes in `tests/test-dsa.cpp`, so the divergence (if
+  any remains) traces to the dense-with-sinks CPU fallback or a hybrid CPU/GPU boundary
+  issue, not the Vulkan DSA/indexed-FA ops. A defensive null-buffer abort in
+  `ggml_vk_op_f32` turns any future cross-backend miss into a clear error instead of a
+  segfault.
 
 ## Benchmarks (RTX 3090, Vulkan0)
 
@@ -595,11 +602,12 @@ record PP tok/s and TG tok/s for both.
 4. **Hybrid CPU/GPU view-allocation (`ROPE_BACK`)** — **fixed**: the scheduler now keeps
    in-place view ops on the view source's backend, so `-sm layer -cmoe` no longer crashes
    on a null device buffer (see "Hybrid CPU/GPU view-allocation" above).
-5. **DSV4 flash-attention indexed + sinks** — the Vulkan FA shader only implements dense
-   FA; DSV4's sinks (`src[4]`) and indexed (`src[5]`) variants fall back to CPU. This is
-   correct but slow, and end-to-end DSV4 decode is not yet byte-identical to CUDA (the
-   divergence traces to that CPU FA fallback, not the Vulkan DSA ops). Implementing
-   indexed FA + sinks on Vulkan is the next lever.
+5. **DSV4 flash-attention indexed + sinks** — **now implemented**: the indexed FA
+   variant (`src[5]`, per-row top-k gather) and the per-head attention sinks (`src[4]`)
+   run in a dedicated scalar kernel (`flash_attn_indexed.comp`) for F16/Q8_0 KV caches,
+   matching the CUDA DSA reader and validated in `tests/test-dsa.cpp` (see "DSV4
+   flash-attention coverage"). Dense FA *with* sinks (no indexer) still falls back to
+   CPU; that is the remaining DSV4 FA gap.
 4. **`--fit` with `GGML_BACKEND_DL`** — fixed: per-device memory is now queried through
    the backend registry (`ggml_backend_reg_get_device_memory`), so DL builds report real
    free memory (and `--fit` no longer sees 0 MiB).
@@ -796,8 +804,11 @@ Still not supported (their matmuls run on CPU), in priority order:
 - `tests/test-dsa.cpp` validates `SINKHORN`, `HC_PRE`, `HC_POST`, `DS4_COMP`, `MASK_TOPK`,
   `MASK_TO_IDX`, `INDEXER_TOPK` and `LATENT_ATTN` against the CPU reference on a target
   backend (all S sizes, F32/F16/Q8_0 latent caches, both DS4 compression types, dense +
-  indexed latent attention). Run as `test-dsa CPU|Vulkan0|CUDA0`. INDEXER_TOPK is compared
-  as a per-row *set* because the CPU reference's bucket top-k is not sorted.
+  indexed latent attention), plus the DSV4 **indexed flash attention + sinks**
+  (`GGML_OP_FLASH_ATTN_EXT` with `src[5]`/`src[4]`: single- and multi-token, F16/Q8_0
+  KV, with/without sinks, trailing `-1` index padding, and the 512/512 head shape). Run
+  as `test-dsa CPU|Vulkan0|CUDA0`. INDEXER_TOPK is compared as a per-row *set* because
+  the CPU reference's bucket top-k is not sorted.
 - `tests/test-iqk-quants.cpp` validates the 15 IQK/KT types against the scalar dequant
   reference (the format definition): single-token decode, small batches, larger K,
   multi-token (dequant-to-F16 path), MoE (`MUL_MAT_ID`) and `GET_ROWS` (quantized token

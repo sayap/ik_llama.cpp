@@ -584,6 +584,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_indexer_topk_score[2];
     vk_pipeline pipeline_indexer_topk_select;
     vk_pipeline pipeline_latent_attn[3];
+    vk_pipeline pipeline_flash_attn_indexed[2];
 
     // [src/dst 0=fp32,1=fp16]
     vk_pipeline pipeline_gelu[2];
@@ -1005,6 +1006,28 @@ struct vk_op_latent_attn_push_constants {
     uint32_t mask_nb1;
     uint32_t has_mask;
     uint32_t indices_nb1;
+    uint32_t dst_nb1;
+    uint32_t dst_nb2;
+};
+
+struct vk_op_flash_attn_indexed_push_constants {
+    uint32_t Dk;
+    uint32_t Dv;
+    uint32_t T;
+    uint32_t H;
+    uint32_t KV;
+    uint32_t topk;
+    float scale;
+    float softcap;
+    uint32_t k_nb1;
+    uint32_t v_nb1;
+    uint32_t q_nb1;
+    uint32_t q_nb2;
+    uint32_t mask_nb1;
+    uint32_t indices_nb1;
+    uint32_t sinks_nb0;
+    uint32_t has_mask;
+    uint32_t has_sinks;
     uint32_t dst_nb1;
     uint32_t dst_nb2;
 };
@@ -3508,6 +3531,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_latent_attn[0], "latent_attn_f32", latent_attn_f32_len, latent_attn_f32_data, "main", 7, sizeof(vk_op_latent_attn_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_latent_attn[1], "latent_attn_f16", latent_attn_f16_len, latent_attn_f16_data, "main", 7, sizeof(vk_op_latent_attn_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_latent_attn[2], "latent_attn_q8_0", latent_attn_q8_0_len, latent_attn_q8_0_data, "main", 7, sizeof(vk_op_latent_attn_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_indexed[0], "flash_attn_indexed_f16", flash_attn_indexed_f16_len, flash_attn_indexed_f16_data, "main", 7, sizeof(vk_op_flash_attn_indexed_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_indexed[1], "flash_attn_indexed_q8_0", flash_attn_indexed_q8_0_len, flash_attn_indexed_q8_0_data, "main", 7, sizeof(vk_op_flash_attn_indexed_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f32, "cpy_f32_f32", cpy_f32_f32_len, cpy_f32_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f16, "cpy_f32_f16", cpy_f32_f16_len, cpy_f32_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -7552,6 +7577,87 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                     },
                                     pc, { workgroups_x, workgroups_y, workgroups_z });
     }
+}
+
+// Indexed flash attention (DSV4): each query row attends to the top-k KV rows
+// gathered by an I32 index tensor (src[5]) plus an optional per-head attention
+// sink (src[4]). Implemented as one scalar shader per supported KV type
+// (F16, Q8_0), mirroring the CUDA DSA reader (dsa_attn.cu).
+static void ggml_vk_flash_attn_indexed(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, const ggml_tensor * indices, ggml_tensor * dst, bool dryrun = false) {
+    VK_LOG_DEBUG("ggml_vk_flash_attn_indexed((" << q << "), (" << k << "), (" << v << "), (" << dst << ")" << (dryrun ? "dryrun" : "") << ")");
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == v->type);
+    GGML_ASSERT(k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(mask && mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(indices && indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(!sinks || sinks->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    // Single KV head group and single batch only (matches the CUDA DSA reader).
+    GGML_ASSERT(k->ne[2] == 1 && k->ne[3] == 1);
+    GGML_ASSERT(v->ne[2] == 1 && v->ne[3] == 1);
+    GGML_ASSERT(q->ne[3] == 1);
+    GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
+
+    const uint32_t cache_idx = k->type == GGML_TYPE_F16 ? 0u : 1u;
+    vk_pipeline pipeline = ctx->device->pipeline_flash_attn_indexed[cache_idx];
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        return;
+    }
+
+    float scale = 1.0f;
+    float softcap = 0.0f;
+    memcpy(&scale,   (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (softcap != 0.0f) {
+        scale /= softcap;
+    }
+
+    const uint32_t T      = (uint32_t) q->ne[1];
+    const uint32_t H      = (uint32_t) q->ne[2];
+    const uint32_t topk   = (uint32_t) indices->ne[0];
+
+    ggml_backend_vk_buffer_context * q_ctx       = (ggml_backend_vk_buffer_context *) q->buffer->context;
+    ggml_backend_vk_buffer_context * k_ctx       = (ggml_backend_vk_buffer_context *) k->buffer->context;
+    ggml_backend_vk_buffer_context * v_ctx       = (ggml_backend_vk_buffer_context *) v->buffer->context;
+    ggml_backend_vk_buffer_context * mask_ctx    = (ggml_backend_vk_buffer_context *) mask->buffer->context;
+    ggml_backend_vk_buffer_context * indices_ctx = (ggml_backend_vk_buffer_context *) indices->buffer->context;
+    ggml_backend_vk_buffer_context * sinks_ctx   = sinks ? (ggml_backend_vk_buffer_context *) sinks->buffer->context : nullptr;
+    ggml_backend_vk_buffer_context * dst_ctx     = (ggml_backend_vk_buffer_context *) dst->buffer->context;
+
+    const vk_op_flash_attn_indexed_push_constants pc = {
+        (uint32_t) q->ne[0],
+        (uint32_t) v->ne[0],
+        T, H,
+        (uint32_t) k->ne[1],
+        topk,
+        scale, softcap,
+        (uint32_t)(k->nb[1] / ggml_type_size(k->type)),
+        (uint32_t)(v->nb[1] / ggml_type_size(v->type)),
+        (uint32_t)(q->nb[1] / sizeof(float)),
+        (uint32_t)(q->nb[2] / sizeof(float)),
+        (uint32_t)(mask->nb[1] / sizeof(uint16_t)),
+        (uint32_t)(indices->nb[1] / sizeof(int32_t)),
+        sinks ? (uint32_t)(sinks->nb[0] / sizeof(float)) : 0u,
+        mask ? 1u : 0u,
+        sinks ? 1u : 0u,
+        (uint32_t)(dst->nb[1] / sizeof(float)),
+        (uint32_t)(dst->nb[2] / sizeof(float)),
+    };
+
+    vk_buffer dummy = q_ctx->dev_buffer;
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        vk_subbuffer{ q_ctx->dev_buffer,       vk_tensor_offset(q) + q->view_offs,       VK_WHOLE_SIZE },
+        vk_subbuffer{ k_ctx->dev_buffer,       vk_tensor_offset(k) + k->view_offs,       VK_WHOLE_SIZE },
+        vk_subbuffer{ v_ctx->dev_buffer,       vk_tensor_offset(v) + v->view_offs,       VK_WHOLE_SIZE },
+        vk_subbuffer{ mask_ctx->dev_buffer,    vk_tensor_offset(mask) + mask->view_offs, VK_WHOLE_SIZE },
+        vk_subbuffer{ indices_ctx->dev_buffer, vk_tensor_offset(indices) + indices->view_offs, VK_WHOLE_SIZE },
+        vk_subbuffer{ sinks_ctx ? sinks_ctx->dev_buffer : dummy, sinks ? vk_tensor_offset(sinks) + sinks->view_offs : 0, VK_WHOLE_SIZE },
+        vk_subbuffer{ dst_ctx->dev_buffer,     vk_tensor_offset(dst) + dst->view_offs,   VK_WHOLE_SIZE },
+    }, pc, { T * H, 1, 1 });
 }
 
 #define GGML_ROPE_TYPE_NEOX   2
@@ -12086,7 +12192,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_FLASH_ATTN_EXT:
-        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node, dryrun);
+        if (src5 != nullptr) {
+            ggml_vk_flash_attn_indexed(ctx, compute_ctx, src0, src1, src2, src3, src4, src5, node, dryrun);
+        } else {
+            ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node, dryrun);
+        }
 
         break;
 
@@ -13336,11 +13446,7 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
             {
                 const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *)backend->context;
                 auto& device = ctx->device;
-                bool coopmat2 = device->coopmat2;
-                FaHeadSizes head_sizes = fa_get_head_sizes(op->src[1]->ne[0], op->src[2]->ne[0]);
-                if (head_sizes == FA_HEAD_SIZE_UNSUPPORTED) {
-                    return false;
-                }
+
                 if (op->src[0]->type != GGML_TYPE_F32) {
                     return false;
                 }
@@ -13350,11 +13456,49 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                 if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
                     return false;
                 }
-                // The Vulkan flash-attn shader only implements plain dense FA
-                // (src[0..3]). Sinks (src[4]) and the indexed variant (src[5])
-                // are not implemented; claim them unsupported so they fall back
-                // to CPU instead of silently computing the wrong attention.
-                if (op->src[4] != NULL || op->src[5] != NULL) {
+
+                // Indexed FA (DSV4): each query row attends to the top-k rows
+                // gathered by src[5] (I32), with an optional per-head attention
+                // sink in src[4]. The scalar indexed kernel handles any head
+                // size, so no fa_get_head_sizes gate applies here.
+                if (op->src[5] != NULL) {
+                    if (op->src[5]->type != GGML_TYPE_I32) {
+                        return false;
+                    }
+                    if (op->src[4] && op->src[4]->type != GGML_TYPE_F32) {
+                        return false;
+                    }
+                    if (op->src[3] == NULL) {
+                        return false;
+                    }
+                    if (op->src[1]->type != op->src[2]->type) {
+                        return false;
+                    }
+                    // Single KV head group and single batch, matching the CUDA
+                    // DSA reader (dsa_attn.cu).
+                    if (op->src[1]->ne[2] != 1 || op->src[1]->ne[3] != 1 ||
+                        op->src[2]->ne[2] != 1 || op->src[2]->ne[3] != 1 ||
+                        op->src[0]->ne[3] != 1) {
+                        return false;
+                    }
+                    switch (op->src[1]->type) {
+                    case GGML_TYPE_F16:
+                    case GGML_TYPE_Q8_0:
+                        return true;
+                    default:
+                        return false;
+                    }
+                }
+
+                // Dense FA with sinks (src[4]) is not implemented yet; fall
+                // back to the CPU backend.
+                if (op->src[4] != NULL) {
+                    return false;
+                }
+
+                bool coopmat2 = device->coopmat2;
+                FaHeadSizes head_sizes = fa_get_head_sizes(op->src[1]->ne[0], op->src[2]->ne[0]);
+                if (head_sizes == FA_HEAD_SIZE_UNSUPPORTED) {
                     return false;
                 }
                 // It's straightforward to support different K/V dequant, but would
@@ -14197,6 +14341,14 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
     if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
         const float * params = (const float *)tensor->op_params;
         tensor_clone = ggml_flash_attn_ext(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], params[0], params[1], params[2]);
+        ggml_flash_attn_ext_set_prec(tensor_clone, (ggml_prec)((const int32_t *)tensor->op_params)[3]);
+        tensor_clone->op_params[4] = ((const int32_t *)tensor->op_params)[4];
+        if (src_clone[4] != nullptr) {
+            ggml_flash_attn_ext_add_sinks(tensor_clone, src_clone[4]);
+        }
+        if (src_clone[5] != nullptr) {
+            tensor_clone->src[5] = src_clone[5];
+        }
     } else if (tensor->op == GGML_OP_MUL_MAT) {
         tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
     } else if (tensor->op == GGML_OP_MUL_MAT_ID) {
