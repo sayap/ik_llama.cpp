@@ -516,11 +516,22 @@ stay on the same backend as the view source.
   DSV4 512/512 head shape). Dense FA *with* sinks (no indexer) still falls back to CPU.
 - **Remaining**: end-to-end DSV4 decode is not yet byte-identical to CUDA. All Vulkan DSA
   kernels (HC_PRE/HC_POST/DS4_COMP/MASK_TOPK/MASK_TO_IDX/SET_ROWS) and the indexed FA
-  match the CPU reference at real shapes in `tests/test-dsa.cpp`, so the divergence (if
-  any remains) traces to the dense-with-sinks CPU fallback or a hybrid CPU/GPU boundary
-  issue, not the Vulkan DSA/indexed-FA ops. A defensive null-buffer abort in
-  `ggml_vk_op_f32` turns any future cross-backend miss into a clear error instead of a
-  segfault.
+  match the CPU reference at real shapes in `tests/test-dsa.cpp`. The remaining divergence
+  is the **dense-with-sinks CPU fallback**, now localized precisely:
+
+  - DeepSeek-V4's `attention.compress_ratios` ends with `[0, 0, 0]`, so the last 3 layers
+    (40..42) are **full-attention layers with no indexer**; `dsv4_build_attn(..., -1)`
+    builds them as `flash_attn_ext` + `add_sinks` with `src[5] == NULL`.
+  - `supports_op` rejects that combo (dense FA + sinks), so those layers' attention runs
+    on CPU while their Q8_0 weights and the KV cache live on Vulkan — a cross-device
+    boundary that corrupts the logits and produces the end-to-end gibberish.
+  - Bisect confirms it: `-ngl 40 -ot exps=CPU` decodes correctly, `-ngl 41` is the first
+    broken point, and forcing the individual attention *ops* to CPU
+    (`GGML_VK_FORCE_CPU_OP`) does not help because the weights/KV stay on Vulkan.
+  - **Fix**: implement dense FA + sinks on Vulkan (scalar and cm2 FA paths, a `sinks`
+    binding + per-head sink in the final renormalization, and `supports_op` accepting
+    `src[4] != NULL && src[5] == NULL`). A defensive null-buffer abort in `ggml_vk_op_f32`
+    turns any future cross-backend miss into a clear error instead of a segfault.
 
 ## Benchmarks (RTX 3090, Vulkan0)
 
@@ -610,7 +621,10 @@ record PP tok/s and TG tok/s for both.
    run in a dedicated scalar kernel (`flash_attn_indexed.comp`) for F16/Q8_0 KV caches,
    matching the CUDA DSA reader and validated in `tests/test-dsa.cpp` (see "DSV4
    flash-attention coverage"). Dense FA *with* sinks (no indexer) still falls back to
-   CPU; that is the remaining DSV4 FA gap.
+   CPU; that is the remaining DSV4 FA gap — and it is the cause of the end-to-end
+   gibberish: the last 3 DSV4 layers (compress_ratios = 0) use this dense-with-sinks
+   path, so their attention runs on CPU while the weights/KV stay on Vulkan (see
+   "DSV4 flash-attention coverage").
 4. **`--fit` with `GGML_BACKEND_DL`** — fixed: per-device memory is now queried through
    the backend registry (`ggml_backend_reg_get_device_memory`), so DL builds report real
    free memory (and `--fit` no longer sees 0 MiB).
