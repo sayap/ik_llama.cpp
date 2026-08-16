@@ -2907,8 +2907,8 @@ static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_back
     return GGML_STATUS_SUCCESS;
 }
 
+ 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
-
     for (auto & item : sched->needs_sync) item = true;
 
     if (sched->is_async && sched->n_backends > 2 && sched->split_mode_graph && sched->has_reduce) {
@@ -3219,12 +3219,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // A REDUCE reads partials from every participating device; synchronize all
-        // backends so their compute is visible to the host-staged all-reduce. (Vulkan
-        // flushes lazily on tensor_get, but e.g. CUDA's get_tensor uses a per-thread
-        // stream and does not drain the backend compute stream.)
+        // A REDUCE reads partials from every participating device. The Vulkan REDUCE
+        // defers its exchange (the partial reads are submitted at stash time and the
+        // waits + write-back land just before the next compute batch is submitted), so
+        // synchronizing the Vulkan backends here would only drain the compute the
+        // exchange is supposed to overlap with. Non-Vulkan backends (e.g. a mixed CUDA
+        // participant) still need the host-staged semantics.
         if (split->graph.n_nodes > 0 && split->graph.nodes[0]->op == GGML_OP_REDUCE) {
             for (int b = 0; b < sched->n_backends; ++b) {
+                if (strncmp(ggml_backend_name(sched->backends[b]), "Vulkan", 6) == 0) {
+                    continue;
+                }
                 ggml_backend_synchronize(sched->backends[b]);
             }
         }
