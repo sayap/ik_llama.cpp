@@ -798,6 +798,12 @@ int main(int argc, char ** argv) {
     test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_Q8_0, 64, 64, 1, 4, 128, 32, true, false);
     test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_F16, 512, 512, 1, 2, 1024, 32, true, false);
 
+    // DSV4 real shapes: 512 head, 64 query heads, top-k 256/512 with sinks.
+    test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_F16, 512, 512, 1, 64, 2048, 256, true, true);
+    test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_F16, 512, 512, 1, 64, 2048, 512, true, true);
+    test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_F16, 512, 512, 4, 64, 2048, 512, true, false);
+    test_flash_attn_indexed(backend_cpu, backend_tgt, GGML_TYPE_F16, 512, 512, 4, 64, 2048, 256, false, true);
+
     test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F32, 32, 128, 4, 4, 8);
     test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F32, 16, 64, 3, 2, 6);
     test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F16, 32, 128, 4, 4, 8);
