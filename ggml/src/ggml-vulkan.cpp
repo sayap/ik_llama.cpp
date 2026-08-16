@@ -1142,6 +1142,7 @@ struct vk_op_rope_push_constants {
     int32_t sections[4];
     uint32_t is_imrope;
     uint32_t is_back;
+    uint32_t rope_offset;
 };
 
 struct vk_op_soft_max_push_constants {
@@ -9924,6 +9925,14 @@ static void ggml_vk_rope(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     }
 
     const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
+    const bool is_mrope  = mode & GGML_ROPE_TYPE_MROPE;
+    const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
+
+    // DSV4-style "flipped" rope: the rotated dims live at the end of the head
+    // (ggml_compute_forward_rope_f32 sets op_params[15] == 1). The rope shaders
+    // copy the leading non-rope dims and rotate the trailing n_dims dims.
+    const bool is_flipped = ((int32_t *) dst->op_params)[15] == 1 && !is_vision && !is_mrope;
+    const uint32_t rope_offset = is_flipped ? (uint32_t)(src0->ne[0] - n_dims) : 0u;
 
     float corr_dims[2];
     ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
@@ -9937,7 +9946,7 @@ static void ggml_vk_rope(ggml_backend_vk_context * ctx, vk_context& subctx, cons
         (uint32_t)src0->ne[0], (uint32_t)n_dims, freq_scale, (uint32_t)src0->ne[1],
         freq_base, ext_factor, attn_factor, {corr_dims[0], corr_dims[1]}, theta_scale,
         src2 != nullptr, (uint32_t)src0->ne[2], s1, s2,
-        sections[0], sections[1], sections[2], sections[3], is_imrope, backprop
+        sections[0], sections[1], sections[2], sections[3], is_imrope, backprop, rope_offset
     }, dryrun);
 }
 

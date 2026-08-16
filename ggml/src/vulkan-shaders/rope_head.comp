@@ -31,6 +31,7 @@ layout (push_constant) uniform parameter {
     int sections[4];
     uint is_imrope;
     uint is_back;
+    uint rope_offset;
 } p;
 
 float rope_yarn_ramp(const float low, const float high, const uint i0) {
