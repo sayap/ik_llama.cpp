@@ -73,8 +73,8 @@ struct vk_cuda_api {
     CUresult (*cuImportExternalMemory)(CUexternalMemory *, const CUDA_EXTERNAL_MEMORY_HANDLE_DESC *) = nullptr;
     CUresult (*cuExternalMemoryGetMappedBuffer)(CUdeviceptr *, CUexternalMemory, const CUDA_EXTERNAL_MEMORY_BUFFER_DESC *) = nullptr;
     CUresult (*cuMemcpyPeer)(CUdeviceptr, CUcontext, CUdeviceptr, CUcontext, size_t) = nullptr;
-    CUresult (*cuMemcpyHtoD)(CUdeviceptr, const void *, size_t) = nullptr;
-    CUresult (*cuMemcpyDtoH)(void *, CUdeviceptr, size_t) = nullptr;
+    CUresult (*cuMemcpyHtoD_v2)(CUdeviceptr, const void *, size_t) = nullptr;
+    CUresult (*cuMemcpyDtoH_v2)(void *, CUdeviceptr, size_t) = nullptr;
     CUresult (*cuGetErrorString)(CUresult, const char **) = nullptr;
 };
 
@@ -101,15 +101,15 @@ static void ggml_vk_cuda_init() {
     LOAD_CUDA_FN(cuImportExternalMemory);
     LOAD_CUDA_FN(cuExternalMemoryGetMappedBuffer);
     LOAD_CUDA_FN(cuMemcpyPeer);
-    LOAD_CUDA_FN(cuMemcpyHtoD);
-    LOAD_CUDA_FN(cuMemcpyDtoH);
+    LOAD_CUDA_FN(cuMemcpyHtoD_v2);
+    LOAD_CUDA_FN(cuMemcpyDtoH_v2);
     LOAD_CUDA_FN(cuGetErrorString);
 #undef LOAD_CUDA_FN
 
     if (!g_cuda.cuInit || !g_cuda.cuDeviceGet || !g_cuda.cuDevicePrimaryCtxRetain ||
         !g_cuda.cuCtxSetCurrent || !g_cuda.cuImportExternalMemory ||
         !g_cuda.cuExternalMemoryGetMappedBuffer || !g_cuda.cuMemcpyPeer ||
-        !g_cuda.cuMemcpyHtoD || !g_cuda.cuMemcpyDtoH) {
+        !g_cuda.cuMemcpyHtoD_v2 || !g_cuda.cuMemcpyDtoH_v2) {
         dlclose(g_cuda.lib);
         g_cuda = vk_cuda_api{};
         return;
@@ -460,7 +460,7 @@ struct vk_device_struct {
     // CUDA driver-API interop for the NVIDIA cross-device P2P reduce (optional)
     CUcontext cuda_ctx = nullptr;
     CUdevice  cuda_dev = -1;
-    vk_buffer cuda_staging;
+    vk_buffer cuda_staging;   // touched by the CUDA copy engine
 
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
@@ -3794,6 +3794,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         const float priorities[] = { 1.0f, 1.0f };
         device->single_queue = compute_queue_family_index == transfer_queue_family_index && queue_family_props[compute_queue_family_index].queueCount == 1;
+        fprintf(stderr, "[queue] dev=%zu single=%d cfam=%u tfam=%u qcount=%u\n", idx, device->single_queue?1:0, compute_queue_family_index, transfer_queue_family_index, queue_family_props[compute_queue_family_index].queueCount);
 
         std::vector<vk::DeviceQueueCreateInfo> device_queue_create_infos;
         if (compute_queue_family_index != transfer_queue_family_index) {
@@ -10676,20 +10677,19 @@ static bool ggml_vk_cuda_probe(vk_device dev) {
     }
     float magic[4] = { 1.5f, -2.5f, 3.25f, -4.75f };
     g_cuda.cuCtxSetCurrent(dev->cuda_ctx);
-    if (g_cuda.cuMemcpyHtoD(p, magic, sizeof(magic)) != CUDA_SUCCESS) {
+    if (g_cuda.cuMemcpyHtoD_v2(p, magic, sizeof(magic)) != CUDA_SUCCESS) {
         return false;
     }
     if (g_cuda.cuCtxSynchronize() != CUDA_SUCCESS) {
         return false;
     }
-    float read[4] = { 0 };
-    ggml_vk_buffer_read(probe, 0, read, sizeof(read));
-    return memcmp(magic, read, sizeof(magic)) == 0;
+    float vk_read[4] = { 0 };
+    ggml_vk_buffer_read(probe, 0, vk_read, sizeof(vk_read));
+    return memcmp(magic, vk_read, sizeof(magic)) == 0;
 }
 
-// Per-device device-local staging buffer for the CUDA P2P reduce. The remote partial is
-// copied into the local device's staging buffer with cuMemcpyPeer, then the local device
-// adds staging into its own partial with a GPU kernel.
+// Per-device device-local staging buffer for the CUDA P2P reduce. The CUDA copy engine
+// writes/reads cuda_staging.
 static vk_buffer ggml_vk_cuda_staging(vk_device dev, size_t size) {
     if (dev->cuda_staging && dev->cuda_staging->size >= size) {
         return dev->cuda_staging;
@@ -10737,9 +10737,12 @@ static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node)
 
     // Real P2P via CUDA driver-API interop (NVIDIA only): export both partials'
     // buffers as OPAQUE_FD, import them into CUDA, and use cuMemcpyPeer for the
-    // cross-device copy. This avoids the host round-trip entirely.
+    // cross-device copy. This is opt-in (GGML_VK_CUDA_P2P=1) because the CUDA copy
+    // engine and the Vulkan compute engine do not share a coherent cache domain on
+    // NVIDIA, and the cross-engine flush needed around the copies is not yet wired up.
     ggml_vk_cuda_init();
-    if (g_cuda.loaded && !multi_remote && remote_src && node->buffer && remote_src->buffer &&
+    const bool want_cuda_p2p = getenv("GGML_VK_CUDA_P2P") != nullptr;
+    if (want_cuda_p2p && g_cuda.loaded && !multi_remote && remote_src && node->buffer && remote_src->buffer &&
         ggml_backend_buffer_is_vk(node->buffer) && ggml_backend_buffer_is_vk(remote_src->buffer)) {
         ggml_backend_vk_buffer_context * lb_ctx = (ggml_backend_vk_buffer_context *) node->buffer->context;
         ggml_backend_vk_buffer_context * rb_ctx = (ggml_backend_vk_buffer_context *) remote_src->buffer->context;
@@ -10755,7 +10758,7 @@ static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node)
             }
         }
 
-        if (g_cuda.loaded && local_dev && remote_dev && local_dev != remote_dev) {
+        if (g_cuda.loaded && want_cuda_p2p && local_dev && remote_dev && local_dev != remote_dev) {
             vk_buffer local_buf  = lb_ctx->dev_buffer;
             uint64_t  local_off  = vk_tensor_offset(node) + node->view_offs;
             vk_buffer remote_buf = rb_ctx->dev_buffer;
@@ -10769,15 +10772,12 @@ static void ggml_vk_op_reduce(ggml_backend_vk_context * ctx, ggml_tensor * node)
             CUdeviceptr staging_base = staging ? ggml_vk_cuda_ptr(local_dev, staging) : 0;
 
             if (local_ctx && remote_ctx && local_base && remote_base && staging_base) {
-                // Producers are flushed by the scheduler before a REDUCE split, but be
-                // explicit: cuMemcpyPeer reads the remote partial directly.
                 ggml_vk_flush_pending_compute(ctx);
                 ggml_vk_flush_pending_compute(remote_dev->backend_ctx);
 
                 g_cuda.cuCtxSetCurrent(local_ctx);
                 CUresult r = g_cuda.cuMemcpyPeer(staging_base, local_ctx, remote_base + remote_off, remote_ctx, nbytes);
                 if (r == CUDA_SUCCESS) {
-                    // local += staging on the local device (vk_reduce_add waits on its fence)
                     vk_reduce_add(ctx, local_buf, local_off, staging, 0, nelem, node->type);
 
                     g_cuda.cuCtxSetCurrent(remote_ctx);
