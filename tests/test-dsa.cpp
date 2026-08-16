@@ -250,7 +250,7 @@ static void test_sinkhorn(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt
     ggml_free(ctx_tgt);
 }
 
-static void test_hc_pre(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt, int S, int T) {
+static void test_hc_pre(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt, int S, int T, int iters = 4) {
     char name[256];
     snprintf(name, sizeof(name), "hc_pre S=%d T=%d", S, T);
     const int ntot = S * S + 2 * S;
@@ -264,7 +264,7 @@ static void test_hc_pre(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt, 
     ggml_set_name(scale_c, "scale");
     ggml_tensor * bias_c = ggml_new_tensor_1d(ctx_cpu, GGML_TYPE_F32, ntot);
     ggml_set_name(bias_c, "bias");
-    ggml_tensor * out_c = ggml_hc_pre(ctx_cpu, x_c, scale_c, bias_c, S, 4, 1e-6f);
+    ggml_tensor * out_c = ggml_hc_pre(ctx_cpu, x_c, scale_c, bias_c, S, iters, 1e-6f);
 
     ggml_tensor * x_t = ggml_new_tensor_2d(ctx_tgt, GGML_TYPE_F32, ntot, T);
     ggml_set_name(x_t, "x");
@@ -272,7 +272,7 @@ static void test_hc_pre(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt, 
     ggml_set_name(scale_t, "scale");
     ggml_tensor * bias_t = ggml_new_tensor_1d(ctx_tgt, GGML_TYPE_F32, ntot);
     ggml_set_name(bias_t, "bias");
-    ggml_tensor * out_t = ggml_hc_pre(ctx_tgt, x_t, scale_t, bias_t, S, 4, 1e-6f);
+    ggml_tensor * out_t = ggml_hc_pre(ctx_tgt, x_t, scale_t, bias_t, S, iters, 1e-6f);
 
     ggml_backend_alloc_ctx_tensors(ctx_cpu, backend_cpu);
     ggml_backend_alloc_ctx_tensors(ctx_tgt, backend_tgt);
@@ -501,6 +501,62 @@ static void test_indexer_topk(ggml_backend_t backend_cpu, ggml_backend_t backend
     ggml_free(ctx_tgt);
 }
 
+static void test_set_rows(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt, ggml_type dst_type, int ncols, int nrows_cache, int nrows_src, bool i64) {
+    char name[256];
+    snprintf(name, sizeof(name), "set_rows dst=%s ncols=%d cache=%d src=%d i64=%d",
+            ggml_type_name(dst_type), ncols, nrows_cache, nrows_src, i64 ? 1 : 0);
+
+    ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
+    ggml_context * ctx_cpu = ggml_init(params);
+    ggml_context * ctx_tgt = ggml_init(params);
+
+    ggml_tensor * a_c = ggml_new_tensor_2d(ctx_cpu, dst_type, ncols, nrows_cache);
+    ggml_set_name(a_c, "a");
+    ggml_tensor * b_c = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_F32, ncols, nrows_src);
+    ggml_set_name(b_c, "b");
+    ggml_tensor * c_c = ggml_new_tensor_1d(ctx_cpu, i64 ? GGML_TYPE_I64 : GGML_TYPE_I32, nrows_src);
+    ggml_set_name(c_c, "c");
+    ggml_tensor * out_c = ggml_set_rows(ctx_cpu, a_c, b_c, c_c);
+
+    ggml_tensor * a_t = ggml_new_tensor_2d(ctx_tgt, dst_type, ncols, nrows_cache);
+    ggml_set_name(a_t, "a");
+    ggml_tensor * b_t = ggml_new_tensor_2d(ctx_tgt, GGML_TYPE_F32, ncols, nrows_src);
+    ggml_set_name(b_t, "b");
+    ggml_tensor * c_t = ggml_new_tensor_1d(ctx_tgt, i64 ? GGML_TYPE_I64 : GGML_TYPE_I32, nrows_src);
+    ggml_set_name(c_t, "c");
+    ggml_tensor * out_t = ggml_set_rows(ctx_tgt, a_t, b_t, c_t);
+
+    ggml_backend_alloc_ctx_tensors(ctx_cpu, backend_cpu);
+    ggml_backend_alloc_ctx_tensors(ctx_tgt, backend_tgt);
+
+    init_tensor_uniform(a_c, -2.0f, 2.0f);
+    init_tensor_uniform(b_c, -2.0f, 2.0f);
+
+    std::vector<int32_t> i32(nrows_src);
+    std::vector<int64_t> i64_data(nrows_src);
+    std::mt19937 rng(31337);
+    for (int i = 0; i < nrows_src; i++) {
+        i32[i] = (int32_t)(rng() % nrows_cache);
+        i64_data[i] = i32[i];
+    }
+    if (i64) {
+        ggml_backend_tensor_set(c_c, i64_data.data(), 0, nrows_src * sizeof(int64_t));
+    } else {
+        ggml_backend_tensor_set(c_c, i32.data(), 0, nrows_src * sizeof(int32_t));
+    }
+
+    copy_tensors_by_name(ctx_cpu, ctx_tgt);
+    if (i64) {
+        ggml_backend_tensor_set(c_t, i64_data.data(), 0, nrows_src * sizeof(int64_t));
+    } else {
+        ggml_backend_tensor_set(c_t, i32.data(), 0, nrows_src * sizeof(int32_t));
+    }
+
+    check_float(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, 0.0);
+    ggml_free(ctx_cpu);
+    ggml_free(ctx_tgt);
+}
+
 static void test_latent_attn(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt, ggml_type ctype, int Dk, int T, int H, int N, int P, int topk, bool indexed) {
     char name[256];
     snprintf(name, sizeof(name), "latent_attn cache=%s indexed=%d Dk=%d T=%d H=%d N=%d P=%d topk=%d",
@@ -607,6 +663,11 @@ int main(int argc, char ** argv) {
         test_hc_pre(backend_cpu, backend_tgt, S, 3);
     }
 
+    test_hc_pre(backend_cpu, backend_tgt, 4, 1, 20);
+    test_hc_pre(backend_cpu, backend_tgt, 4, 8, 20);
+    test_hc_post(backend_cpu, backend_tgt, 4096, 4, 1);
+    test_hc_post(backend_cpu, backend_tgt, 4096, 4, 8);
+
     test_hc_post(backend_cpu, backend_tgt, 16, 4, 3);
     test_hc_post(backend_cpu, backend_tgt, 16, 4, 1);
     test_hc_post(backend_cpu, backend_tgt, 32, 8, 2);
@@ -615,6 +676,8 @@ int main(int argc, char ** argv) {
     test_ds4_comp(backend_cpu, backend_tgt, 0, 64, 3, 4);
     test_ds4_comp(backend_cpu, backend_tgt, 1, 32, 3, 4);
     test_ds4_comp(backend_cpu, backend_tgt, 1, 64, 2, 5);
+    test_ds4_comp(backend_cpu, backend_tgt, 0, 512, 2, 4);
+    test_ds4_comp(backend_cpu, backend_tgt, 1, 512, 1, 128);
 
     for (ggml_type t : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_mask_to_idx(backend_cpu, backend_tgt, t, 64, 3, 8);
@@ -635,6 +698,10 @@ int main(int argc, char ** argv) {
     test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F32, 16, 64, 3, 2, 6);
     test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F16, 32, 128, 4, 4, 8);
     test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F16, 16, 64, 3, 2, 6);
+
+    test_set_rows(backend_cpu, backend_tgt, GGML_TYPE_F16, 64, 128, 5, false);
+    test_set_rows(backend_cpu, backend_tgt, GGML_TYPE_F16, 128, 256, 8, true);
+    test_set_rows(backend_cpu, backend_tgt, GGML_TYPE_F32, 32, 64, 4, false);
 
     if (backend_tgt != backend_cpu) {
         ggml_backend_free(backend_tgt);

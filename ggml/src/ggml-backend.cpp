@@ -2416,6 +2416,22 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
         }
     }
 
+    // pass 4b: in-place ops that produce a view write into the view source's
+    // memory, so they must run on the same backend as the view source. This is
+    // what makes a ROPE_BACK / SET_ROWS dst view inherit the right buffer via
+    // ggml_backend_view_init; without it, an op can be scheduled on a GPU while
+    // its dst view was allocated on CPU for a downstream CPU consumer.
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node->view_src != NULL && !ggml_is_view_op(node->op)) {
+            const int vsrc_backend_id = tensor_backend_id(node->view_src);
+            if (vsrc_backend_id != -1) {
+                tensor_backend_id(node) = vsrc_backend_id;
+                SET_CAUSE(node, "4b.vsrc");
+            }
+        }
+    }
+
     // pass 5: split graph, find tensors that need to be copied
     {
         int i_split = 0;
