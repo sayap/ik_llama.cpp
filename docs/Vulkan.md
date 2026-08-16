@@ -360,6 +360,46 @@ split imbalance and per-split scheduler latency. Closing the gap needs an on-dev
 cross-device copy (the CUDA-interop `cuMemcpyPeer` path) ordered against Vulkan
 compute via a same-device external-semaphore import (see "Performance / architecture"
 below).
+
+### 11c. Future: async on-device reduce on AMD/mesa (`DMA_BUF` + `SYNC_FD`)
+
+The default decode reduce is host-staged and the shared-buffer P2P path is only
+synchronous and only auto-engaged above 1 MiB (`GGML_VK_P2P=1` forces it). The
+P2P path's data movement is already on-device on mesa (the shared buffer is
+`DEVICE_LOCAL` + `DMA_BUF`, imported on both cards), but it is **host-ordered**: each
+`ggml_vk_buffer_copy` does flush + submit + fence wait, `vk_reduce_add` allocates a
+descriptor pool + temp context + fence per call, and the whole exchange is ~5
+serialized submit+wait pairs — so its fixed overhead dominates decode-sized (20 KB)
+tensors and it loses to the lean lazy host path. On NVIDIA the same path falls back
+to host-visible `OPAQUE_FD`, so it is not even on-device.
+
+Three steps close this on AMD (the one place pure Vulkan has a real P2P route):
+
+1. **Make the P2P reduce lazy/async**, mirroring the host path: submit the
+   partial→shared copies fenceless on each device's queue, wait each device's fence
+   once (not once per copy), cache the add pipeline's descriptor set (kill the
+   per-call `createDescriptorPool`), and make the broadcast copies fire-and-forget.
+   That drops the fixed cost to ~2 submits + ~2 waits, at which point the on-device
+   `DMA_BUF` data path should beat the host path for decode.
+2. **Vendor-aware heuristic**: once step 1 lands, route decode reduces through the
+   P2P path on `external_dma_buf_support` devices (e.g. `nbytes >= (dma_buf ? 4096
+   : 1MB)` instead of the flat 1 MiB threshold), keeping `OPAQUE_FD` devices on the
+   host-staged path.
+3. **Wire cross-device `SYNC_FD` semaphores** (mesa allows importing
+   `VkImportSemaphoreFdInfoKHR` across devices; NVIDIA's `OPAQUE_FD` is
+   same-device-only and `SYNC_FD` is absent). This replaces the host fence waits with
+   on-device signal/wait ordering — the Vulkan equivalent of CUDA's stream/event
+   reduce — and removes the per-layer bubble entirely. The scaffolding already exists
+   (`ggml_vk_create_timeline_semaphore`, the `wait_semaphores`/`signal_semaphores`
+   plumbing in `ggml_vk_submit`); it is simply never populated.
+
+Caveats: cross-device `DMA_BUF` memory import sits in a spec-gray area
+(`VUID-VkMemoryAllocateInfo-None-00644` is violated in practice on mesa) and mesa's
+P2P needs `CONFIG_DMABUF_MOVE_NOTIFY`. Cross-*node* (RPC) reduces are a separate and
+much larger problem: every exchange then pays a full network round-trip, which is
+orders of magnitude above the µs-scale fence waits discussed here and dominates any
+multi-node `-sm graph`/`--rpc` split until the RPC layer overlaps transfers with
+compute.
 - `llama_default_buffer_type_split()` keeps the CUDA/SYCL specialized split buffers for
   homogeneous static builds, and otherwise builds a per-slot buffer-type map from the
   registry and returns the generic split buffer. This makes `-sm graph` work in
