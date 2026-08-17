@@ -89,6 +89,14 @@ const std::vector<std::string> iqk_type_names = {
     "iq4_kt",
 };
 
+// IQK/KT families that get a SIMT dot4 Q8_1 mmq (mul_mmq.comp) for prompt
+// processing on coopmat1 (AMD/Intel) devices. These are the per-32-element-
+// scale types: one BK=32 mmq tile maps onto a single 32-element group with its
+// own scale, so the existing per-tile scale machinery carries over 1:1.
+const std::vector<std::string> iqk_mmq_type_names = {
+    "iq4_ks",
+};
+
 namespace {
 void execute_command(const std::string& command, std::string& stdout_str, std::string& stderr_str) {
 #ifdef _WIN32
@@ -418,6 +426,18 @@ void matmul_shaders(bool fp16, bool matmul_id, bool coopmat, bool coopmat2, bool
         }
 #endif
     }
+
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    if (!coopmat && !coopmat2 && !matmul_id) {
+        // SIMT dot4 Q8_1 mmq for the per-32-scale IQK/KT families. These are
+        // used on coopmat1 (AMD/Intel) devices, where the dequant-to-F16 +
+        // F16 WMMA path is the baseline to beat (see docs/Vulkan.md).
+        for (const auto& tname : iqk_mmq_type_names) {
+            std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+            string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
+        }
+    }
+#endif
 
     if (coopmat2 && !matmul_id) {
         // IQK / KT quant families (QK_K = 256, byte-addressed with per-row META

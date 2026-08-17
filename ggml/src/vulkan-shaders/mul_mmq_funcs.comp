@@ -97,3 +97,82 @@ FLOAT_TYPE_VEC2 get_dm(uint ib) {
     return FLOAT_TYPE_VEC2(data_a_packed32[ib].dm);
 }
 #endif
+
+#if defined(DATA_A_IQ4_KS)
+// IQ4_KS byte-addressed mmq decode.
+//
+// The weights are byte-addressed with a 4-byte fp32 row header followed by
+// 136-byte 256-element blocks (8 scale bytes + 128 quantized bytes). The mmq
+// tile (BK=32) maps 1:1 onto a 32-element group, which has a single scale
+// (folded into dl) and 16 quantized bytes (8 nibble pairs = 8 elements per
+// repack). p.stride_a is the K dimension in elements, so
+// groups_per_row = p.stride_a / BK.
+
+#include "iq4k_byte_tables.comp"
+
+shared uint iq4k_byte_shmem[2][256];
+
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize) {
+    for (uint idx = gl_LocalInvocationIndex.x; idx < 128; idx += wgsize.x) {
+        const uint e0  = iq4k_values_byte_0[idx];
+        const uint e16 = iq4k_values_byte_16[idx];
+        iq4k_byte_shmem[0][2*idx]     = e0 & 0xffffu;
+        iq4k_byte_shmem[0][2*idx + 1] = e0 >> 16;
+        iq4k_byte_shmem[1][2*idx]     = e16 & 0xffffu;
+        iq4k_byte_shmem[1][2*idx + 1] = e16 >> 16;
+    }
+    barrier();
+}
+
+uint iqk_load_u32(uint off) {
+    return uint(data_a[off]) | (uint(data_a[off + 1]) << 8) | (uint(data_a[off + 2]) << 16) | (uint(data_a[off + 3]) << 24);
+}
+
+FLOAT_TYPE get_d(uint ib) {
+    const uint groups_per_row = p.stride_a / BK;
+    const uint blocks_per_row = groups_per_row / 8u;
+    const uint row    = ib / groups_per_row;
+    const uint group  = ib % groups_per_row;
+    const uint block  = group / 8u;
+    const uint g_in_b = group % 8u;
+
+    const uint row_byte   = row * (4u + blocks_per_row * 136u);
+    const uint block_byte = row_byte + 4u + block * 136u;
+
+    const float d  = uintBitsToFloat(iqk_load_u32(row_byte));
+    const uint  sc = data_a[block_byte + g_in_b];
+    return FLOAT_TYPE(d * (float(sc & 254u) - 127.0f));
+}
+
+i32vec2 repack(uint ib, uint iqs) {
+    const uint groups_per_row = p.stride_a / BK;
+    const uint blocks_per_row = groups_per_row / 8u;
+    const uint row    = ib / groups_per_row;
+    const uint group  = ib % groups_per_row;
+    const uint block  = group / 8u;
+    const uint g_in_b = group % 8u;
+
+    const uint row_byte   = row * (4u + blocks_per_row * 136u);
+    const uint block_byte = row_byte + 4u + block * 136u;
+
+    const uint sc    = data_a[block_byte + g_in_b];
+    const uint v_sel = (sc & 1u) != 0u ? 1u : 0u;
+
+    const uint w = iqk_load_u32(block_byte + 8u + 16u * g_in_b + 4u * iqs);
+
+    int packed_lo = 0;
+    int packed_hi = 0;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint q     = (w >> (8u * k)) & 0xffu;
+        const uint entry = iq4k_byte_shmem[v_sel][q];
+        packed_lo |= int(entry & 0xffu) << (8 * k);
+        packed_hi |= int((entry >> 8) & 0xffu) << (8 * k);
+    }
+    return i32vec2(packed_lo, packed_hi);
+}
+
+ACC_TYPE mul_q8_1(int32_t q_sum, float da, vec2 dsb) {
+    return ACC_TYPE(da * (float(q_sum) * dsb.x));
+}
+#endif
