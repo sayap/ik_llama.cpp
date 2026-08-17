@@ -2989,6 +2989,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
         } \
 
         if (device->integer_dot_product) {
+            CREATE_MMQ(GGML_TYPE_IQ2_K,   pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ2_K],   matmul_iq2_k_q8_1,   mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ3_K,   pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ3_K],   matmul_iq3_k_q8_1,   mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ4_K,   pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_K],   matmul_iq4_k_q8_1,   mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ5_K,   pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ5_K],   matmul_iq5_k_q8_1,   mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ6_K,   pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ6_K],   matmul_iq6_k_q8_1,   mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
             CREATE_MMQ(GGML_TYPE_IQ2_KS,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ2_KS],  matmul_iq2_ks_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
             CREATE_MMQ(GGML_TYPE_IQ3_KS,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ3_KS],  matmul_iq3_ks_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
             CREATE_MMQ(GGML_TYPE_IQ4_KS,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KS],  matmul_iq4_ks_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );

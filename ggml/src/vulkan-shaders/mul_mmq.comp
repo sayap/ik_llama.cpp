@@ -3,7 +3,9 @@
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-#if defined(DATA_A_IQ2_KS) || defined(DATA_A_IQ3_KS) || defined(DATA_A_IQ4_KS) || \
+#if defined(DATA_A_IQ2_K)   || defined(DATA_A_IQ3_K)   || defined(DATA_A_IQ4_K)   || \
+    defined(DATA_A_IQ5_K)   || defined(DATA_A_IQ6_K)   || \
+    defined(DATA_A_IQ2_KS) || defined(DATA_A_IQ3_KS) || defined(DATA_A_IQ4_KS) || \
     defined(DATA_A_IQ4_KSS) || defined(DATA_A_IQ5_KS) || defined(DATA_A_IQ2_KL) || \
     defined(DATA_A_IQ1_KT) || defined(DATA_A_IQ2_KT) || defined(DATA_A_IQ3_KT) || \
     defined(DATA_A_IQ4_KT)
@@ -37,6 +39,19 @@
 // 4-bit quants.
 #undef QUANT_R
 #define QUANT_R 2
+#endif
+
+#if defined(DATA_A_IQ2_K) || defined(DATA_A_IQ3_K) || defined(DATA_A_IQ4_K) || \
+    defined(DATA_A_IQ5_K) || defined(DATA_A_IQ6_K)
+// The base _K types have two per-16-element dequant scales inside each BK=32
+// tile. The repack still covers 8 elements (the first 16 in slots 0..3, the
+// second 16 in slots 4..7), but the accumulator scales the two 16-element
+// halves separately (see IQK_PER16_SCALES in the compute loop).
+#undef QUANT_R
+#define QUANT_R 2
+#undef QUANT_AUXF
+#define QUANT_AUXF 2
+#define IQK_PER16_SCALES
 #endif
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
@@ -360,6 +375,19 @@ void main() {
                     [[unroll]] for (uint cr = 0; cr < TM; cr++) {
                         const uint cache_a_idx = wsir * TM + cr;
                         const uint sums_idx = (wsic * TN + cc) * (WMITER * TM) + wsir * TM + cr;
+#ifdef IQK_PER16_SCALES
+                        int32_t q_sum1 = 0;
+                        int32_t q_sum2 = 0;
+                        [[unroll]] for (uint idx_k = 0; idx_k < BK / 8; idx_k++) {
+                            q_sum1 += dotPacked4x8EXT(cache_a_qs[cache_a_idx * (BK / 4) + idx_k],
+                                                      cache_b_qs[cc * (BK / 4) + idx_k]);
+                            q_sum2 += dotPacked4x8EXT(cache_a_qs[cache_a_idx * (BK / 4) + idx_k + BK / 8],
+                                                      cache_b_qs[cc * (BK / 4) + idx_k + BK / 8]);
+                        }
+                        const FLOAT_TYPE_VEC2 dm = cache_a_dm[cache_a_idx];
+                        const FLOAT_TYPE_VEC2 ds = cache_b_ds[cc];
+                        sums[sums_idx] += ACC_TYPE(dm.x * (float(q_sum1) * ds.x) + dm.y * (float(q_sum2) * ds.x));
+#else
                         int32_t q_sum = 0;
                         [[unroll]] for (uint idx_k = 0; idx_k < BK / 4; idx_k++) {
                             q_sum += dotPacked4x8EXT(cache_a_qs[cache_a_idx * (BK / 4) + idx_k],
@@ -367,6 +395,7 @@ void main() {
                         }
 
                         sums[sums_idx] += mul_q8_1(q_sum, cache_a_dm[cache_a_idx], cache_b_ds[cc]);
+#endif
                     }
                 }
             }
