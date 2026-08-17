@@ -450,7 +450,9 @@ on a 32-token decode). Three additional bugs were found and fixed along the way:
 
 ### 12. DSA / GLM-DSA / DeepSeek-V4 sparse-attention ops
 
-All 8 missing sparse-attention ops from `docs/handover-DSA-ops.md` are now implemented:
+All 8 sparse-attention ops are now implemented — the 7-op DSA family shared by GLM-5.2
+(`glm-dsa`, via `src/graphs/build_deepseek2.cpp`) and DeepSeek2/Mistral4/BailingMoE3/
+OpenPangu, plus the DeepSeek-V4 `DS4_COMP` extra (`src/graphs/build_deepseek4.cpp`):
 
 - `INDEXER_TOPK` — two-kernel implementation (a score kernel `indexer_topk_score.comp`
   with F32/F16 `k` variants, plus `indexer_topk_select.comp` for the per-row top-k). Query
@@ -572,6 +574,27 @@ several quant types and batch sizes.
 - Intel cooperative-matrix policy: this fork only enables coopmat on Xe2 (SIMD16) GPUs.
   Upstream additionally allows Xe1 integrated GPUs with the Intel proprietary Windows
   driver. AMD RADV is always allowed (RDNA3+ hardware permitting).
+
+### Adding a new op (recipe)
+
+Follow the `DELTA_NET` pattern in `ggml/src/ggml-vulkan.cpp`:
+
+1. `ggml_backend_vk_supports_op` — accept the op only for the type combinations the
+   shaders actually handle (don't return `true` unconditionally; an over-broad
+   `supports_op` is a null-pipeline crash, not a CPU fallback).
+2. `ggml_vk_build_graph` op switch — add `case GGML_OP_*:`, calling a dedicated
+   `ggml_vk_<op>(...)` helper.
+3. `ggml_vk_compute_forward` dispatch — route the node to the same helper (see the
+   `ssm_conv` / `delta_net` cases).
+4. Dedicated op function — model on `ggml_vk_delta_net`: request the pipeline in the
+   dryrun, bind buffers / set push constants / dispatch in the record pass, and return
+   `false` for unsupported shapes/types so the scheduler falls back to CPU.
+5. GLSL shader — add `ggml/src/vulkan-shaders/<op>.comp` and register it in
+   `ggml/src/vulkan-shaders/vulkan-shaders-gen.cpp` via
+   `string_to_spv("<op>_f32", "<op>.comp", {})`; rebuild the `vulkan-shaders-gen` target
+   so the SPIR-V is regenerated.
+6. Dedicated ops with their own function don't go through the generic `ggml_vk_op_f32`
+   dryrun short-circuit list.
 
 ### MoE offload vs `-sm graph` (notes, not yet benchmarked)
 
