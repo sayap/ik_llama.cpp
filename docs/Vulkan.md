@@ -682,7 +682,18 @@ record PP tok/s and TG tok/s for both.
    same mmq (a typed Q6_0-style decode with the zero-mean `kvalues_mxfp4` table and an
    f32 E8M0 scale): Qwen3.8-27B-MXFP4 / Vulkan1 (Strix Halo, 2600-token prompt)
    `-ub 512` ~178 tok/s (vs ~92 before, ~1.9×), `-ub 2048` ~181 tok/s (vs ~106,
-   ~1.7×). MoE `MUL_MAT_ID` remains on the dequant-to-F16 path (see "coopmat1 devices
+   ~1.7×). The **legacy K quants (`Q2_K`..`Q6_K`) now have the same SIMT dot4
+   Q8_1 mmq** (`mul_mmq.comp` typed tile loaders in `mul_mmq_funcs.comp`; Q2_K uses
+   a separate dot(1, B) min correction, Q3_K/Q6_K reuse the per-16-scale
+   IQK_PER16_SCALES accumulator, Q4_K/Q5_K use a per-32 scale+min offset).
+   Correctness is covered by `tests/test-iqk-quants.cpp` (all five types pass on
+   `Vulkan0` and `Vulkan1`). **Performance caveat**: on Vulkan1 the current
+   ik_llama SIMT mmq structure (one BK=32 tile per barrier, byte-packed A) is
+   still ~1.13× slower than the coopmat1 F16-WMMA inline-dequant path for
+   Qwen3.8-27B-Q4_K_L (`-ub 512` pp1024 ~206 vs ~238 tok/s), while mainline's
+   mmq (`mul_mmq.comp` with BK_STEP=4 staging and nibble-packed A) reaches
+   ~363 tok/s. Closing the gap needs porting that staging/packing structure.
+   MoE `MUL_MAT_ID` remains on the dequant-to-F16 path (see "coopmat1 devices
    (AMD / Intel)" under Performance / architecture).
 
 ### Op coverage (the big one)

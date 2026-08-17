@@ -30,6 +30,12 @@
 
 #include "types.comp"
 
+#ifdef FLOAT16
+#define FLOAT_TYPE_VEC4 f16vec4
+#else
+#define FLOAT_TYPE_VEC4 vec4
+#endif
+
 #if defined(DATA_A_IQ2_KS) || defined(DATA_A_IQ3_KS) || defined(DATA_A_IQ4_KS) || \
     defined(DATA_A_IQ4_KSS) || defined(DATA_A_IQ5_KS) || defined(DATA_A_IQ2_KL) || \
     defined(DATA_A_IQ1_KT) || defined(DATA_A_IQ2_KT) || defined(DATA_A_IQ3_KT) || \
@@ -52,6 +58,28 @@
 #undef QUANT_AUXF
 #define QUANT_AUXF 2
 #define IQK_PER16_SCALES
+#endif
+
+#if defined(DATA_A_Q2_K) || defined(DATA_A_Q3_K) || defined(DATA_A_Q4_K) || \
+    defined(DATA_A_Q5_K) || defined(DATA_A_Q6_K)
+// Legacy K quants (Q2_K..Q6_K): 256-element blocks. A BK=32 tile maps to one
+// 32-element group. Q3_K/Q6_K have two per-16 scales (reuse IQK_PER16_SCALES),
+// Q4_K/Q5_K have one per-32 scale plus a per-32 min offset (LEGACY_K_OFFSET),
+// and Q2_K has two per-16 scale/min pairs (LEGACY_K_Q2, which also needs a
+// separate dot(1, B) for the min correction).
+#undef QUANT_R
+#define QUANT_R 2
+#undef QUANT_AUXF
+#define QUANT_AUXF 2
+#if defined(DATA_A_Q2_K)
+#define LEGACY_K_Q2
+#endif
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+#define LEGACY_K_OFFSET
+#endif
+#if defined(DATA_A_Q3_K) || defined(DATA_A_Q6_K)
+#define IQK_PER16_SCALES
+#endif
 #endif
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
@@ -122,6 +150,10 @@ shared FLOAT_TYPE buf_a_dm[BM];
 #else
 shared FLOAT_TYPE_VEC2 buf_a_dm[BM];
 #endif
+#endif
+
+#if defined(DATA_A_Q2_K)
+shared FLOAT_TYPE_VEC4 buf_a_q2[BM];
 #endif
 
 shared int32_t buf_b_qs[BN * SHMEM_STRIDE];
@@ -255,6 +287,9 @@ void main() {
     }
 #else
     int32_t cache_a_qs[WMITER * TM * BK / 4];
+#if defined(DATA_A_Q2_K)
+    FLOAT_TYPE_VEC4 cache_a_q2[WMITER * TM];
+#endif
 
     int32_t cache_b_qs[TN * BK / 4];
 
@@ -284,6 +319,9 @@ void main() {
                 buf_a_dm[buf_ib] = get_d(ib);
 #else
                 buf_a_dm[buf_ib] = get_dm(ib);
+#endif
+#if defined(DATA_A_Q2_K)
+                buf_a_q2[buf_ib] = get_q2(ib);
 #endif
             }
 #if QUANT_R == 1
@@ -355,6 +393,9 @@ void main() {
             [[unroll]] for (uint cr = 0; cr < TM; cr++) {
                 const uint ib = warp_r * WM + wsir * WSUBM + tiwr * TM + cr;
                 cache_a_dm[wsir * TM + cr] = buf_a_dm[ib];
+#if defined(DATA_A_Q2_K)
+                cache_a_q2[wsir * TM + cr] = buf_a_q2[ib];
+#endif
                 [[unroll]] for (uint idx_k = 0; idx_k < BK / 4; idx_k++) {
                     cache_a_qs[(wsir * TM + cr) * (BK / 4) + idx_k] = buf_a_qs[ib * SHMEM_STRIDE + idx_k];
                 }
@@ -375,7 +416,34 @@ void main() {
                     [[unroll]] for (uint cr = 0; cr < TM; cr++) {
                         const uint cache_a_idx = wsir * TM + cr;
                         const uint sums_idx = (wsic * TN + cc) * (WMITER * TM) + wsir * TM + cr;
-#ifdef IQK_PER16_SCALES
+#if defined(LEGACY_K_Q2)
+                        int32_t q_sum1 = 0;
+                        int32_t q_sum2 = 0;
+                        int32_t m_sum1 = 0;
+                        int32_t m_sum2 = 0;
+                        [[unroll]] for (uint idx_k = 0; idx_k < BK / 8; idx_k++) {
+                            q_sum1 += dotPacked4x8EXT(cache_a_qs[cache_a_idx * (BK / 4) + idx_k],
+                                                      cache_b_qs[cc * (BK / 4) + idx_k]);
+                            m_sum1 += dotPacked4x8EXT(int(0x01010101),
+                                                      cache_b_qs[cc * (BK / 4) + idx_k]);
+                            q_sum2 += dotPacked4x8EXT(cache_a_qs[cache_a_idx * (BK / 4) + idx_k + BK / 8],
+                                                      cache_b_qs[cc * (BK / 4) + idx_k + BK / 8]);
+                            m_sum2 += dotPacked4x8EXT(int(0x01010101),
+                                                      cache_b_qs[cc * (BK / 4) + idx_k + BK / 8]);
+                        }
+                        const FLOAT_TYPE_VEC4 q2 = cache_a_q2[cache_a_idx];
+                        const FLOAT_TYPE_VEC2 ds = cache_b_ds[cc];
+                        sums[sums_idx] += ACC_TYPE(float(ds.x) * (float(q2.x) * float(q_sum1) + float(q2.y) * float(q_sum2) - float(q2.z) * float(m_sum1) - float(q2.w) * float(m_sum2)));
+#elif defined(LEGACY_K_OFFSET)
+                        int32_t q_sum = 0;
+                        [[unroll]] for (uint idx_k = 0; idx_k < BK / 4; idx_k++) {
+                            q_sum += dotPacked4x8EXT(cache_a_qs[cache_a_idx * (BK / 4) + idx_k],
+                                                     cache_b_qs[cc * (BK / 4) + idx_k]);
+                        }
+                        const FLOAT_TYPE_VEC2 dm = cache_a_dm[cache_a_idx];
+                        const FLOAT_TYPE_VEC2 ds = cache_b_ds[cc];
+                        sums[sums_idx] += ACC_TYPE(float(ds.x) * float(dm.x) * float(q_sum) - float(dm.y) * float(ds.y));
+#elif defined(IQK_PER16_SCALES)
                         int32_t q_sum1 = 0;
                         int32_t q_sum2 = 0;
                         [[unroll]] for (uint idx_k = 0; idx_k < BK / 8; idx_k++) {

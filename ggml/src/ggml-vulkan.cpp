@@ -2487,6 +2487,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     std::vector<uint32_t> l_warptile, m_warptile, s_warptile,
                           l_warptile_mmq, m_warptile_mmq, s_warptile_mmq,
                           l_warptile_mmq_int, m_warptile_mmq_int, s_warptile_mmq_int,
+                          l_warptile_mmq_int_k, m_warptile_mmq_int_k, s_warptile_mmq_int_k,
                           l_warptile_mmq_k, m_warptile_mmq_k, s_warptile_mmq_k,
                           l_warptile_mmqid, m_warptile_mmqid, s_warptile_mmqid;
     std::array<uint32_t, 3> l_wg_denoms, m_wg_denoms, s_wg_denoms,
@@ -2554,6 +2555,14 @@ static void ggml_vk_load_shaders(vk_device& device) {
         l_warptile_mmq_int = { 128, 128, 128, 32, subgroup_size_8 * 2, 64, 2, 4, 4, 1, subgroup_size_8 };
         m_warptile_mmq_int = { 128,  64,  64, 32, subgroup_size_8,     32, 2, 2, 2, 1, subgroup_size_8 };
         s_warptile_mmq_int = { subgroup_size_32, 32, 32, 32, 32,       32, 2, 2, 1, 1, subgroup_size_8 };
+
+        // Legacy K quants decode a whole 256-element block per BK=32 tile and
+        // are more ALU-heavy than the 32-element-block quants, so a single
+        // K-iteration per tile (WMITER=1) performs better (mirrors mainline's
+        // warptile_mmq_int_k).
+        l_warptile_mmq_int_k = { 128, 128, 128, 32, subgroup_size_8 * 2, 64, 1, 4, 4, 1, subgroup_size_8 };
+        m_warptile_mmq_int_k = { 128,  64,  64, 32, subgroup_size_8,     32, 1, 2, 2, 1, subgroup_size_8 };
+        s_warptile_mmq_int_k = { subgroup_size_32, 32, 32, 32, 32,       32, 1, 2, 1, 1, subgroup_size_8 };
 
         // chip specific tuning
         if ((device->architecture == AMD_GCN) && (device->driver_id != vk::DriverId::eAmdProprietary)) {
@@ -3006,6 +3015,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
             CREATE_MMQ(GGML_TYPE_IQ4_KT,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT],  matmul_iq4_kt_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
             CREATE_MMQ(GGML_TYPE_Q6_0,    pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q6_0],    matmul_q6_0_q8_1,    mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
             CREATE_MMQ(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_MXFP4],   matmul_mxfp4_q8_1,   mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_Q2_K,    pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q2_K],    matmul_q2_k_q8_1,    mmq_wg_denoms, warptile_mmq_int_k, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_Q3_K,    pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q3_K],    matmul_q3_k_q8_1,    mmq_wg_denoms, warptile_mmq_int_k, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_Q4_K,    pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_K],    matmul_q4_k_q8_1,    mmq_wg_denoms, warptile_mmq_int_k, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_Q5_K,    pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_K],    matmul_q5_k_q8_1,    mmq_wg_denoms, warptile_mmq_int_k, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_Q6_K,    pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q6_K],    matmul_q6_k_q8_1,    mmq_wg_denoms, warptile_mmq_int_k, vk_mat_mat_push_constants, 3, );
         }
 #undef CREATE_MMQ
 #endif
@@ -5901,11 +5915,18 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, int m, int 
             if (split_k == 3) {
                 split_k = 2;
             }
-            if (ctx->device->coopmat2) {
-                // coopmat2 shader expects splits to be aligned to 256
-                while (split_k > 1 && ((k / split_k) % 256) != 0) {
-                    split_k /= 2;
+            // The K-quant mmq shaders address weights as contiguous 256-element
+            // blocks (block index = 32-element group index / 8), so each split
+            // must be 256-aligned and the last split must not be empty.
+            while (true) {
+                if (split_k == 1) {
+                    break;
                 }
+                const uint32_t k_split = ROUNDUP_POW2(CEIL_DIV(k, split_k), 256);
+                if (k_split * (split_k - 1) < k) {
+                    break;
+                }
+                split_k--;
             }
         }
     }
@@ -5971,7 +5992,7 @@ static void ggml_vk_matmul(
 
     GGML_ASSERT(batch_stride_d == m * n);
 
-    const vk_mat_mat_push_constants pc1 = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, CEIL_DIV(k, split_k), ne02, ne12, broadcast2, broadcast3, padded_n };
+    const vk_mat_mat_push_constants pc1 = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, ROUNDUP_POW2(CEIL_DIV(k, split_k), 256), ne02, ne12, broadcast2, broadcast3, padded_n };
     // Make sure enough workgroups get assigned for split k to work
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, split_k_buffer }, pc1, { (CEIL_DIV(m, pipeline->wg_denoms[0]) * pipeline->wg_denoms[0]) * split_k, n, batch });
     ggml_vk_sync_buffers(subctx);
