@@ -683,16 +683,22 @@ record PP tok/s and TG tok/s for both.
    f32 E8M0 scale): Qwen3.8-27B-MXFP4 / Vulkan1 (Strix Halo, 2600-token prompt)
    `-ub 512` ~178 tok/s (vs ~92 before, ~1.9×), `-ub 2048` ~181 tok/s (vs ~106,
    ~1.7×). The **legacy K quants (`Q2_K`..`Q6_K`) now have the same SIMT dot4
-   Q8_1 mmq** (`mul_mmq.comp` typed tile loaders in `mul_mmq_funcs.comp`; Q2_K uses
-   a separate dot(1, B) min correction, Q3_K/Q6_K reuse the per-16-scale
-   IQK_PER16_SCALES accumulator, Q4_K/Q5_K use a per-32 scale+min offset).
-   Correctness is covered by `tests/test-iqk-quants.cpp` (all five types pass on
-   `Vulkan0` and `Vulkan1`). **Performance caveat**: on Vulkan1 the current
-   ik_llama SIMT mmq structure (one BK=32 tile per barrier, byte-packed A) is
-   still ~1.13× slower than the coopmat1 F16-WMMA inline-dequant path for
-   Qwen3.8-27B-Q4_K_L (`-ub 512` pp1024 ~206 vs ~238 tok/s), while mainline's
-   mmq (`mul_mmq.comp` with BK_STEP=4 staging and nibble-packed A) reaches
-   ~363 tok/s. Closing the gap needs porting that staging/packing structure.
+   Q8_1 mmq** (`mul_mmq.comp` + `mul_mmq_funcs.comp`). Q2_K/Q3_K/Q4_K use
+   nibble-packed A (2/4/4 int32 per BK=32 tile instead of 8), Q5_K/Q6_K use
+   mainline's byte-packed decoders, and the whole mmq uses BK_STEP=4 staging
+   plus the x4 Q8_1 B layout (see the performance caveat below).
+   Correctness is covered by `tests/test-iqk-quants.cpp` (all types pass on
+   `Vulkan0` and `Vulkan1`). **mmq staging ported**: mainline's `mul_mmq.comp`
+   staging is now ported — BK_STEP=4 (4 K-tiles per barrier), nibble-packed A
+   for Q2_K/Q3_K/Q4_K, the x4 Q8_1 B layout (`block_q8_1_x4_packed128`,
+   `LOAD_VEC_B=16`), mainline's Q5_K/Q6_K byte-packed decoders, and
+   x4/subgroup `quantize_q8_1` variants. On Vulkan1 / Qwen3.8-27B-Q4_K_L
+   (`-ub 512` pp1024) this lifts the mmq from ~206 to ~244-249 tok/s, now
+   beating the coopmat1 F16-WMMA inline-dequant path (~238). It is still short
+   of mainline's number (~356 tok/s measured with `../llama.cpp/build-dl` on
+   the same box; the docs' earlier ~363): the shader, B staging and quantize
+   now mirror mainline, so the residual gap is ik-specific prompt-path
+   overhead outside `mul_mmq`, not the mmq kernel structure.
    MoE `MUL_MAT_ID` remains on the dequant-to-F16 path (see "coopmat1 devices
    (AMD / Intel)" under Performance / architecture).
 
