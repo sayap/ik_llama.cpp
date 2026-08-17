@@ -116,128 +116,11 @@ ACC_TYPE mul_q8_1(int32_t q_sum, float da, vec2 dsb) {
 // for the per-32-scale types (Q4_K/Q5_K).
 // ---------------------------------------------------------------------------
 
-#if defined(DATA_A_Q2_K)
-// Q2_K: 16 sub-blocks of 16 2-bit values. scales[16] holds a 4-bit scale (low
-// nibble) and a 4-bit min (high nibble) per sub-block. The two-bit values are
-// packed one per byte so dotPacked4x8EXT can dot them against Q8_1; the min
-// correction is a separate dot(1, B) in the compute loop, folded through the
-// dmin*min factors returned by get_q2.
-uint q2_k_scales_byte(uint blk, uint b) {
-    const uint16_t w = data_a[blk].scales[b >> 1u];
-    return (b & 1u) != 0u ? uint(w) >> 8 : uint(w) & 0xffu;
-}
+// Q2_K nibble-packed staging (block_a_to_shmem / block_a_to_registers /
+// mmq_dot_product) is defined at the end of this file.
 
-uint q2_k_qs_u32(uint blk, uint byte_off) {
-    const uint16_t w0 = data_a[blk].qs[byte_off >> 1u];
-    const uint16_t w1 = data_a[blk].qs[(byte_off >> 1u) + 1u];
-    return uint(w0) | (uint(w1) << 16);
-}
-
-FLOAT_TYPE_VEC2 get_dm(uint ib) {
-    const uint blk = ib / 8u;
-    return FLOAT_TYPE_VEC2(float(data_a[blk].d.x), float(data_a[blk].d.y));
-}
-
-FLOAT_TYPE_VEC4 get_q2(uint ib) {
-    const uint blk = ib / 8u;
-    const uint g   = ib % 8u;
-
-    const float d    = float(data_a[blk].d.x);
-    const float dmin = float(data_a[blk].d.y);
-    const uint  s0   = q2_k_scales_byte(blk, 2u * g);
-    const uint  s1   = q2_k_scales_byte(blk, 2u * g + 1u);
-    return FLOAT_TYPE_VEC4(d * float(s0 & 0xFu), d * float(s1 & 0xFu),
-                           dmin * float(s0 >> 4), dmin * float(s1 >> 4));
-}
-
-i32vec2 repack(uint ib, uint iqs) {
-    const uint blk = ib / 8u;
-    const uint g   = ib % 8u;
-
-    const uint ip    = g / 4u;
-    const uint shift = (2u * g) % 8u;
-    const uint base  = 32u * ip + 4u * iqs;
-
-    const uint w0 = q2_k_qs_u32(blk, base);
-    const uint w1 = q2_k_qs_u32(blk, base + 16u);
-
-    int v0 = 0;
-    int v1 = 0;
-    [[unroll]] for (uint k = 0; k < 4; ++k) {
-        const uint b0 = (w0 >> (8u * k)) & 0xffu;
-        const uint b1 = (w1 >> (8u * k)) & 0xffu;
-        v0 |= int((b0 >> shift) & 0x03u) << (8 * k);
-        v1 |= int((b1 >> shift) & 0x03u) << (8 * k);
-    }
-    return i32vec2(v0, v1);
-}
-#endif
-
-#if defined(DATA_A_Q3_K)
-// Q3_K: 16 sub-blocks of 16 3-bit values (2 low bits in qs, high bit in
-// hmask) with 6-bit scales (stored minus 32).
-uint q3_k_scales_byte(uint blk, uint b) {
-    const uint16_t w = data_a[blk].scales[b >> 1u];
-    return (b & 1u) != 0u ? uint(w) >> 8 : uint(w) & 0xffu;
-}
-
-uint q3_k_qs_byte(uint blk, uint b) {
-    const uint16_t w = data_a[blk].qs[b >> 1u];
-    return (b & 1u) != 0u ? uint(w) >> 8 : uint(w) & 0xffu;
-}
-
-uint q3_k_hmask_byte(uint blk, uint b) {
-    const uint16_t w = data_a[blk].hmask[b >> 1u];
-    return (b & 1u) != 0u ? uint(w) >> 8 : uint(w) & 0xffu;
-}
-
-uint q3_k_scale(uint blk, uint is) {
-    if (is < 4u) {
-        return (q3_k_scales_byte(blk, is) & 0xFu) | ((q3_k_scales_byte(blk, is + 8u) & 3u) << 4);
-    } else if (is < 8u) {
-        return (q3_k_scales_byte(blk, is) & 0xFu) | (((q3_k_scales_byte(blk, is + 4u) >> 2u) & 3u) << 4);
-    } else if (is < 12u) {
-        return (q3_k_scales_byte(blk, is - 8u) >> 4u) | (((q3_k_scales_byte(blk, is) >> 4u) & 3u) << 4);
-    } else {
-        return (q3_k_scales_byte(blk, is - 8u) >> 4u) | (((q3_k_scales_byte(blk, is - 4u) >> 6u) & 3u) << 4);
-    }
-}
-
-FLOAT_TYPE_VEC2 get_dm(uint ib) {
-    const uint blk = ib / 8u;
-    const uint g   = ib % 8u;
-
-    const float d = float(data_a[blk].d);
-    const uint us0 = q3_k_scale(blk, 2u * g);
-    const uint us1 = q3_k_scale(blk, 2u * g + 1u);
-    return FLOAT_TYPE_VEC2(d * (float(us0) - 32.0f), d * (float(us1) - 32.0f));
-}
-
-i32vec2 repack(uint ib, uint iqs) {
-    const uint blk = ib / 8u;
-    const uint g   = ib % 8u;
-
-    const uint ip     = g / 4u;
-    const uint j      = g % 4u;
-    const uint shift  = 2u * j;
-    const uint hm_bit = 1u << g;
-
-    int v0 = 0;
-    int v1 = 0;
-    [[unroll]] for (uint k = 0; k < 4; ++k) {
-        const uint qs0 = q3_k_qs_byte(blk, 32u * ip + 4u * iqs + k);
-        const uint hm0 = q3_k_hmask_byte(blk, 4u * iqs + k);
-        const int q0 = int((qs0 >> shift) & 0x03u) - (((hm0 & hm_bit) != 0u) ? 0 : 4);
-        v0 |= (q0 & 0xff) << (8 * k);
-
-        const uint qs1 = q3_k_qs_byte(blk, 32u * ip + 16u + 4u * iqs + k);
-        const uint hm1 = q3_k_hmask_byte(blk, 16u + 4u * iqs + k);
-        const int q1 = int((qs1 >> shift) & 0x03u) - (((hm1 & hm_bit) != 0u) ? 0 : 4);
-        v1 |= (q1 & 0xff) << (8 * k);
-    }
-    return i32vec2(v0, v1);
-}
-#endif
+// Q3_K nibble-packed staging (block_a_to_shmem / block_a_to_registers /
+// mmq_dot_product) is defined at the end of this file.
 
 #if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
 // Q4_K and Q5_K share the same 6-bit per-32 scale/min packing (scales[12]).
@@ -257,147 +140,11 @@ void q45_k_scale_min(uint blk, uint g, out uint sc, out uint mb) {
 }
 #endif
 
-#if defined(DATA_A_Q4_K)
-FLOAT_TYPE_VEC2 get_dm(uint ib) {
-    const uint blk = ib / 8u;
-    const uint g   = ib % 8u;
+// Q4_K nibble-packed staging (block_a_to_shmem / block_a_to_registers /
+// mmq_dot_product) is defined at the end of this file.
 
-    const float d    = float(data_a[blk].d.x);
-    const float dmin = float(data_a[blk].d.y);
-    uint sc, mb;
-    q45_k_scale_min(blk, g, sc, mb);
-    return FLOAT_TYPE_VEC2(d * float(sc), dmin * float(mb));
-}
-
-i32vec2 repack(uint ib, uint iqs) {
-    const uint blk = ib / 8u;
-    const uint g   = ib % 8u;
-
-    // Q4_K packs two sub-blocks per byte: the low nibble is sub-block 2*(g/2)
-    // and the high nibble is sub-block 2*(g/2)+1.
-    const bool hi_nib = (g & 1u) != 0u;
-    const uint qb0 = 32u * (g / 2u) + 4u * iqs;
-
-    const uint16_t qw00 = data_a[blk].qs[qb0 >> 1u];
-    const uint16_t qw01 = data_a[blk].qs[(qb0 >> 1u) + 1u];
-    const uint16_t qw10 = data_a[blk].qs[(qb0 + 16u) >> 1u];
-    const uint16_t qw11 = data_a[blk].qs[((qb0 + 16u) >> 1u) + 1u];
-    const uint qbytes0 = uint(qw00) | (uint(qw01) << 16);
-    const uint qbytes1 = uint(qw10) | (uint(qw11) << 16);
-
-    int v0 = 0;
-    int v1 = 0;
-    [[unroll]] for (uint k = 0; k < 4; ++k) {
-        const uint q0 = (qbytes0 >> (8u * k)) & 0xffu;
-        const uint q1 = (qbytes1 >> (8u * k)) & 0xffu;
-        v0 |= int(hi_nib ? (q0 >> 4) : (q0 & 0xFu)) << (8 * k);
-        v1 |= int(hi_nib ? (q1 >> 4) : (q1 & 0xFu)) << (8 * k);
-    }
-    return i32vec2(v0, v1);
-}
-#endif
-
-#if defined(DATA_A_Q5_K)
-FLOAT_TYPE_VEC2 get_dm(uint ib) {
-    const uint blk = ib / 8u;
-    const uint g   = ib % 8u;
-
-    const float d    = float(data_a[blk].d.x);
-    const float dmin = float(data_a[blk].d.y);
-    uint sc, mb;
-    q45_k_scale_min(blk, g, sc, mb);
-    return FLOAT_TYPE_VEC2(d * float(sc), dmin * float(mb));
-}
-
-i32vec2 repack(uint ib, uint iqs) {
-    const uint blk = ib / 8u;
-    const uint g   = ib % 8u;
-
-    const bool hi_nib = (g & 1u) != 0u;
-    const uint qb0 = 32u * (g / 2u) + 4u * iqs;
-    const uint hb0 = 4u * iqs;
-
-    const uint16_t qw00 = data_a[blk].qs[qb0 >> 1u];
-    const uint16_t qw01 = data_a[blk].qs[(qb0 >> 1u) + 1u];
-    const uint16_t qw10 = data_a[blk].qs[(qb0 + 16u) >> 1u];
-    const uint16_t qw11 = data_a[blk].qs[((qb0 + 16u) >> 1u) + 1u];
-    const uint qbytes0 = uint(qw00) | (uint(qw01) << 16);
-    const uint qbytes1 = uint(qw10) | (uint(qw11) << 16);
-
-    const uint16_t hw00 = data_a[blk].qh[hb0 >> 1u];
-    const uint16_t hw01 = data_a[blk].qh[(hb0 >> 1u) + 1u];
-    const uint16_t hw10 = data_a[blk].qh[(hb0 + 16u) >> 1u];
-    const uint16_t hw11 = data_a[blk].qh[((hb0 + 16u) >> 1u) + 1u];
-    const uint hbytes0 = uint(hw00) | (uint(hw01) << 16);
-    const uint hbytes1 = uint(hw10) | (uint(hw11) << 16);
-
-    int v0 = 0;
-    int v1 = 0;
-    [[unroll]] for (uint k = 0; k < 4; ++k) {
-        const uint q0 = (qbytes0 >> (8u * k)) & 0xffu;
-        const uint q1 = (qbytes1 >> (8u * k)) & 0xffu;
-        const uint h0 = (hbytes0 >> (8u * k)) & 0xffu;
-        const uint h1 = (hbytes1 >> (8u * k)) & 0xffu;
-        const uint nib0 = hi_nib ? (q0 >> 4) : (q0 & 0xFu);
-        const uint nib1 = hi_nib ? (q1 >> 4) : (q1 & 0xFu);
-        v0 |= int((nib0 + 16u * ((h0 >> g) & 1u)) & 0xffu) << (8 * k);
-        v1 |= int((nib1 + 16u * ((h1 >> g) & 1u)) & 0xffu) << (8 * k);
-    }
-    return i32vec2(v0, v1);
-}
-#endif
-
-#if defined(DATA_A_Q6_K)
-// Q6_K: 16 sub-blocks of 16 6-bit values (4 low bits in ql, 2 high bits in
-// qh) with per-16 int8 scales. The 6-bit value is stored minus 32.
-uint q6_k_ql_byte(uint blk, uint b) {
-    const uint16_t w = data_a[blk].ql[b >> 1u];
-    return (b & 1u) != 0u ? uint(w) >> 8 : uint(w) & 0xffu;
-}
-
-uint q6_k_qh_byte(uint blk, uint b) {
-    const uint16_t w = data_a[blk].qh[b >> 1u];
-    return (b & 1u) != 0u ? uint(w) >> 8 : uint(w) & 0xffu;
-}
-
-FLOAT_TYPE_VEC2 get_dm(uint ib) {
-    const uint blk = ib / 8u;
-    const uint g   = ib % 8u;
-
-    const float d = float(data_a[blk].d);
-    const int s0 = int(data_a[blk].scales[2u * g]);
-    const int s1 = int(data_a[blk].scales[2u * g + 1u]);
-    return FLOAT_TYPE_VEC2(d * float(s0), d * float(s1));
-}
-
-i32vec2 repack(uint ib, uint iqs) {
-    const uint blk = ib / 8u;
-    const uint g   = ib % 8u;
-
-    const uint ip       = g / 4u;
-    const uint off      = g % 4u;
-    const uint shift    = 2u * off;
-    const bool hi_nib   = off >= 2u;
-    const uint ql_extra = (off & 1u) != 0u ? 32u : 0u;
-
-    int v0 = 0;
-    int v1 = 0;
-    [[unroll]] for (uint k = 0; k < 4; ++k) {
-        const uint ql0 = q6_k_ql_byte(blk, 64u * ip + 4u * iqs + ql_extra + k);
-        const uint qh0 = q6_k_qh_byte(blk, 32u * ip + 4u * iqs + k);
-        const uint nib0 = hi_nib ? (ql0 >> 4) : (ql0 & 0xFu);
-        const uint q0 = nib0 | (((qh0 >> shift) & 3u) << 4);
-        v0 |= ((int(q0) - 32) & 0xff) << (8 * k);
-
-        const uint ql1 = q6_k_ql_byte(blk, 64u * ip + 16u + 4u * iqs + ql_extra + k);
-        const uint qh1 = q6_k_qh_byte(blk, 32u * ip + 16u + 4u * iqs + k);
-        const uint nib1 = hi_nib ? (ql1 >> 4) : (ql1 & 0xFu);
-        const uint q1 = nib1 | (((qh1 >> shift) & 3u) << 4);
-        v1 |= ((int(q1) - 32) & 0xff) << (8 * k);
-    }
-    return i32vec2(v0, v1);
-}
-#endif
+// Q5_K and Q6_K byte-packed staging (block_a_to_shmem / block_a_to_registers /
+// mmq_dot_product) is defined at the end of this file.
 
 #if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q6_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 FLOAT_TYPE get_d(uint ib) {
@@ -1576,3 +1323,362 @@ ACC_TYPE mul_q8_1(int32_t q_sum, float da, vec2 dsb) {
     return ACC_TYPE(da * (float(q_sum) * dsb.x));
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// BK_STEP staging helpers. The outer loop stages BK_STEP=4 K-tiles into shared
+// memory with a single barrier, then the compute loop walks the staged tiles
+// (see mul_mmq.comp). A is staged through block_a_to_shmem and read back into
+// registers with block_a_to_registers; the per-tile dot product lives in
+// mmq_dot_product. B is always the Q8_1 activation cache.
+// ---------------------------------------------------------------------------
+
+void block_b_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bool is_in_bounds) {
+    if (is_in_bounds) {
+        const uint ib_outer = ib / 4;
+        const uint ib_inner = ib % 4;
+
+        if (iqs == 0) {
+            buf_b[buf_ib].ds = FLOAT_TYPE_VEC2(data_b[ib_outer].ds[ib_inner]);
+        }
+
+        const ivec4 values = data_b[ib_outer].qs[ib_inner * 2 + iqs];
+        buf_b[buf_ib].qs[iqs * 4    ] = values.x;
+        buf_b[buf_ib].qs[iqs * 4 + 1] = values.y;
+        buf_b[buf_ib].qs[iqs * 4 + 2] = values.z;
+        buf_b[buf_ib].qs[iqs * 4 + 3] = values.w;
+    } else {
+        if (iqs == 0) {
+            buf_b[buf_ib].ds = FLOAT_TYPE_VEC2(0.0f);
+        }
+
+        buf_b[buf_ib].qs[iqs * 4    ] = 0;
+        buf_b[buf_ib].qs[iqs * 4 + 1] = 0;
+        buf_b[buf_ib].qs[iqs * 4 + 2] = 0;
+        buf_b[buf_ib].qs[iqs * 4 + 3] = 0;
+    }
+}
+
+void block_b_to_registers(const uint ib) {
+    cache_b.ds = buf_b[ib].ds;
+    [[unroll]] for (uint iqs = 0; iqs < BK / 4; iqs++) {
+        cache_b.qs[iqs] = buf_b[ib].qs[iqs];
+    }
+}
+
+#if defined(DATA_A_Q2_K)
+// Q2_K nibble-packed A: 16 2-bit values per uint32 (2 int32 per BK=32 tile).
+// The two sub-block scale/min bytes are kept in shared memory and the min
+// correction is folded into the dot product as dot(1, B) * dmin * min.
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+    const uint ib_k = ib / 8;
+    const uint iqs_k = (ib % 8) * 8 + iqs * 4;
+
+    const uint qs_idx = (iqs_k / 32) * 8 + (iqs_k % 8);
+    const uint qs_shift = ((iqs_k % 32) / 8) * 2;
+
+    const uint32_t vals0 = (data_a_packed32[ib_k].qs[qs_idx    ] >> qs_shift) & 0x03030303;
+    const uint32_t vals1 = (data_a_packed32[ib_k].qs[qs_idx + 1] >> qs_shift) & 0x03030303;
+    const uint32_t vals2 = (data_a_packed32[ib_k].qs[qs_idx + 2] >> qs_shift) & 0x03030303;
+    const uint32_t vals3 = (data_a_packed32[ib_k].qs[qs_idx + 3] >> qs_shift) & 0x03030303;
+
+    buf_a[buf_ib].qs[iqs] = vals0 | (vals1 << 2) | (vals2 << 4) | (vals3 << 6);
+
+    if (iqs == 0) {
+        buf_a[buf_ib].dm = FLOAT_TYPE_VEC2(data_a_packed32[ib_k].d);
+        buf_a[buf_ib].scales = unpack8(uint32_t(data_a[ib_k].scales[iqs_k / 8])).xy;
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
+    cache_a[reg_ib].scales = buf_a[buf_ib].scales;
+
+    [[unroll]] for (uint iqs = 0; iqs < 2; iqs++) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    int32_t sum_d = 0;
+    int32_t sum_m = 0;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        const uint8_t scale = cache_a[ib_a].scales[iqs / 4];
+        const int32_t scale_m = int32_t(scale >> 4) * 0x01010101;
+        const int32_t qs_a = int32_t((cache_a[ib_a].qs[iqs / 4] >> ((iqs % 4) * 2)) & 0x03030303);
+
+        sum_d += dotPacked4x8EXT(qs_a, cache_b.qs[iqs]) * (scale & 0xF);
+        sum_m += dotPacked4x8EXT(scale_m, cache_b.qs[iqs]);
+    }
+
+    return ACC_TYPE(float(cache_b.ds.x) * (float(cache_a[ib_a].dm.x) * float(sum_d) - float(cache_a[ib_a].dm.y) * float(sum_m)));
+}
+#endif
+
+#if defined(DATA_A_Q3_K)
+// Q3_K nibble-packed A: the 3rd bit is added during staging and subtracted (4)
+// again in the dot product, so 8 values pack into one uint32 (4 int32 per
+// BK=32 tile).
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+    const uint ib_k = ib / 8;
+    const uint hm_idx = iqs * 2;
+    const uint iqs_k = (ib % 8) * 8 + hm_idx;
+
+    const uint qs_idx = (iqs_k / 32) * 8 + (iqs_k % 8);
+    const uint qs_shift = ((iqs_k % 32) / 8) * 2;
+    const uint hm_shift = iqs_k / 8;
+
+    const i8vec2 vals00 = unpack8(int32_t(int16_t((data_a[ib_k].qs[qs_idx * 2    ] >> qs_shift) & uint16_t(0x0303)))).xy |
+                          unpack8(int32_t(int16_t(((data_a[ib_k].hmask[hm_idx * 2    ] >> hm_shift) & uint16_t(0x0101))) << 2)).xy;
+    const i8vec2 vals01 = unpack8(int32_t(int16_t((data_a[ib_k].qs[qs_idx * 2 + 1    ] >> qs_shift) & uint16_t(0x0303)))).xy |
+                          unpack8(int32_t(int16_t(((data_a[ib_k].hmask[hm_idx * 2 + 1] >> hm_shift) & uint16_t(0x0101))) << 2)).xy;
+    const i8vec2 vals10 = unpack8(int32_t(int16_t((data_a[ib_k].qs[qs_idx * 2 + 2    ] >> qs_shift) & uint16_t(0x0303)))).xy |
+                          unpack8(int32_t(int16_t(((data_a[ib_k].hmask[hm_idx * 2 + 2] >> hm_shift) & uint16_t(0x0101))) << 2)).xy;
+    const i8vec2 vals11 = unpack8(int32_t(int16_t((data_a[ib_k].qs[qs_idx * 2 + 3    ] >> qs_shift) & uint16_t(0x0303)))).xy |
+                          unpack8(int32_t(int16_t(((data_a[ib_k].hmask[hm_idx * 2 + 3] >> hm_shift) & uint16_t(0x0101))) << 2)).xy;
+
+    buf_a[buf_ib].qs[iqs] = pack32(u8vec4(vals00.x, vals00.y, vals01.x, vals01.y)) |
+                           (pack32(u8vec4(vals10.x, vals10.y, vals11.x, vals11.y)) << 4);
+
+    if (iqs == 0) {
+        const uint is = iqs_k / 4;
+        const i8vec2 scales = i8vec2(unpack8(uint32_t(((data_a[ib_k].scales[(is % 8      ) / 2] >> (4 * (is / 8))) & 0x0F0F) |
+                                                     (((data_a[ib_k].scales[(8 + (is % 4)) / 2] >> (2 * (is / 4))) & 0x0303) << 4))).xy);
+
+        buf_a[buf_ib].dm = FLOAT_TYPE_VEC2(float(data_a[ib_k].d) * vec2(scales - 32));
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
+
+    [[unroll]] for (uint iqs = 0; iqs < 4; iqs++) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    float result = 0.0;
+    int32_t q_sum = 0;
+
+    [[unroll]] for (uint iqs = 0; iqs < 4; iqs++) {
+        const int32_t qs_a = pack32(unpack8(int32_t((cache_a[ib_a].qs[iqs / 2] >> ((iqs % 2) * 4)) & 0x0F0F0F0F)) - int8_t(4));
+
+        q_sum += dotPacked4x8EXT(qs_a, cache_b.qs[iqs]);
+    }
+    result += float(cache_a[ib_a].dm.x) * float(q_sum);
+    q_sum = 0;
+
+    [[unroll]] for (uint iqs = 4; iqs < 8; iqs++) {
+        const int32_t qs_a = pack32(unpack8(int32_t((cache_a[ib_a].qs[iqs / 2] >> ((iqs % 2) * 4)) & 0x0F0F0F0F)) - int8_t(4));
+
+        q_sum += dotPacked4x8EXT(qs_a, cache_b.qs[iqs]);
+    }
+    result += float(cache_a[ib_a].dm.y) * float(q_sum);
+
+    return ACC_TYPE(float(cache_b.ds.x) * result);
+}
+#endif
+
+#if defined(DATA_A_Q4_K)
+// Q4_K nibble-packed A: 8 4-bit values per uint32 (4 int32 per BK=32 tile),
+// with a single per-32 scale/min pair.
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+    const uint ib_k = ib / 8;
+    const uint iqs_k = (ib % 8) * 8 + iqs * 2;
+
+    const uint qs_idx = (iqs_k / 16) * 8 + (iqs_k % 8);
+    const uint qs_shift = ((iqs_k % 16) / 8) * 4;
+
+    const uint32_t vals0 = (data_a_packed32[ib_k].qs[qs_idx    ] >> qs_shift) & 0x0F0F0F0F;
+    const uint32_t vals1 = (data_a_packed32[ib_k].qs[qs_idx + 1] >> qs_shift) & 0x0F0F0F0F;
+
+    buf_a[buf_ib].qs[iqs] = vals0 | (vals1 << 4);
+
+    if (iqs == 0) {
+        const uint g = ib % 8;
+        uint sc, mb;
+        q45_k_scale_min(ib_k, g, sc, mb);
+        buf_a[buf_ib].dm = FLOAT_TYPE_VEC2(float(data_a[ib_k].d.x) * float(sc), float(data_a[ib_k].d.y) * float(mb));
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
+
+    [[unroll]] for (uint iqs = 0; iqs < 4; iqs++) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    int32_t q_sum = 0;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        const int32_t qs_a = int32_t((cache_a[ib_a].qs[iqs / 2] >> ((iqs % 2) * 4)) & 0x0F0F0F0F);
+
+        q_sum += dotPacked4x8EXT(qs_a, cache_b.qs[iqs]);
+    }
+
+    return ACC_TYPE(float(cache_b.ds.x) * float(cache_a[ib_a].dm.x) * float(q_sum) - float(cache_a[ib_a].dm.y) * float(cache_b.ds.y));
+}
+#endif
+
+#if defined(DATA_A_Q5_K)
+// Q5_K byte-packed A: 8 int32 per BK=32 tile (4 5-bit values per int32), with
+// a single per-32 scale/min pair.
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+    const uint ib_k = ib / 8;
+    const uint iqs_k = (ib % 8) * 8 + iqs;
+
+    const uint qs_idx = (iqs_k / 16) * 8 + (iqs_k % 8);
+    const uint qs_shift = ((iqs_k % 16) / 8) * 4;
+    const uint qh_idx = iqs;
+    const uint qh_shift = iqs_k / 8;
+
+    buf_a[buf_ib].qs[iqs] = int32_t(((data_a_packed32[ib_k].qs[qs_idx] >> qs_shift) & 0x0F0F0F0F) |
+                                   (((data_a_packed32[ib_k].qh[qh_idx] >> qh_shift) & 0x01010101) << 4));
+
+    if (iqs == 0) {
+        const uint g = ib % 8;
+        uint sc, mb;
+        q45_k_scale_min(ib_k, g, sc, mb);
+        buf_a[buf_ib].dm = FLOAT_TYPE_VEC2(float(data_a[ib_k].d.x) * float(sc), float(data_a[ib_k].d.y) * float(mb));
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    int32_t q_sum = 0;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+
+    return ACC_TYPE(float(cache_b.ds.x) * float(cache_a[ib_a].dm.x) * float(q_sum) - float(cache_a[ib_a].dm.y) * float(cache_b.ds.y));
+}
+#endif
+
+#if defined(DATA_A_Q6_K)
+// Q6_K byte-packed A: 8 int32 per BK=32 tile (4 6-bit-minus-32 values per
+// int32), with two per-16 scales.
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+    const uint ib_k = ib / 8;
+    const uint g = ib % 8;
+    const uint iqs_k = g * 8 + iqs;
+
+    const uint ql_idx = (iqs_k / 32) * 16 + iqs_k % 16;
+    const uint ql_shift = ((iqs_k % 32) / 16) * 4;
+    const uint qh_idx = (iqs_k / 32) * 8 + iqs;
+    const uint qh_shift = ((iqs_k % 32) / 8) * 2;
+
+    const i8vec2 vals00 = (unpack8(int32_t((data_a[ib_k].ql[ql_idx * 2    ] >> ql_shift) & uint16_t(0x0F0F))).xy |
+                          unpack8(int32_t(((data_a[ib_k].qh[qh_idx * 2    ] >> qh_shift) & uint16_t(0x0303)) << 4)).xy) - int8_t(32);
+    const i8vec2 vals01 = (unpack8(int32_t((data_a[ib_k].ql[ql_idx * 2 + 1] >> ql_shift) & uint16_t(0x0F0F))).xy |
+                          unpack8(int32_t(((data_a[ib_k].qh[qh_idx * 2 + 1] >> qh_shift) & uint16_t(0x0303)) << 4)).xy) - int8_t(32);
+
+    buf_a[buf_ib].qs[iqs] = pack32(i8vec4(vals00.x, vals00.y, vals01.x, vals01.y));
+
+    if (iqs == 0) {
+        const int s0 = int(data_a[ib_k].scales[2u * g]);
+        const int s1 = int(data_a[ib_k].scales[2u * g + 1u]);
+        buf_a[buf_ib].dm = FLOAT_TYPE_VEC2(float(data_a[ib_k].d) * float(s0), float(data_a[ib_k].d) * float(s1));
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    float result = 0.0;
+    int32_t q_sum = 0;
+
+    [[unroll]] for (uint iqs = 0; iqs < 4; iqs++) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+    result += float(cache_a[ib_a].dm.x) * float(q_sum);
+    q_sum = 0;
+
+    [[unroll]] for (uint iqs = 4; iqs < 8; iqs++) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+    result += float(cache_a[ib_a].dm.y) * float(q_sum);
+
+    return ACC_TYPE(float(cache_b.ds.x) * result);
+}
+#endif
+
+#if !defined(DATA_A_Q2_K) && !defined(DATA_A_Q3_K) && !defined(DATA_A_Q4_K) && !defined(DATA_A_Q5_K) && !defined(DATA_A_Q6_K)
+// Generic byte-packed A staging: 4 int8 values per int32 (8 int32 per BK=32
+// tile), with either a single scale (QUANT_AUXF == 1) or a per-16 scale/min
+// pair (QUANT_AUXF == 2).
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
+#if QUANT_AUXF == 1
+    if (iqs == 0) {
+        buf_a[buf_ib].dm = get_d(ib);
+    }
+#else
+    if (iqs == 0) {
+        buf_a[buf_ib].dm = get_dm(ib);
+    }
+#endif
+#if QUANT_R == 1
+    buf_a[buf_ib].qs[iqs] = repack(ib, iqs);
+#else
+    const i32vec2 vals = repack(ib, iqs);
+    buf_a[buf_ib].qs[iqs    ] = vals.x;
+    buf_a[buf_ib].qs[iqs + 4] = vals.y;
+#endif
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].dm = buf_a[buf_ib].dm;
+
+    [[unroll]] for (uint iqs = 0; iqs < A_QS_PER_TILE; iqs++) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+#if defined(LEGACY_K_OFFSET)
+    int32_t q_sum = 0;
+    [[unroll]] for (uint idx_k = 0; idx_k < BK / 4; idx_k++) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[idx_k], cache_b.qs[idx_k]);
+    }
+
+    const FLOAT_TYPE_VEC2 dm = cache_a[ib_a].dm;
+    const FLOAT_TYPE_VEC2 ds = cache_b.ds;
+    return ACC_TYPE(float(ds.x) * float(dm.x) * float(q_sum) - float(dm.y) * float(ds.y));
+#elif defined(IQK_PER16_SCALES)
+    int32_t q_sum1 = 0;
+    int32_t q_sum2 = 0;
+    [[unroll]] for (uint idx_k = 0; idx_k < BK / 8; idx_k++) {
+        q_sum1 += dotPacked4x8EXT(cache_a[ib_a].qs[idx_k], cache_b.qs[idx_k]);
+        q_sum2 += dotPacked4x8EXT(cache_a[ib_a].qs[idx_k + BK / 8], cache_b.qs[idx_k + BK / 8]);
+    }
+
+    const FLOAT_TYPE_VEC2 dm = cache_a[ib_a].dm;
+    const FLOAT_TYPE_VEC2 ds = cache_b.ds;
+    return ACC_TYPE(dm.x * (float(q_sum1) * ds.x) + dm.y * (float(q_sum2) * ds.x));
+#else
+    int32_t q_sum = 0;
+    [[unroll]] for (uint idx_k = 0; idx_k < BK / 4; idx_k++) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[idx_k], cache_b.qs[idx_k]);
+    }
+
+    return mul_q8_1(q_sum, cache_a[ib_a].dm, cache_b.ds);
+#endif
+}
+#endif // !DATA_A_Q2_K && !DATA_A_Q3_K && !DATA_A_Q4_K

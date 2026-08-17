@@ -262,6 +262,19 @@ struct block_q8_1_packed32
     int32_t qs[8];
 };
 
+// 4 blocks in one to allow 16-byte/128-bit alignment and loads
+struct block_q8_1_x4
+{
+    f16vec2 ds[4];
+    int32_t qs[32];
+};
+
+struct block_q8_1_x4_packed128
+{
+    f16vec2 ds[4];
+    ivec4 qs[8];
+};
+
 // K-quants
 #define QUANT_K_Q2_K 256
 
@@ -370,6 +383,14 @@ struct block_q5_K_packed16
     uint16_t qs[QUANT_K_Q5_K/2/2];
 };
 
+struct block_q5_K_packed32
+{
+    f16vec2 d;
+    uint32_t scales[12/4];
+    uint32_t qh[QUANT_K_Q5_K/8/4];
+    uint32_t qs[QUANT_K_Q5_K/2/4];
+};
+
 struct block_q5_K_packed128
 {
     uvec4 q5k[11];
@@ -379,6 +400,7 @@ struct block_q5_K_packed128
 #define QUANT_K QUANT_K_Q5_K
 #define A_TYPE block_q5_K
 #define A_TYPE_PACKED16 block_q5_K_packed16
+#define A_TYPE_PACKED32 block_q5_K_packed32
 #endif
 
 #define QUANT_K_Q6_K 256
