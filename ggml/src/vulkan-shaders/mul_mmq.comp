@@ -3,6 +3,9 @@
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#ifdef DATA_A_IQ4_KS
+#extension GL_EXT_shader_8bit_storage : require
+#endif
 
 #extension GL_EXT_integer_dot_product : require
 
@@ -21,6 +24,13 @@
 #endif
 
 #include "types.comp"
+
+#ifdef DATA_A_IQ4_KS
+// The mmq tile (BK=32) maps to one IQ4_KS 32-element group, so each repack
+// covers 8 elements (two packed-int8 uint32s) like the other 4-bit quants.
+#undef QUANT_R
+#define QUANT_R 2
+#endif
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
