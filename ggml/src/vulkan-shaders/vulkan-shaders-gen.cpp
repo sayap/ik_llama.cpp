@@ -89,11 +89,16 @@ const std::vector<std::string> iqk_type_names = {
     "iq4_kt",
 };
 
-// Per-32-element-scale types (IQK/KT/KS/KL families plus the legacy Q6_0) that
-// get a SIMT dot4 Q8_1 mmq (mul_mmq.comp) for prompt processing on coopmat1
-// (AMD/Intel) devices: one BK=32 mmq tile maps onto a single 32-element group
-// with its own scale, so the existing per-tile scale machinery carries over 1:1.
+// Types that get a SIMT dot4 Q8_1 mmq (mul_mmq.comp) for prompt processing on
+// coopmat1 (AMD/Intel) devices. The per-32-element-scale IQK/KT/KS/KL families
+// (plus the legacy Q6_0) map one BK=32 tile onto a single 32-element group with
+// one scale, and the base _K types (per-16 scales) keep two scales per tile.
 const std::vector<std::string> iqk_mmq_type_names = {
+    "iq2_k",
+    "iq3_k",
+    "iq4_k",
+    "iq5_k",
+    "iq6_k",
     "iq2_ks",
     "iq3_ks",
     "iq4_ks",

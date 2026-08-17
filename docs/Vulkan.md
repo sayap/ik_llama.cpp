@@ -226,7 +226,10 @@ scale exponent, 17-byte blocks) is now supported by `MUL_MAT`, `MUL_MAT_ID` and
 - **prompt (`mul_mat`)**: on `NV_coopmat2` devices, a native cm2 inline-dequant
   matmul (`mul_mm_cm2.comp` + `dequantFuncMXFP4`) reads the 17-byte blocks directly;
   `ggml_vk_get_mul_mat_mat_pipeline` no longer falls back to dequant+F16 for MXFP4.
-  Non-coopmat2 devices keep the flat `dequant_mxfp4.comp` → F16 matmul fallback.
+  Non-coopmat2 devices keep the flat `dequant_mxfp4.comp` → F16 matmul fallback (on
+  coopmat1 this is the remaining dense-prompt dequant-to-F16 gap: MXFP4 is the cleanest
+  next SIMT dot4 mmq candidate — a per-32 power-of-two scale and a zero-mean 4-bit
+  table, see "coopmat1 devices" below).
 - **`MUL_MAT_ID`**: the mat-mat-id path now uses the same native cm2 inline-dequant
   matmul on coopmat2 (this matters for large MoE models: the old dequant-to-F16 path
   dequantized the *entire* expert matrix — 8 GiB of F16 for DeepSeek-V4's fused
@@ -667,15 +670,18 @@ record PP tok/s and TG tok/s for both.
 6. Everything else: Mamba `SSM_SCAN`, the `*_R4` repacks and `IQ1_BN`/`IQ2_BN`, async
    tensor copies/events, the fence busy-wait, and the remaining training/vision ops
    (`GLU`, `RWKV_WKV6/7`, `CONV_2D_DW`, `SIN`/`COS`, ...).
-7. **coopmat1 prompt processing** (AMD / Intel): **implemented for all per-32-scale
-   IQK/KT/KS/KL families plus `Q6_0`** — a SIMT `dot4` Q8_1 mmq (`mul_mmq.comp`
-   byte-addressed tile loader + packed-int8 dp4a) now runs the dense `MUL_MAT` prompt
-   path on KHR-coopmat devices instead of the dequant-to-F16 + f16 WMMA GEMM. Measured
-   on Qwen3.8-27B / Vulkan1 (Strix Halo, 2600-token prompt): `-ub 512` IQ4_KS ~186 tok/s
-   (vs ~98 before, ~1.9×), IQ3_KT ~170 tok/s, IQ5_KS ~161 tok/s; `-ub 2048` IQ4_KS
-   ~174 tok/s (vs ~118, ~1.5×), IQ3_KT ~160 tok/s, IQ5_KS ~146 tok/s. The base `_K`
-   types (per-16 scales) and MoE `MUL_MAT_ID` remain on the dequant-to-F16 path (see
-   "coopmat1 devices (AMD / Intel)" under Performance / architecture).
+7. **coopmat1 prompt processing** (AMD / Intel): **implemented for the per-32-scale
+   IQK/KT/KS/KL families, the base per-16-scale `_K` types, and `Q6_0`** — a SIMT
+   `dot4` Q8_1 mmq (`mul_mmq.comp` byte-addressed tile loader + packed-int8 dp4a) now
+   runs the dense `MUL_MAT` prompt path on KHR-coopmat devices instead of the
+   dequant-to-F16 + f16 WMMA GEMM. Measured on Qwen3.8-27B / Vulkan1 (Strix Halo,
+   2600-token prompt): `-ub 512` IQ4_KS ~186 tok/s (vs ~98 before, ~1.9×), IQ3_KT ~170,
+   IQ5_KS ~161; `-ub 2048` IQ4_KS ~174 (vs ~118, ~1.5×), IQ3_KT ~160, IQ5_KS ~146.
+   The base per-16-scale `_K` types use the same mmq with two scales per BK=32 tile:
+   `-ub 512` IQ4_K ~195 tok/s (vs ~76, ~2.6×), IQ3_K ~184 (vs ~85, ~2.2×); `-ub 2048`
+   IQ4_K ~193 (vs ~104, ~1.9×), IQ3_K ~179 (vs ~91, ~2.0×). MoE `MUL_MAT_ID` and
+   dense `MXFP4` remain on the dequant-to-F16 path (see "coopmat1 devices (AMD / Intel)"
+   under Performance / architecture).
 
 ### Op coverage (the big one)
 
@@ -828,13 +834,16 @@ I.e. at large `-ub` the current path is **compute-bound on f16 WMMA** (the only 
 leaving F16), and at small/medium `-ub` it is **bandwidth-bound on the F16 intermediate**
 (removing the intermediate wins). Options, highest value first:
 
-1. **SIMT `dot4` MMQ for the per-32-element-scale families** (KS/KSS/KT/KL, plus Q6_0):
-   **now implemented for all of them.** `mul_mmq.comp` + `mul_mmq_funcs.comp` gained
-   byte-addressed tile loaders for `IQ2_KS`, `IQ3_KS`, `IQ4_KS`, `IQ4_KSS`, `IQ5_KS`,
-   `IQ2_KL`, `IQ1_KT`..`IQ4_KT` and a typed `Q6_0` loader: one BK=32 mmq tile maps onto
-   one 32-element group (its per-32 `dl` scale is folded exactly like the corresponding
-   `mul_mat_vec_*_q8_1` decode kernel), `repack` decodes the group's 8 elements to two
-   packed-int8 uint32s, and the standard dp4a accumulate dots against Q8_1 activations.
+1. **SIMT `dot4` MMQ for the IQK/KT families (per-32 and per-16 scales)** (KS/KSS/KT/KL,
+   the base `_K` types, plus Q6_0): **now implemented for all of them.**
+   `mul_mmq.comp` + `mul_mmq_funcs.comp` gained byte-addressed tile loaders for
+   `IQ2_K`..`IQ6_K`, `IQ2_KS`, `IQ3_KS`, `IQ4_KS`, `IQ4_KSS`, `IQ5_KS`, `IQ2_KL`,
+   `IQ1_KT`..`IQ4_KT` and a typed `Q6_0` loader: one BK=32 mmq tile maps onto one
+   32-element group, `repack` decodes the group's 8 elements to two packed-int8 uint32s,
+   and the standard dp4a accumulate dots against Q8_1 activations. The per-32 types fold
+   their single `dl` scale exactly like the corresponding `mul_mat_vec_*_q8_1` decode
+   kernel; the base `_K` types keep two per-16 scales per tile (`QUANT_AUXF == 2`) and
+   the accumulator scales the two 16-element half-dots separately.
    The KT hash decode reuses `iqk_hash_values_packed` (`iqk_tables.comp`); `Q6_0` folds
    its −32 zero point into the block-sum correction. The pipelines are created on
    coopmat1 devices in the `integer_dot_product` branch
@@ -847,6 +856,8 @@ leaving F16), and at small/medium `-ub` it is **bandwidth-bound on the F16 inter
    | IQ4_KS | 98 → ~186 tok/s (~1.9×) | 118 → ~174 tok/s (~1.5×) |
    | IQ3_KT | ~170 tok/s | ~160 tok/s |
    | IQ5_KS | ~161 tok/s | ~146 tok/s |
+   | IQ4_K  | 76 → ~195 tok/s (~2.6×) | 104 → ~193 tok/s (~1.9×) |
+   | IQ3_K  | 85 → ~184 tok/s (~2.2×) | 91 → ~179 tok/s (~2.0×) |
 
    The win is smaller than the paper 2-4× because the Strix Halo iGPU shares DDR
    bandwidth with the CPU, so both paths are more memory-contended than the isolated
@@ -857,9 +868,9 @@ leaving F16), and at small/medium `-ub` it is **bandwidth-bound on the F16 inter
    measured 261 vs 489 tok/s PP and was disabled — but that was on the RTX 3090, where SIMT
    dot4 had to compete with 71-TFLOPS coopmat2 F16 tiles; against RDNA's ~17 TFLOPS f16 WMMA
    the same kernel is the favorite. The verdict does not transfer across device classes.
-   The base `_K` types (IQ2_K..IQ6_K) have **per-16** dequant scales, which fit neither the
-   per-32 Q8_1 grouping nor a simple int8 tile without per-16 handling; they stay on the F16
-   path initially.
+   The base `_K` types (IQ2_K..IQ6_K) have **per-16** dequant scales; they use the same
+   mmq with two scales per BK=32 tile (the low 16 elements in slots 0..3 and the high 16
+   in slots 4..7, scaled separately), so the per-16 handling needed no grouping trick.
 2. **`coopmat<int8_t>` WMMA MMQ** — `coopmat_int_support`/`coopmat_int_{m,n,k}` are detected
    and never used. The reverted 8×-slower experiment was again NVIDIA KHR-coopmat1 vs
    coopmat2; on RDNA the 16×16×32 i8 WMMA is native silicon at 2× the f16 rate, and the
@@ -882,7 +893,10 @@ Option 1 is now measured on the Strix Halo iGPU (Vulkan1) for `IQ4_KS`, `IQ3_KT`
 - **MoE `MUL_MAT_ID`**: the mmq covers dense `MUL_MAT` only; MoE prompt processing still
   pays dequant-to-F16 for the IQK/KT types on coopmat1 (a `matmul_id_*_q8_1` mmq variant
   is the missing piece).
-- **Base `_K` types** (`IQ2_K`..`IQ6_K`) stay on the F16 path (per-16 scales).
+- **MXFP4 dense `MUL_MAT`**: on coopmat1 MXFP4 still pays the flat `dequant_mxfp4.comp` →
+  F16 WMMA round trip. It is the cleanest remaining dense-prompt win: a per-32
+  power-of-two scale and a zero-mean 4-bit value table (`kvalues_mxfp4` sums to 0) map
+  directly onto the Q6_0-style typed mmq with no `-sum` offset correction.
 - **Option 2** (`coopmat<int8_t>` WMMA MMQ) and **option 3** (shrink the F16 intermediate)
   are still open.
 - A pre-existing Vulkan1 correctness gap surfaced while testing: `q6_0`/`mxfp4`
@@ -1224,8 +1238,9 @@ remaining gaps are dominated by the FFN:
     back to dequant+F16 (segfault on the Strix Halo iGPU). The matmul-pipeline lookup
     now returns nullptr when the selected struct has no compiled l/m/s/a_* variants,
     which takes the intended dequant+F16 fallback.
-- The base IQK types (IQ2_K..IQ6_K) have per-16-element dequant scales, which fit neither
-  the SIMT mmq's per-32-group scale nor a simple cm2 tile without per-16 handling.
+- The base IQK types (IQ2_K..IQ6_K) have per-16-element dequant scales. The coopmat1
+  SIMT mmq now handles them (two scales per BK=32 tile); the coopmat2 cm2 inline-dequant
+  path still lacks per-16 handling, so those types keep the dequant+F16 fallback there.
 
 An earlier symptom (the model generating "!" repeatedly) was from a pre-fix build (wrong
 `ql`/`qh` offsets and 16-bit reads in the IQ4_KT kernels); the current build generates

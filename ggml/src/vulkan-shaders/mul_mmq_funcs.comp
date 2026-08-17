@@ -9,7 +9,9 @@
 // 8 elements (two packed-int8 uint32s). iqk_tables.comp provides the value
 // tables plus iqk_load_u16/u32 (unaligned-safe byte loads) and the KT-family
 // hash decode (iqk_hash_values_packed, used with IQK_USE_DOT4).
-#if defined(DATA_A_IQ2_KS) || defined(DATA_A_IQ3_KS) || defined(DATA_A_IQ4_KS) || \
+#if defined(DATA_A_IQ2_K)   || defined(DATA_A_IQ3_K)   || defined(DATA_A_IQ4_K)   || \
+    defined(DATA_A_IQ5_K)   || defined(DATA_A_IQ6_K)   || \
+    defined(DATA_A_IQ2_KS) || defined(DATA_A_IQ3_KS) || defined(DATA_A_IQ4_KS) || \
     defined(DATA_A_IQ4_KSS) || defined(DATA_A_IQ5_KS) || defined(DATA_A_IQ2_KL) || \
     defined(DATA_A_IQ1_KT) || defined(DATA_A_IQ2_KT) || defined(DATA_A_IQ3_KT) || \
     defined(DATA_A_IQ4_KT)
@@ -21,7 +23,7 @@
 #endif
 #endif
 
-#if defined(DATA_A_IQ2_KS)
+#if defined(DATA_A_IQ2_K) || defined(DATA_A_IQ2_KS)
 #include "iq2k_table.comp"
 #endif
 
@@ -128,6 +130,407 @@ FLOAT_TYPE_VEC2 get_dm(uint ib) {
     defined(DATA_A_IQ4_KT)
 ACC_TYPE mul_q8_1(int32_t q_sum, float da, vec2 dsb) {
     return ACC_TYPE(da * (float(q_sum) * dsb.x));
+}
+#endif
+
+#if defined(DATA_A_IQ2_K)
+// IQ2_K byte-addressed mmq decode: 76-byte blocks (d + extra + 8 scales + 64
+// 2-bit bytes). A 32-element group g = 4*chunk + f reads 2-bit field f from
+// the 16-byte low/high qs chunks; the four 2-bit indices of a repack word form
+// one 256-entry iq2k_table lookup (vsel from extra).
+shared uint iq2k_shmem[2][256];
+
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize) {
+    for (uint idx = gl_LocalInvocationIndex.x; idx < 256; idx += wgsize.x) {
+        iq2k_shmem[0][idx] = iq2k_table[idx];
+        iq2k_shmem[1][idx] = iq2k_table[256 + idx];
+    }
+    barrier();
+}
+
+FLOAT_TYPE_VEC2 get_dm(uint ib) {
+    const uint groups_per_row = p.stride_a / BK;
+    const uint blocks_per_row = groups_per_row / 8u;
+    const uint row    = ib / groups_per_row;
+    const uint group  = ib % groups_per_row;
+    const uint block  = group / 8u;
+    const uint g      = group % 8u;
+
+    const uint row_byte   = row * (blocks_per_row * 76u);
+    const uint block_byte = row_byte + block * 76u;
+
+    const float d  = iqk_f16_to_f32(iqk_load_u16(block_byte));
+    const uint  sc = data_a[block_byte + 4u + g];
+    return FLOAT_TYPE_VEC2(d * (float(sc & 0xFu) - 8.0f), d * (float(sc >> 4) - 8.0f));
+}
+
+i32vec2 repack(uint ib, uint iqs) {
+    const uint groups_per_row = p.stride_a / BK;
+    const uint blocks_per_row = groups_per_row / 8u;
+    const uint row    = ib / groups_per_row;
+    const uint group  = ib % groups_per_row;
+    const uint block  = group / 8u;
+    const uint g      = group % 8u;
+
+    const uint row_byte   = row * (blocks_per_row * 76u);
+    const uint block_byte = row_byte + block * 76u;
+
+    const uint chunk = g / 4u;
+    const uint f     = g % 4u;
+    const uint extra = iqk_load_u16(block_byte + 2u);
+    const uint vsel1 = (extra >> (2u * g)) & 1u;
+    const uint vsel2 = (extra >> (2u * g + 1u)) & 1u;
+
+    const uint qs_base = block_byte + 12u + 32u * chunk;
+    const uint w_lo = iqk_load_u32(qs_base + 4u * iqs);
+    const uint w_hi = iqk_load_u32(qs_base + 16u + 4u * iqs);
+
+    const int off_lo = dotPacked4x8EXT(int((w_lo >> (2u * f)) & 0x03030303u), 0x40100401);
+    const int off_hi = dotPacked4x8EXT(int((w_hi >> (2u * f)) & 0x03030303u), 0x40100401);
+
+    return i32vec2(int(iq2k_shmem[vsel1][off_lo]), int(iq2k_shmem[vsel2][off_hi]));
+}
+#endif
+
+#if defined(DATA_A_IQ3_K)
+// IQ3_K byte-addressed mmq decode: 110-byte blocks (2-byte aligned). A
+// 32-element group g reads 2-bit qs field f = g%4 and high bit g from the
+// 32-byte qh array; the 5-bit indices go through the iq3nl byte-pair table.
+shared uint iq3nl_byte_shmem[256];
+
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize) {
+    for (uint idx = gl_LocalInvocationIndex.x; idx < 256; idx += wgsize.x) {
+        const uint lo_i = idx & 0xFu;
+        const uint hi_i = idx >> 4;
+        const uint lo_p = iq3nl_values_packed[lo_i >> 2];
+        const uint hi_p = iq3nl_values_packed[hi_i >> 2];
+        int lo = int((lo_p >> (8 * (lo_i & 3))) & 0xffu);
+        int hi = int((hi_p >> (8 * (hi_i & 3))) & 0xffu);
+        if (lo >= 128) lo -= 256;
+        if (hi >= 128) hi -= 256;
+        iq3nl_byte_shmem[idx] = (lo & 0xffu) | ((hi & 0xffu) << 8);
+    }
+    barrier();
+}
+
+FLOAT_TYPE_VEC2 get_dm(uint ib) {
+    const uint groups_per_row = p.stride_a / BK;
+    const uint blocks_per_row = groups_per_row / 8u;
+    const uint row    = ib / groups_per_row;
+    const uint group  = ib % groups_per_row;
+    const uint block  = group / 8u;
+    const uint g      = group % 8u;
+
+    const uint row_byte   = row * (blocks_per_row * 110u);
+    const uint block_byte = row_byte + block * 110u;
+
+    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+
+    const uint sh16 = iqk_load_u16(block_byte + 4u);
+    const uint sl   = data_a[block_byte + 6u + g];
+    const int  s1   = ((sh16 >> (2u * g)) & 1u) != 0u ? -1 : 1;
+    const int  s2   = ((sh16 >> (2u * g + 1u)) & 1u) != 0u ? -1 : 1;
+    const float dl1 = d * float(2 * int(sl & 0xFu) + 1) * float(s1);
+    const float dl2 = d * float(2 * int(sl >> 4) + 1) * float(s2);
+    return FLOAT_TYPE_VEC2(dl1, dl2);
+}
+
+i32vec2 repack(uint ib, uint iqs) {
+    const uint groups_per_row = p.stride_a / BK;
+    const uint blocks_per_row = groups_per_row / 8u;
+    const uint row    = ib / groups_per_row;
+    const uint group  = ib % groups_per_row;
+    const uint block  = group / 8u;
+    const uint g      = group % 8u;
+
+    const uint row_byte   = row * (blocks_per_row * 110u);
+    const uint block_byte = row_byte + block * 110u;
+
+    const uint chunk = g / 4u;
+    const uint f     = g % 4u;
+    const uint extra = iqk_load_u16(block_byte + 2u);
+    const uint voff1 = ((extra >> (2u * g)) & 1u) != 0u ? 0x08080808u : 0u;
+    const uint voff2 = ((extra >> (2u * g + 1u)) & 1u) != 0u ? 0x08080808u : 0u;
+
+    const uint qs_base = block_byte + 14u + 32u * chunk;
+    const uint qh_base = block_byte + 78u;
+    const uint w_lo = 4u * iqs;
+    const uint w_hi = w_lo + 16u;
+
+    const uint idx_lo = ((iqk_load_u32(qs_base + w_lo) >> (2u * f)) & 0x03030303u) |
+                        (((iqk_load_u32(qh_base + w_lo) >> g) & 0x01010101u) << 2) | voff1;
+    const uint idx_hi = ((iqk_load_u32(qs_base + w_hi) >> (2u * f)) & 0x03030303u) |
+                        (((iqk_load_u32(qh_base + w_hi) >> g) & 0x01010101u) << 2) | voff2;
+
+    const uint pair00 = (idx_lo & 0xFu) | ((idx_lo >> 4) & 0xF0u);
+    const uint pair01 = ((idx_lo >> 16) & 0xFu) | ((idx_lo >> 20) & 0xF0u);
+    const uint pair10 = (idx_hi & 0xFu) | ((idx_hi >> 4) & 0xF0u);
+    const uint pair11 = ((idx_hi >> 16) & 0xFu) | ((idx_hi >> 20) & 0xF0u);
+
+    const int v0 = int(iq3nl_byte_shmem[pair00] | (iq3nl_byte_shmem[pair01] << 16));
+    const int v1 = int(iq3nl_byte_shmem[pair10] | (iq3nl_byte_shmem[pair11] << 16));
+    return i32vec2(v0, v1);
+}
+#endif
+
+#if defined(DATA_A_IQ4_K)
+// IQ4_K byte-addressed mmq decode: 144-byte blocks. A 32-element group g has
+// two per-16 scales (dl1/dl2) and two value-table selectors (v1 for the low
+// qs nibbles, v2 for the high qs nibbles); the combined byte-pair table packs
+// one low-nibble and one high-nibble value into a single lookup.
+shared uint iq4k_pair_shmem[4][256];
+
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize) {
+    for (uint idx = gl_LocalInvocationIndex.x; idx < 128; idx += wgsize.x) {
+        const uint b0  = iq4k_values_byte_0[idx];
+        const uint b16 = iq4k_values_byte_16[idx];
+        const uint c00 = (b0 & 0xffu) | (b0 & 0xff00u);
+        const uint c01 = (b0 & 0xffu) | (b16 & 0xff00u);
+        const uint c10 = (b16 & 0xffu) | (b0 & 0xff00u);
+        const uint c11 = (b16 & 0xffu) | (b16 & 0xff00u);
+        const uint d00 = ((b0 >> 16) & 0xffu) | ((b0 >> 16) & 0xff00u);
+        const uint d01 = ((b0 >> 16) & 0xffu) | ((b16 >> 16) & 0xff00u);
+        const uint d10 = ((b16 >> 16) & 0xffu) | ((b0 >> 16) & 0xff00u);
+        const uint d11 = ((b16 >> 16) & 0xffu) | ((b16 >> 16) & 0xff00u);
+        iq4k_pair_shmem[0][2*idx]     = c00;
+        iq4k_pair_shmem[0][2*idx + 1] = d00;
+        iq4k_pair_shmem[1][2*idx]     = c01;
+        iq4k_pair_shmem[1][2*idx + 1] = d01;
+        iq4k_pair_shmem[2][2*idx]     = c10;
+        iq4k_pair_shmem[2][2*idx + 1] = d10;
+        iq4k_pair_shmem[3][2*idx]     = c11;
+        iq4k_pair_shmem[3][2*idx + 1] = d11;
+    }
+    barrier();
+}
+
+FLOAT_TYPE_VEC2 get_dm(uint ib) {
+    const uint groups_per_row = p.stride_a / BK;
+    const uint blocks_per_row = groups_per_row / 8u;
+    const uint row    = ib / groups_per_row;
+    const uint group  = ib % groups_per_row;
+    const uint block  = group / 8u;
+    const uint g      = group % 8u;
+
+    const uint row_byte   = row * (blocks_per_row * 144u);
+    const uint block_byte = row_byte + block * 144u;
+
+    const float d  = iqk_f16_to_f32(iqk_load_u16(block_byte));
+    const uint  sh = data_a[block_byte + 4u + g / 2u] >> (4u * (g % 2u));
+    const uint  sl = data_a[block_byte + 8u + g];
+    const int ls1 = int((sl & 0xFu) | ((sh << 4) & 0x30u)) - 32;
+    const int ls2 = int((sl >> 4) | ((sh << 2) & 0x30u)) - 32;
+    return FLOAT_TYPE_VEC2(d * float(ls1), d * float(ls2));
+}
+
+i32vec2 repack(uint ib, uint iqs) {
+    const uint groups_per_row = p.stride_a / BK;
+    const uint blocks_per_row = groups_per_row / 8u;
+    const uint row    = ib / groups_per_row;
+    const uint group  = ib % groups_per_row;
+    const uint block  = group / 8u;
+    const uint g      = group % 8u;
+
+    const uint row_byte   = row * (blocks_per_row * 144u);
+    const uint block_byte = row_byte + block * 144u;
+
+    const uint extra = iqk_load_u16(block_byte + 2u);
+    const uint v1_sel = (extra >> (2u * g)) & 1u;
+    const uint v2_sel = (extra >> (2u * g + 1u)) & 1u;
+    const uint pair_sel = 2u * v1_sel + v2_sel;
+
+    const uint w = iqk_load_u32(block_byte + 16u + 16u * g + 4u * iqs);
+
+    int packed_lo = 0;
+    int packed_hi = 0;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint q     = (w >> (8u * k)) & 0xffu;
+        const uint entry = iq4k_pair_shmem[pair_sel][q];
+        packed_lo |= int(entry & 0xffu) << (8 * k);
+        packed_hi |= int((entry >> 8) & 0xffu) << (8 * k);
+    }
+    return i32vec2(packed_lo, packed_hi);
+}
+#endif
+
+#if defined(DATA_A_IQ5_K)
+// IQ5_K byte-addressed mmq decode: 176-byte blocks. The 256 elements are four
+// 64-element blocks (ib64); a 32-element group is one half of a 64-block. The
+// low half reads low qs nibbles and the high half reads high qs nibbles, each
+// with its own per-16 scale and 5-bit value-table selector.
+shared int iq5nl_shmem[64];
+
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize) {
+    for (uint idx = gl_LocalInvocationIndex.x; idx < 64; idx += wgsize.x) {
+        const uint packed = iq5nl_values_packed[idx / 4u];
+        int v = int((packed >> (8u * (idx % 4u))) & 0xffu);
+        if (v >= 128) v -= 256;
+        iq5nl_shmem[idx] = v;
+    }
+    barrier();
+}
+
+int iq5nl_lookup4(uint idx_packed, uint table_off) {
+    int res = 0;
+    [[unroll]] for (int b = 0; b < 4; ++b) {
+        const uint idx = ((idx_packed >> (8 * b)) & 0x1fu) + table_off;
+        res |= (iq5nl_shmem[idx] & 0xff) << (8 * b);
+    }
+    return res;
+}
+
+FLOAT_TYPE_VEC2 get_dm(uint ib) {
+    const uint groups_per_row = p.stride_a / BK;
+    const uint blocks_per_row = groups_per_row / 8u;
+    const uint row    = ib / groups_per_row;
+    const uint group  = ib % groups_per_row;
+    const uint block  = group / 8u;
+    const uint g      = group % 8u;
+
+    const uint row_byte   = row * (blocks_per_row * 176u);
+    const uint block_byte = row_byte + block * 176u;
+
+    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+
+    const uint ib64 = g / 2u;
+    const uint sub_half = g % 2u;
+    const uint sh_byte = data_a[block_byte + 4u + ib64];
+    const uint sl0 = data_a[block_byte + 8u + 2u * ib64];
+    const uint sl1 = data_a[block_byte + 9u + 2u * ib64];
+    if (sub_half == 0u) {
+        const int ls1 = int((sl0 & 0xFu) | ((sh_byte << 4) & 0x30u)) - 32;
+        const int ls2 = int((sl0 >> 4) | ((sh_byte << 2) & 0x30u)) - 32;
+        return FLOAT_TYPE_VEC2(d * float(ls1), d * float(ls2));
+    } else {
+        const int ls3 = int((sl1 & 0xFu) | (sh_byte & 0x30u)) - 32;
+        const int ls4 = int((sl1 >> 4) | ((sh_byte >> 2) & 0x30u)) - 32;
+        return FLOAT_TYPE_VEC2(d * float(ls3), d * float(ls4));
+    }
+}
+
+i32vec2 repack(uint ib, uint iqs) {
+    const uint groups_per_row = p.stride_a / BK;
+    const uint blocks_per_row = groups_per_row / 8u;
+    const uint row    = ib / groups_per_row;
+    const uint group  = ib % groups_per_row;
+    const uint block  = group / 8u;
+    const uint g      = group % 8u;
+
+    const uint row_byte   = row * (blocks_per_row * 176u);
+    const uint block_byte = row_byte + block * 176u;
+
+    const uint ib64 = g / 2u;
+    const uint sub_half = g % 2u;
+    const uint shift = 2u * ib64;
+    const uint extra = iqk_load_u16(block_byte + 2u) >> (4u * ib64);
+    const uint v_off_lo = 32u * ((extra >> (2u * sub_half)) & 1u);
+    const uint v_off_hi = 32u * ((extra >> (2u * sub_half + 1u)) & 1u);
+
+    const uint qs_base = block_byte + 16u + 32u * ib64;
+    const uint qh_base = block_byte + 144u;
+    const uint qs_low  = iqk_load_u32(qs_base + 4u * iqs);
+    const uint qs_high = iqk_load_u32(qs_base + 16u + 4u * iqs);
+    const uint qh_low  = iqk_load_u32(qh_base + 4u * iqs) >> shift;
+    const uint qh_high = iqk_load_u32(qh_base + 16u + 4u * iqs) >> shift;
+
+    uint idx_low, idx_high;
+    if (sub_half == 0u) {
+        idx_low  = (qs_low & 0x0f0f0f0fu)  | ((qh_low  << 4) & 0x10101010u);
+        idx_high = (qs_high & 0x0f0f0f0fu) | ((qh_high << 4) & 0x10101010u);
+    } else {
+        idx_low  = ((qs_low >> 4) & 0x0f0f0f0fu)  | ((qh_low  << 3) & 0x10101010u);
+        idx_high = ((qs_high >> 4) & 0x0f0f0f0fu) | ((qh_high << 3) & 0x10101010u);
+    }
+    return i32vec2(iq5nl_lookup4(idx_low, v_off_lo), iq5nl_lookup4(idx_high, v_off_hi));
+}
+#endif
+
+#if defined(DATA_A_IQ6_K)
+// IQ6_K byte-addressed mmq decode: 212-byte blocks. Four 64-element blocks
+// (ib64); a 32-element group is one half of a 64-block (low/high qs nibbles). The
+// 6-bit indices index the 128-entry iq6nl table (two 64-entry tables selected
+// by the extra bits).
+shared int iq6nl_shmem[128];
+
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize) {
+    for (uint idx = gl_LocalInvocationIndex.x; idx < 128; idx += wgsize.x) {
+        iq6nl_shmem[idx] = int(iq6nl_values[idx]);
+    }
+    barrier();
+}
+
+int iq6nl_lookup4(uint idx_packed, uint table_off) {
+    int res = 0;
+    [[unroll]] for (int b = 0; b < 4; ++b) {
+        const uint idx = ((idx_packed >> (8 * b)) & 0x3fu) + table_off;
+        res |= (iq6nl_shmem[idx] & 0xff) << (8 * b);
+    }
+    return res;
+}
+
+FLOAT_TYPE_VEC2 get_dm(uint ib) {
+    const uint groups_per_row = p.stride_a / BK;
+    const uint blocks_per_row = groups_per_row / 8u;
+    const uint row    = ib / groups_per_row;
+    const uint group  = ib % groups_per_row;
+    const uint block  = group / 8u;
+    const uint g      = group % 8u;
+
+    const uint row_byte   = row * (blocks_per_row * 212u);
+    const uint block_byte = row_byte + block * 212u;
+
+    const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+
+    const uint ib64 = g / 2u;
+    const uint sub_half = g % 2u;
+    const uint sc_word = iqk_load_u32(block_byte + 4u + 4u * ib64);
+    int sc1 = int(sc_word & 0xffu); if (sc1 >= 128) sc1 -= 256;
+    int sc2 = int((sc_word >> 8) & 0xffu); if (sc2 >= 128) sc2 -= 256;
+    int sc3 = int((sc_word >> 16) & 0xffu); if (sc3 >= 128) sc3 -= 256;
+    int sc4 = int((sc_word >> 24) & 0xffu); if (sc4 >= 128) sc4 -= 256;
+    if (sub_half == 0u) return FLOAT_TYPE_VEC2(d * float(sc1), d * float(sc2));
+    return FLOAT_TYPE_VEC2(d * float(sc3), d * float(sc4));
+}
+
+i32vec2 repack(uint ib, uint iqs) {
+    const uint groups_per_row = p.stride_a / BK;
+    const uint blocks_per_row = groups_per_row / 8u;
+    const uint row    = ib / groups_per_row;
+    const uint group  = ib % groups_per_row;
+    const uint block  = group / 8u;
+    const uint g      = group % 8u;
+
+    const uint row_byte   = row * (blocks_per_row * 212u);
+    const uint block_byte = row_byte + block * 212u;
+
+    const uint ib64 = g / 2u;
+    const uint sub_half = g % 2u;
+    const uint shift = 4u * (ib64 % 2u);
+    const uint extra = iqk_load_u16(block_byte + 2u) >> (4u * ib64);
+    const uint v_off_lo = 64u * ((extra >> (2u * sub_half)) & 1u);
+    const uint v_off_hi = 64u * ((extra >> (2u * sub_half + 1u)) & 1u);
+
+    const uint qs_base = block_byte + 20u + 32u * ib64;
+    const uint qh_base = block_byte + 148u + 32u * (ib64 / 2u);
+    const uint qs_low  = iqk_load_u32(qs_base + 4u * iqs);
+    const uint qs_high = iqk_load_u32(qs_base + 16u + 4u * iqs);
+    const uint qh_low  = iqk_load_u32(qh_base + 4u * iqs) >> shift;
+    const uint qh_high = iqk_load_u32(qh_base + 16u + 4u * iqs) >> shift;
+
+    uint idx_low, idx_high;
+    if (sub_half == 0u) {
+        idx_low  = (qs_low & 0x0f0f0f0fu)  | ((qh_low  << 4) & 0x30303030u);
+        idx_high = (qs_high & 0x0f0f0f0fu) | ((qh_high << 4) & 0x30303030u);
+    } else {
+        idx_low  = ((qs_low >> 4) & 0x0f0f0f0fu)  | ((qh_low  << 2) & 0x30303030u);
+        idx_high = ((qs_high >> 4) & 0x0f0f0f0fu) | ((qh_high << 2) & 0x30303030u);
+    }
+    return i32vec2(iq6nl_lookup4(idx_low, v_off_lo), iq6nl_lookup4(idx_high, v_off_hi));
 }
 #endif
 
