@@ -3005,6 +3005,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
             CREATE_MMQ(GGML_TYPE_IQ3_KT,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ3_KT],  matmul_iq3_kt_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
             CREATE_MMQ(GGML_TYPE_IQ4_KT,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT],  matmul_iq4_kt_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
             CREATE_MMQ(GGML_TYPE_Q6_0,    pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q6_0],    matmul_q6_0_q8_1,    mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_MXFP4,   pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_MXFP4],   matmul_mxfp4_q8_1,   mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
         }
 #undef CREATE_MMQ
 #endif

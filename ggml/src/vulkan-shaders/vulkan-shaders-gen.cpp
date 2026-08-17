@@ -110,6 +110,7 @@ const std::vector<std::string> iqk_mmq_type_names = {
     "iq3_kt",
     "iq4_kt",
     "q6_0",
+    "mxfp4",
 };
 
 namespace {
@@ -449,7 +450,11 @@ void matmul_shaders(bool fp16, bool matmul_id, bool coopmat, bool coopmat2, bool
         // F16 WMMA path is the baseline to beat (see docs/Vulkan.md).
         for (const auto& tname : iqk_mmq_type_names) {
             std::string data_a_key = "DATA_A_" + to_uppercase(tname);
-            string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
+            // MXFP4's E8M0 scale is a power of two with a huge dynamic range
+            // (down to 2^-128); keep it in f32 even for the f16 path, unlike
+            // the IQK/KT scales which are already f16-representable.
+            const std::string float_type = (tname == "mxfp4") ? "float" : FLOAT_TYPE(tname);
+            string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(base_dict, {{"FLOAT_TYPE", float_type}, {data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
         }
     }
 #endif
