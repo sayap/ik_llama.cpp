@@ -226,10 +226,9 @@ scale exponent, 17-byte blocks) is now supported by `MUL_MAT`, `MUL_MAT_ID` and
 - **prompt (`mul_mat`)**: on `NV_coopmat2` devices, a native cm2 inline-dequant
   matmul (`mul_mm_cm2.comp` + `dequantFuncMXFP4`) reads the 17-byte blocks directly;
   `ggml_vk_get_mul_mat_mat_pipeline` no longer falls back to dequant+F16 for MXFP4.
-  Non-coopmat2 devices keep the flat `dequant_mxfp4.comp` → F16 matmul fallback (on
-  coopmat1 this is the remaining dense-prompt dequant-to-F16 gap: MXFP4 is the cleanest
-  next SIMT dot4 mmq candidate — a per-32 power-of-two scale and a zero-mean 4-bit
-  table, see "coopmat1 devices" below).
+  Non-coopmat2 devices keep the flat `dequant_mxfp4.comp` → F16 matmul fallback, except
+  coopmat1 devices with integer dot, which now run a native SIMT dot4 Q8_1 mmq
+  (`mul_mmq.comp` typed MXFP4 decode) — see "coopmat1 devices" below.
 - **`MUL_MAT_ID`**: the mat-mat-id path now uses the same native cm2 inline-dequant
   matmul on coopmat2 (this matters for large MoE models: the old dequant-to-F16 path
   dequantized the *entire* expert matrix — 8 GiB of F16 for DeepSeek-V4's fused
@@ -679,9 +678,12 @@ record PP tok/s and TG tok/s for both.
    IQ5_KS ~161; `-ub 2048` IQ4_KS ~174 (vs ~118, ~1.5×), IQ3_KT ~160, IQ5_KS ~146.
    The base per-16-scale `_K` types use the same mmq with two scales per BK=32 tile:
    `-ub 512` IQ4_K ~195 tok/s (vs ~76, ~2.6×), IQ3_K ~184 (vs ~85, ~2.2×); `-ub 2048`
-   IQ4_K ~193 (vs ~104, ~1.9×), IQ3_K ~179 (vs ~91, ~2.0×). MoE `MUL_MAT_ID` and
-   dense `MXFP4` remain on the dequant-to-F16 path (see "coopmat1 devices (AMD / Intel)"
-   under Performance / architecture).
+   IQ4_K ~193 (vs ~104, ~1.9×), IQ3_K ~179 (vs ~91, ~2.0×). Dense `MXFP4` now uses the
+   same mmq (a typed Q6_0-style decode with the zero-mean `kvalues_mxfp4` table and an
+   f32 E8M0 scale): Qwen3.8-27B-MXFP4 / Vulkan1 (Strix Halo, 2600-token prompt)
+   `-ub 512` ~178 tok/s (vs ~92 before, ~1.9×), `-ub 2048` ~181 tok/s (vs ~106,
+   ~1.7×). MoE `MUL_MAT_ID` remains on the dequant-to-F16 path (see "coopmat1 devices
+   (AMD / Intel)" under Performance / architecture).
 
 ### Op coverage (the big one)
 
@@ -893,10 +895,14 @@ Option 1 is now measured on the Strix Halo iGPU (Vulkan1) for `IQ4_KS`, `IQ3_KT`
 - **MoE `MUL_MAT_ID`**: the mmq covers dense `MUL_MAT` only; MoE prompt processing still
   pays dequant-to-F16 for the IQK/KT types on coopmat1 (a `matmul_id_*_q8_1` mmq variant
   is the missing piece).
-- **MXFP4 dense `MUL_MAT`**: on coopmat1 MXFP4 still pays the flat `dequant_mxfp4.comp` →
-  F16 WMMA round trip. It is the cleanest remaining dense-prompt win: a per-32
-  power-of-two scale and a zero-mean 4-bit value table (`kvalues_mxfp4` sums to 0) map
-  directly onto the Q6_0-style typed mmq with no `-sum` offset correction.
+- **MXFP4 dense `MUL_MAT`**: **now implemented.** A typed `DATA_A_MXFP4` decode was
+  added to `mul_mmq.comp`/`mul_mmq_funcs.comp`: one BK=32 tile maps onto one 17-byte
+  MXFP4 block, the 4-bit nibbles are looked up in the zero-mean `kvalues_mxfp4` table
+  (no `-sum` offset correction) and packed as int8, and `get_d` reconstructs the E8M0
+  power-of-two scale in f32 (kept f32 even in the f16 path because the exponent range
+  reaches 2^-128). Measured on Qwen3.8-27B-MXFP4 / Vulkan1 (Strix Halo, 2600-token
+  prompt): `-ub 512` ~178 tok/s (vs ~92 dequant-to-F16, ~1.9×), `-ub 2048` ~181 tok/s
+  (vs ~106, ~1.7×).
 - **Option 2** (`coopmat<int8_t>` WMMA MMQ) and **option 3** (shrink the F16 intermediate)
   are still open.
 - A pre-existing Vulkan1 correctness gap surfaced while testing: `q6_0`/`mxfp4`

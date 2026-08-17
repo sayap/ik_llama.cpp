@@ -238,6 +238,9 @@ struct block_mxfp4
 #define QUANT_R QUANT_R_MXFP4
 #define QUANT_AUXF 1
 #define A_TYPE block_mxfp4
+// The SIMT dot4 Q8_1 mmq (mul_mmq.comp) reads the raw 17-byte blocks through
+// the same typed struct (the std430 stride is 17).
+#define A_TYPE_PACKED16 block_mxfp4
 #endif
 
 #define QUANT_K_Q8_1 32

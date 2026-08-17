@@ -1251,3 +1251,38 @@ ACC_TYPE mul_q8_1(int32_t q_sum, float da, vec2 dsb) {
     return ACC_TYPE(da * (float(q_sum) * dsb.x - 32.0f * dsb.y));
 }
 #endif
+
+#if defined(DATA_A_MXFP4)
+// MXFP4 typed mmq decode: one 32-element block per tile. The 4-bit nibbles are
+// mapped through the zero-mean e2m1 value table (kvalues_mxfp4 sums to 0), so
+// there is no offset correction: mul_q8_1 is just scale * d8 * q_sum.
+int mxfp4_lookup4(uint nibbles) {
+    int res = 0;
+    [[unroll]] for (int b = 0; b < 4; ++b) {
+        const uint n = (nibbles >> (8 * b)) & 0xFu;
+        res |= (int(kvalues_mxfp4_const[n]) & 0xff) << (8 * b);
+    }
+    return res;
+}
+
+FLOAT_TYPE get_d(uint ib) {
+    const uint e = uint(data_a[ib].e);
+    return FLOAT_TYPE(uintBitsToFloat(e >= 2u ? ((e - 1u) << 23u) : (e == 0u ? 0x00200000u : 0x00400000u)));
+}
+
+i32vec2 repack(uint ib, uint iqs) {
+    const uint qs0 = uint(data_a[ib].qs[4 * iqs]);
+    const uint qs1 = uint(data_a[ib].qs[4 * iqs + 1]);
+    const uint qs2 = uint(data_a[ib].qs[4 * iqs + 2]);
+    const uint qs3 = uint(data_a[ib].qs[4 * iqs + 3]);
+
+    const uint nib_lo = (qs0 & 0xFu) | ((qs1 & 0xFu) << 8) | ((qs2 & 0xFu) << 16) | ((qs3 & 0xFu) << 24);
+    const uint nib_hi = (qs0 >> 4) | ((qs1 >> 4) << 8) | ((qs2 >> 4) << 16) | ((qs3 >> 4) << 24);
+
+    return i32vec2(mxfp4_lookup4(nib_lo), mxfp4_lookup4(nib_hi));
+}
+
+ACC_TYPE mul_q8_1(int32_t q_sum, float da, vec2 dsb) {
+    return ACC_TYPE(da * (float(q_sum) * dsb.x));
+}
+#endif

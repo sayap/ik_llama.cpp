@@ -8,7 +8,7 @@
     defined(DATA_A_IQ2_KS) || defined(DATA_A_IQ3_KS) || defined(DATA_A_IQ4_KS) || \
     defined(DATA_A_IQ4_KSS) || defined(DATA_A_IQ5_KS) || defined(DATA_A_IQ2_KL) || \
     defined(DATA_A_IQ1_KT) || defined(DATA_A_IQ2_KT) || defined(DATA_A_IQ3_KT) || \
-    defined(DATA_A_IQ4_KT)
+    defined(DATA_A_IQ4_KT) || defined(DATA_A_MXFP4)
 #extension GL_EXT_shader_8bit_storage : require
 #endif
 
