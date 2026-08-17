@@ -886,9 +886,15 @@ Option 1 is now measured on the Strix Halo iGPU (Vulkan1) for `IQ4_KS`, `IQ3_KT`
 - **Option 2** (`coopmat<int8_t>` WMMA MMQ) and **option 3** (shrink the F16 intermediate)
   are still open.
 - A pre-existing Vulkan1 correctness gap surfaced while testing: `q6_0`/`mxfp4`
-  `MUL_MAT_ID` multi-token (`n=8`) cases and base-`_K` fused-up-gate cases return
-  `inf`/`nan` (and `test-iqk-quants` segfaults on the mxfp4 large-M `mul_mat_id` case).
-  These are unrelated to the mmq work but need fixing.
+  `MUL_MAT_ID` multi-token (`n=8`) cases returned `inf`/`nan` (and `test-iqk-quants`
+  segfaulted on the mxfp4 large-M `mul_mat_id` case). **Fixed**: the coopmat1/scalar
+  matmul_id path no longer creates the `Q6_0` typed pipeline (whose `mul_mm.comp` A
+  decode was missing), and `ggml_vk_get_mul_mat_mat_id_pipeline` now treats an empty
+  pipeline as a fallback to dequant-to-F16, so `Q6_0`/`MXFP4` MoE prompt processing
+  dequantizes like the dense path.
+- Still open: base-`_K` (`IQ4_K`/`IQ5_K`/`IQ6_K`) `FUSED_UP_GATE` cases return wrong
+  results on Vulkan1 (`test-fused-up-gate`; `IQ2_K`/`IQ3_K` pass). Unrelated to the
+  mmq work.
 
 ### Integration
 
