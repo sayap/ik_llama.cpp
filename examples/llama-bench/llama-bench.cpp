@@ -244,6 +244,7 @@ struct cmd_params {
     std::vector<std::pair<int,int>> n_threads;
     std::vector<int> n_gpu_layers;
     std::vector<std::string> rpc_servers;
+    std::vector<std::string> devices;
     std::vector<llama_split_mode> split_mode;
     std::vector<int> main_gpu;
     std::vector<bool> no_kv_offload;
@@ -293,6 +294,7 @@ static const cmd_params cmd_params_defaults = {
     /* n_threads            */ {{cpu_get_num_math(), cpu_get_num_math()}},
     /* n_gpu_layers         */ {999},
     /* rpc_servers          */ {""},
+    /* devices              */ {""},
     /* split_mode           */ {LLAMA_SPLIT_MODE_LAYER},
     /* main_gpu             */ {0},
     /* no_kv_offload        */ {false},
@@ -348,6 +350,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ngl, --n-gpu-layers <n>            (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  --n-cpu-moe <n>                     (default: none)\n");
     printf("  -rpc, --rpc <rpc_servers>           (default: %s)\n", join(cmd_params_defaults.rpc_servers, ",").c_str());
+    printf("  -dev, --device <dev1,dev2,...>       (default: %s)\n", join(cmd_params_defaults.devices, ",").c_str());
     printf("  -sm, --split-mode <none|layer|graph>(default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                 (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>        (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -649,6 +652,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 break;
             }
             params.rpc_servers.push_back(argv[i]);
+        } else if (arg == "-dev" || arg == "--device") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.devices.push_back(argv[i]);
         } else if (arg == "-sm" || arg == "--split-mode") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -926,6 +935,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.type_v.empty())       { params.type_v = cmd_params_defaults.type_v; }
     if (params.n_gpu_layers.empty()) { params.n_gpu_layers = cmd_params_defaults.n_gpu_layers; }
     if (params.rpc_servers.empty())  { params.rpc_servers = cmd_params_defaults.rpc_servers; }
+    if (params.devices.empty())      { params.devices = cmd_params_defaults.devices; }
     if (params.split_mode.empty())   { params.split_mode = cmd_params_defaults.split_mode; }
     if (params.main_gpu.empty())     { params.main_gpu = cmd_params_defaults.main_gpu; }
     if (params.no_kv_offload.empty()){ params.no_kv_offload = cmd_params_defaults.no_kv_offload; }
@@ -966,6 +976,7 @@ struct cmd_params_instance {
     std::pair<int,int> n_threads;
     int n_gpu_layers;
     std::string rpc_servers;
+    std::string devices;
     llama_split_mode split_mode;
     int main_gpu;
     bool no_kv_offload;
@@ -1001,6 +1012,7 @@ struct cmd_params_instance {
         if (!rpc_servers.empty()) {
             mparams.rpc_servers = rpc_servers.c_str();
         }
+        mparams.devices = devices.c_str();
         mparams.split_mode = split_mode;
         mparams.main_gpu = main_gpu;
         mparams.tensor_split = tensor_split.data();
@@ -1025,6 +1037,7 @@ struct cmd_params_instance {
         return model == other.model &&
                n_gpu_layers == other.n_gpu_layers &&
                rpc_servers == other.rpc_servers &&
+               devices == other.devices &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu &&
                use_mmap == other.use_mmap &&
@@ -1075,6 +1088,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & m : params.model)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & rpc : params.rpc_servers)
+    for (const auto & dev : params.devices)
     for (const auto & sm : params.split_mode)
     for (const auto & mg : params.main_gpu)
     for (const auto & ts : params.tensor_split)
@@ -1107,6 +1121,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_threads    = */ nt,
                 /* .n_gpu_layers = */ nl,
                 /* .rpc_servers  = */ rpc,
+                /* .devices      = */ dev,
                 /* .split_mode   = */ sm,
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
@@ -1154,6 +1169,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_threads    = */ nt,
                 /* .n_gpu_layers = */ nl,
                 /* .rpc_servers  = */ rpc,
+                /* .devices      = */ dev,
                 /* .split_mode   = */ sm,
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
@@ -1201,6 +1217,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_threads    = */ nt,
                 /* .n_gpu_layers = */ nl,
                 /* .rpc_servers  = */ rpc,
+                /* .devices      = */ dev,
                 /* .split_mode   = */ sm,
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
@@ -1248,6 +1265,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_threads    = */ nt,
                 /* .n_gpu_layers = */ nl,
                 /* .rpc_servers  = */ rpc,
+                /* .devices      = */ dev,
                 /* .split_mode   = */ sm,
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
