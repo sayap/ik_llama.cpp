@@ -55,11 +55,12 @@ and `GET_ROWS`:
   constants) and the dispatch passes the tensor's full byte size (the per-row scale headers
   must be included in the source subbuffer).
 
-  `IQ4_KT` additionally has a native Q8_1 integer-dot mmq (`mul_mmq.comp`): a byte-addressed
-  tile loader runs the hash decode with `dot4` and packs the values as signed int8, then the
-  standard dp4a vec-dot accumulates against Q8_1 activations. It is gated to devices without
-  cooperative matrices — on tensor-core GPUs it is correct but slower than the dequant+F16 path
-  (see "vs CUDA" below).
+  The per-32-scale families (`IQ2_KS`, `IQ3_KS`, `IQ4_KS`, `IQ4_KSS`, `IQ5_KS`, `IQ2_KL`,
+  `IQ1_KT`..`IQ4_KT`, plus `Q6_0`) additionally have a native Q8_1 integer-dot mmq
+  (`mul_mmq.comp`): a byte-addressed tile loader runs each type's decode with `dot4` and packs
+  the values as signed int8, then the standard dp4a vec-dot accumulates against Q8_1
+  activations. It is gated to devices without cooperative matrices — on tensor-core GPUs it is
+  correct but slower than the dequant+F16 path (see "vs CUDA" below and "coopmat1 devices").
 - **GET_ROWS (quantized token embeddings)**: a byte-addressed `get_rows_iqk.comp` shader
   dequantizes one element per thread (1024 per workgroup, matching the pipeline's
   elements-per-workgroup denom). The per-row scale header is read from the explicit row byte
@@ -268,8 +269,10 @@ Remaining gaps:
 - **The generic coopmat2 F16 matmul** runs below FP16 peak and is now the main PP
   lever; it affects the FFN and every projection (see the `Qwen2.5-Coder` "vs CUDA"
   section for the tuning analysis).
-- **`Q6_0` has no native int8 mmq on Vulkan** (CUDA decodes to int8 and uses INT8
-  tensor cores); `coopmat_int_support` is detected but unused.
+- **`Q6_0` has no native int8 coopmat mmq on Vulkan** (CUDA decodes to int8 and uses
+  INT8 tensor cores); `coopmat_int_support` is detected but unused. (The coopmat1 SIMT
+  dot4 mmq now covers dense `MUL_MAT` — see "coopmat1 devices" — but MoE `MUL_MAT_ID`
+  and the coopmat2 path still dequantize.)
 - **Decode (`mul_mat_vec`) TG** (~1.19x) is FFN/output-projection bound. The `Q6_0`
   vec path is now a native Q8_1 + dot4 kernel (see "Q6_0 quant"), and the `IQ4_KS`
   Q8_1 table-decode kernel reads its 4-byte-aligned weights through a uint32 view
@@ -664,13 +667,15 @@ record PP tok/s and TG tok/s for both.
 6. Everything else: Mamba `SSM_SCAN`, the `*_R4` repacks and `IQ1_BN`/`IQ2_BN`, async
    tensor copies/events, the fence busy-wait, and the remaining training/vision ops
    (`GLU`, `RWKV_WKV6/7`, `CONV_2D_DW`, `SIN`/`COS`, ...).
-7. **coopmat1 prompt processing** (AMD / Intel): **implemented for `IQ4_KS`** — a SIMT
-   `dot4` Q8_1 mmq (`mul_mmq.comp` byte-addressed tile loader + packed-int8 dp4a) now runs
-   the dense `MUL_MAT` prompt path on KHR-coopmat devices instead of the dequant-to-F16 +
-   f16 WMMA GEMM. Measured on Qwen3.8-27B-IQ4_KS / Vulkan1 (Strix Halo, 2600-token prompt):
-   `-ub 512` 98 → ~188 tok/s (~1.9×), `-ub 2048` 118 → ~176 tok/s (~1.5×). The other
-   per-32-scale types (KS/KSS/KT/KL, plus Q6_0) follow the same pattern and are the next
-   increment (see "coopmat1 devices (AMD / Intel)" under Performance / architecture).
+7. **coopmat1 prompt processing** (AMD / Intel): **implemented for all per-32-scale
+   IQK/KT/KS/KL families plus `Q6_0`** — a SIMT `dot4` Q8_1 mmq (`mul_mmq.comp`
+   byte-addressed tile loader + packed-int8 dp4a) now runs the dense `MUL_MAT` prompt
+   path on KHR-coopmat devices instead of the dequant-to-F16 + f16 WMMA GEMM. Measured
+   on Qwen3.8-27B / Vulkan1 (Strix Halo, 2600-token prompt): `-ub 512` IQ4_KS ~186 tok/s
+   (vs ~98 before, ~1.9×), IQ3_KT ~170 tok/s, IQ5_KS ~161 tok/s; `-ub 2048` IQ4_KS
+   ~174 tok/s (vs ~118, ~1.5×), IQ3_KT ~160 tok/s, IQ5_KS ~146 tok/s. The base `_K`
+   types (per-16 scales) and MoE `MUL_MAT_ID` remain on the dequant-to-F16 path (see
+   "coopmat1 devices (AMD / Intel)" under Performance / architecture).
 
 ### Op coverage (the big one)
 
@@ -824,19 +829,30 @@ leaving F16), and at small/medium `-ub` it is **bandwidth-bound on the F16 inter
 (removing the intermediate wins). Options, highest value first:
 
 1. **SIMT `dot4` MMQ for the per-32-element-scale families** (KS/KSS/KT/KL, plus Q6_0):
-   **now implemented for `IQ4_KS`.** `mul_mmq.comp` + `mul_mmq_funcs.comp` gained a
-   byte-addressed `IQ4_KS` tile loader: one BK=32 mmq tile maps onto one 32-element group
-   (its per-32 `dl` scale is folded exactly like the `mul_mat_vec_iq4_ks_q8_1` decode
-   kernel), `repack` decodes the 4 quantized bytes per 8-element group to packed int8 via a
-   shared byte-pair `iq4k_values` table, and the standard dp4a accumulate dots against Q8_1
-   activations. The pipeline is created on coopmat1 devices in the `integer_dot_product`
-   branch (`pipeline_dequant_mul_mat_mat_q8_1[IQ4_KS]`), so the existing MMQ-first dispatch
-   in `ggml_vk_mul_mat_q_f16` picks it up automatically. Measured on Qwen3.8-27B-IQ4_KS /
-   Vulkan1 (Strix Halo, 2600-token prompt): `-ub 512` 98 → ~188 tok/s (~1.9×),
-   `-ub 2048` 118 → ~176 tok/s (~1.5×). The win is smaller than the paper 2-4× because the
-   Strix Halo iGPU shares DDR bandwidth with the CPU, so both paths are more
-   memory-contended than the isolated-17-TFLOPS model assumed. The other per-32-scale types
-   (KSS/KT/KL/other-KS, plus Q6_0) follow the same structure and are the next increment.
+   **now implemented for all of them.** `mul_mmq.comp` + `mul_mmq_funcs.comp` gained
+   byte-addressed tile loaders for `IQ2_KS`, `IQ3_KS`, `IQ4_KS`, `IQ4_KSS`, `IQ5_KS`,
+   `IQ2_KL`, `IQ1_KT`..`IQ4_KT` and a typed `Q6_0` loader: one BK=32 mmq tile maps onto
+   one 32-element group (its per-32 `dl` scale is folded exactly like the corresponding
+   `mul_mat_vec_*_q8_1` decode kernel), `repack` decodes the group's 8 elements to two
+   packed-int8 uint32s, and the standard dp4a accumulate dots against Q8_1 activations.
+   The KT hash decode reuses `iqk_hash_values_packed` (`iqk_tables.comp`); `Q6_0` folds
+   its −32 zero point into the block-sum correction. The pipelines are created on
+   coopmat1 devices in the `integer_dot_product` branch
+   (`pipeline_dequant_mul_mat_mat_q8_1[TYPE]`), so the existing MMQ-first dispatch in
+   `ggml_vk_mul_mat_q_f16` picks them up automatically. Measured on Qwen3.8-27B /
+   Vulkan1 (Strix Halo, 2600-token prompt):
+
+   | quant | `-ub 512` | `-ub 2048` |
+   |---|---|---|
+   | IQ4_KS | 98 → ~186 tok/s (~1.9×) | 118 → ~174 tok/s (~1.5×) |
+   | IQ3_KT | ~170 tok/s | ~160 tok/s |
+   | IQ5_KS | ~161 tok/s | ~146 tok/s |
+
+   The win is smaller than the paper 2-4× because the Strix Halo iGPU shares DDR
+   bandwidth with the CPU, so both paths are more memory-contended than the isolated
+   17-TFLOPS model assumed. IQ3_KT/IQ5_KS gain less than IQ4_KS because their decodes
+   are more ALU-heavy (IQ3_KT: per-element hash + abs + sign; IQ5_KS: per-element
+   5-bit table lookup), matching the `mul_mat_vec` decode-kernel trend.
    **Caveat:** the earlier `mul_mmq.comp` IQ4_KT experiment
    measured 261 vs 489 tok/s PP and was disabled — but that was on the RTX 3090, where SIMT
    dot4 had to compete with 71-TFLOPS coopmat2 F16 tiles; against RDNA's ~17 TFLOPS f16 WMMA
@@ -860,15 +876,9 @@ leaving F16), and at small/medium `-ub` it is **bandwidth-bound on the F16 inter
    Infinity Cache while A streams once. These only help while the path is bandwidth-bound
    (roughly `-ub <= 512-1024`); at `-ub 2048` they hit the same f16 compute wall.
 
-Option 1 (`IQ4_KS`) is now measured on the Strix Halo iGPU (Vulkan1) — see the numbers
-above. Remaining work, in order:
+Option 1 is now measured on the Strix Halo iGPU (Vulkan1) for `IQ4_KS`, `IQ3_KT` and
+`IQ5_KS` — see the numbers above. Remaining work, in order:
 
-- **Other per-32-scale types** (`IQ2_KS`, `IQ3_KS`, `IQ4_KSS`, `IQ5_KS`, `IQ2_KL`,
-  `IQ1_KT`..`IQ4_KT`, plus `Q6_0`): each needs a `repack`/`get_d` in
-  `mul_mmq_funcs.comp`, an entry in `iqk_mmq_type_names`, and a `CREATE_MMQ` call in the
-  coopmat1 branch. The KT hash decode can reuse `iqk_hash_values_packed`
-  (`iqk_tables.comp`); `Q6_0` is a plain int8 decode with the −32 offset folded into the
-  block-sum correction.
 - **MoE `MUL_MAT_ID`**: the mmq covers dense `MUL_MAT` only; MoE prompt processing still
   pays dequant-to-F16 for the IQK/KT types on coopmat1 (a `matmul_id_*_q8_1` mmq variant
   is the missing piece).
@@ -1115,8 +1125,9 @@ remaining gaps are dominated by the FFN:
   matmul (`mmq`) that reads the quantized weights once. Three approaches were explored for
   adding one to Vulkan:
   * **The SIMT dot4 mmq (`mul_mmq.comp` with Q8_1 activations) is now implemented for
-    `IQ4_KT`** (the only IQK/KT type wired up so far; the other row-meta types could follow
-    the same pattern): a byte-addressed tile loader runs the hash decode with `dot4` and
+    `IQ4_KT`** (the first IQK/KT type wired up; the other per-32-scale row-meta types
+    followed in the coopmat1 path): a byte-addressed tile loader runs the hash decode with
+    `dot4` and
     packs the values as signed int8, then the standard dp4a vec-dot accumulates against
     Q8_1 activations — the same shape as CUDA's `load_tiles_iq4_kt`. Two bugs were found
     and fixed while wiring it up: the raw-weights binding must use `ggml_nbytes()` (the
