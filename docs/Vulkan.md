@@ -664,6 +664,11 @@ record PP tok/s and TG tok/s for both.
 6. Everything else: Mamba `SSM_SCAN`, the `*_R4` repacks and `IQ1_BN`/`IQ2_BN`, async
    tensor copies/events, the fence busy-wait, and the remaining training/vision ops
    (`GLU`, `RWKV_WKV6/7`, `CONV_2D_DW`, `SIN`/`COS`, ...).
+7. **coopmat1 prompt processing** (AMD / Intel): the IQK/KT mat-mat path has no native
+   quantized matmul on KHR-coopmat devices and always pays dequant-to-F16 + an f16 WMMA
+   GEMM; the Q8_1 dot4 MMQ that legacy quants already use there likely wins 2-4× for the
+   per-32-scale types (see "coopmat1 devices (AMD / Intel): what we can do for prompt
+   processing" under Performance / architecture).
 
 ### Op coverage (the big one)
 
@@ -792,6 +797,65 @@ Still not supported (their matmuls run on CPU), in priority order:
   synthetic cross-device reduce through the ggml scheduler and a mixed Vulkan0+CPU split;
   not yet validated end-to-end on a real model). `-sm attn` (MLA) still needs the
   `split_dim=2` load/get path.
+
+### coopmat1 devices (AMD / Intel): what we can do for prompt processing
+
+`VK_NV_cooperative_matrix2` is NVIDIA-only, so AMD (RADV, e.g. the Strix Halo Radeon 8060S —
+RDNA 3.5, 16×16×16 KHR coopmat) and Intel run the **coopmat1** path. There the IQK/KT
+mat-mat types have no native quantized matmul: `ggml_vk_mul_mat_q_f16` prefers an MMQ
+pipeline when `integer_dot_product` is enabled (Q8_1 activations via
+`pipeline_dequant_mul_mat_mat_q8_1`), but those pipelines only exist for
+`Q4_0/Q4_1/Q5_0/Q5_1/Q8_0` (`mul_mmq.comp`), so the IQK/KT types always pay the flat
+dequant-to-F16 round trip plus the F16 coopmat1 GEMM (BM/BN/BK = 128/128/128 "l" tiles).
+Paper analysis for one FFN matmul `[27648, 5120] x [27648, n]` on Strix Halo
+(~256 GB/s LPDDR5X, ~17 TFLOPS f16 WMMA, ~32 MB Infinity Cache):
+
+| | traffic | compute floor |
+|---|---|---|
+| dequant pass | 75 MB R + 283 MB W ≈ 1.4 ms | — |
+| F16 GEMM, n=2048 | A panel re-read once per BN=128 N-tile ≈ 4.5 GB ≈ **18 ms** (B mostly L2 hits) | ≈ **34 ms** |
+| F16 GEMM, n=512 | ≈ 2.3 GB ≈ 9 ms | ≈ 8.5 ms |
+| quantized A re-read (what an mmq would touch) | ≈ 2.4 GB ≈ 9 ms (≈ 4.5 with BN=256) | int8 dot4 ≈ 8-10 ms |
+
+I.e. at large `-ub` the current path is **compute-bound on f16 WMMA** (the only way out is
+leaving F16), and at small/medium `-ub` it is **bandwidth-bound on the F16 intermediate**
+(removing the intermediate wins). Options, highest value first:
+
+1. **SIMT `dot4` MMQ for the per-32-element-scale families** (KS/KSS/KT/KL, plus Q6_0):
+   extend `mul_mmq.comp` exactly the way `Q4_0..Q8_0` already work on these devices —
+   byte-addressed tile loader decodes to packed int8, dp4a against Q8_1 activations, with
+   the per-32 `dl * d8` scale folded like the `mul_mat_vec_*_q8_1` decode kernels already
+   do. Both traffic (≈ 2.4 vs 4.5+ GB) and compute (int8 ≈ 2× f16 WMMA) point to roughly a
+   2-4× FFN matmul win at `-ub 2048`, and all the infrastructure already exists
+   (Q8_1 activation quantize, `warptile_mmq_int`, MMQ-first dispatch in
+   `ggml_vk_mul_mat_q_f16`). **Caveat:** the earlier `mul_mmq.comp` IQ4_KT experiment
+   measured 261 vs 489 tok/s PP and was disabled — but that was on the RTX 3090, where SIMT
+   dot4 had to compete with 71-TFLOPS coopmat2 F16 tiles; against RDNA's ~17 TFLOPS f16 WMMA
+   the same kernel is the favorite. The verdict does not transfer across device classes.
+   The base `_K` types (IQ2_K..IQ6_K) have **per-16** dequant scales, which fit neither the
+   per-32 Q8_1 grouping nor a simple int8 tile without per-16 handling; they stay on the F16
+   path initially.
+2. **`coopmat<int8_t>` WMMA MMQ** — `coopmat_int_support`/`coopmat_int_{m,n,k}` are detected
+   and never used. The reverted 8×-slower experiment was again NVIDIA KHR-coopmat1 vs
+   coopmat2; on RDNA the 16×16×32 i8 WMMA is native silicon at 2× the f16 rate, and the
+   baseline it must beat is ≈ 4× weaker. The per-32 `dl` scale forces one coopmat + float
+   scale-accumulate per K=32 chunk (this is what killed it on NVIDIA), so it is a gamble —
+   worth re-running on RDNA before dismissing. Q6_0 (plain decode, exact int8 via the −32
+   offset folded into the block-sum correction) is the cleanest first target.
+3. **Shrink the F16 intermediate for small/medium `-ub`**: port the coopmat1 inline-dequant
+   A-loads of PR #2332 (ik_llama.cpp#2332 adds `mul_mm.comp` A-tile decodes for IQ4_KS/KT on
+   scalar + coopmat1; its `LOAD_VEC_A = 4`-per-trellis-group idea matches the cm2 V=4
+   decode-vector trick), or keep the two-pass structure but re-read less: larger BN (BN=256
+   halves the A re-reads; the LDS `ggml_vk_matmul_shmem_support` gate may currently forbid it
+   — RDNA has 64 KB LDS/CU) and an L2-friendly dispatch order so B stays resident in the
+   Infinity Cache while A streams once. These only help while the path is bandwidth-bound
+   (roughly `-ub <= 512-1024`); at `-ub 2048` they hit the same f16 compute wall.
+
+None of this has been measured on the actual hardware — the 3090 (coopmat2) numbers that
+motivated the current path choices do not apply to coopmat1 devices, which the doc's own
+"Testing" section lists as exercised only via the Strix Halo iGPU (and that one mainly as
+the `-sm graph` second device). The single highest-value next measurement is option 1 on
+the Strix Halo at `-ub 512` and `-ub 2048`.
 
 ### Integration
 
