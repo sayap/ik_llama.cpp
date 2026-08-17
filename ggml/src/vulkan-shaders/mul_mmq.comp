@@ -3,7 +3,10 @@
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-#ifdef DATA_A_IQ4_KS
+#if defined(DATA_A_IQ2_KS) || defined(DATA_A_IQ3_KS) || defined(DATA_A_IQ4_KS) || \
+    defined(DATA_A_IQ4_KSS) || defined(DATA_A_IQ5_KS) || defined(DATA_A_IQ2_KL) || \
+    defined(DATA_A_IQ1_KT) || defined(DATA_A_IQ2_KT) || defined(DATA_A_IQ3_KT) || \
+    defined(DATA_A_IQ4_KT)
 #extension GL_EXT_shader_8bit_storage : require
 #endif
 
@@ -25,9 +28,13 @@
 
 #include "types.comp"
 
-#ifdef DATA_A_IQ4_KS
-// The mmq tile (BK=32) maps to one IQ4_KS 32-element group, so each repack
-// covers 8 elements (two packed-int8 uint32s) like the other 4-bit quants.
+#if defined(DATA_A_IQ2_KS) || defined(DATA_A_IQ3_KS) || defined(DATA_A_IQ4_KS) || \
+    defined(DATA_A_IQ4_KSS) || defined(DATA_A_IQ5_KS) || defined(DATA_A_IQ2_KL) || \
+    defined(DATA_A_IQ1_KT) || defined(DATA_A_IQ2_KT) || defined(DATA_A_IQ3_KT) || \
+    defined(DATA_A_IQ4_KT)
+// The mmq tile (BK=32) maps to one per-32-scale IQK/KT 32-element group, so
+// each repack covers 8 elements (two packed-int8 uint32s) like the other
+// 4-bit quants.
 #undef QUANT_R
 #define QUANT_R 2
 #endif

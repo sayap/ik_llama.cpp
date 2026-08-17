@@ -2991,7 +2991,17 @@ static void ggml_vk_load_shaders(vk_device& device) {
         } \
 
         if (device->integer_dot_product) {
-            CREATE_MMQ(GGML_TYPE_IQ4_KS, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KS], matmul_iq4_ks_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ2_KS,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ2_KS],  matmul_iq2_ks_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ3_KS,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ3_KS],  matmul_iq3_ks_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ4_KS,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KS],  matmul_iq4_ks_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ4_KSS, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KSS], matmul_iq4_kss_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ5_KS,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ5_KS],  matmul_iq5_ks_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ2_KL,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ2_KL],  matmul_iq2_kl_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ1_KT,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ1_KT],  matmul_iq1_kt_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ2_KT,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ2_KT],  matmul_iq2_kt_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ3_KT,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ3_KT],  matmul_iq3_kt_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_IQ4_KT,  pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_IQ4_KT],  matmul_iq4_kt_q8_1,  mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            CREATE_MMQ(GGML_TYPE_Q6_0,    pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q6_0],    matmul_q6_0_q8_1,    mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
         }
 #undef CREATE_MMQ
 #endif
