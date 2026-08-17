@@ -109,6 +109,296 @@ ACC_TYPE mul_q8_1(int32_t q_sum, float da, vec2 dsb) {
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// Legacy K quants (Q2_K..Q6_K). A BK=32 tile maps to one 32-element group g
+// of a 256-element block; the group is sub-blocks 2g and 2g+1 for the
+// per-16-scale types (Q2_K/Q3_K/Q6_K), or the single 32-element sub-block g
+// for the per-32-scale types (Q4_K/Q5_K).
+// ---------------------------------------------------------------------------
+
+#if defined(DATA_A_Q2_K)
+// Q2_K: 16 sub-blocks of 16 2-bit values. scales[16] holds a 4-bit scale (low
+// nibble) and a 4-bit min (high nibble) per sub-block. The two-bit values are
+// packed one per byte so dotPacked4x8EXT can dot them against Q8_1; the min
+// correction is a separate dot(1, B) in the compute loop, folded through the
+// dmin*min factors returned by get_q2.
+uint q2_k_scales_byte(uint blk, uint b) {
+    const uint16_t w = data_a[blk].scales[b >> 1u];
+    return (b & 1u) != 0u ? uint(w) >> 8 : uint(w) & 0xffu;
+}
+
+uint q2_k_qs_u32(uint blk, uint byte_off) {
+    const uint16_t w0 = data_a[blk].qs[byte_off >> 1u];
+    const uint16_t w1 = data_a[blk].qs[(byte_off >> 1u) + 1u];
+    return uint(w0) | (uint(w1) << 16);
+}
+
+FLOAT_TYPE_VEC2 get_dm(uint ib) {
+    const uint blk = ib / 8u;
+    return FLOAT_TYPE_VEC2(float(data_a[blk].d.x), float(data_a[blk].d.y));
+}
+
+FLOAT_TYPE_VEC4 get_q2(uint ib) {
+    const uint blk = ib / 8u;
+    const uint g   = ib % 8u;
+
+    const float d    = float(data_a[blk].d.x);
+    const float dmin = float(data_a[blk].d.y);
+    const uint  s0   = q2_k_scales_byte(blk, 2u * g);
+    const uint  s1   = q2_k_scales_byte(blk, 2u * g + 1u);
+    return FLOAT_TYPE_VEC4(d * float(s0 & 0xFu), d * float(s1 & 0xFu),
+                           dmin * float(s0 >> 4), dmin * float(s1 >> 4));
+}
+
+i32vec2 repack(uint ib, uint iqs) {
+    const uint blk = ib / 8u;
+    const uint g   = ib % 8u;
+
+    const uint ip    = g / 4u;
+    const uint shift = (2u * g) % 8u;
+    const uint base  = 32u * ip + 4u * iqs;
+
+    const uint w0 = q2_k_qs_u32(blk, base);
+    const uint w1 = q2_k_qs_u32(blk, base + 16u);
+
+    int v0 = 0;
+    int v1 = 0;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint b0 = (w0 >> (8u * k)) & 0xffu;
+        const uint b1 = (w1 >> (8u * k)) & 0xffu;
+        v0 |= int((b0 >> shift) & 0x03u) << (8 * k);
+        v1 |= int((b1 >> shift) & 0x03u) << (8 * k);
+    }
+    return i32vec2(v0, v1);
+}
+#endif
+
+#if defined(DATA_A_Q3_K)
+// Q3_K: 16 sub-blocks of 16 3-bit values (2 low bits in qs, high bit in
+// hmask) with 6-bit scales (stored minus 32).
+uint q3_k_scales_byte(uint blk, uint b) {
+    const uint16_t w = data_a[blk].scales[b >> 1u];
+    return (b & 1u) != 0u ? uint(w) >> 8 : uint(w) & 0xffu;
+}
+
+uint q3_k_qs_byte(uint blk, uint b) {
+    const uint16_t w = data_a[blk].qs[b >> 1u];
+    return (b & 1u) != 0u ? uint(w) >> 8 : uint(w) & 0xffu;
+}
+
+uint q3_k_hmask_byte(uint blk, uint b) {
+    const uint16_t w = data_a[blk].hmask[b >> 1u];
+    return (b & 1u) != 0u ? uint(w) >> 8 : uint(w) & 0xffu;
+}
+
+uint q3_k_scale(uint blk, uint is) {
+    if (is < 4u) {
+        return (q3_k_scales_byte(blk, is) & 0xFu) | ((q3_k_scales_byte(blk, is + 8u) & 3u) << 4);
+    } else if (is < 8u) {
+        return (q3_k_scales_byte(blk, is) & 0xFu) | (((q3_k_scales_byte(blk, is + 4u) >> 2u) & 3u) << 4);
+    } else if (is < 12u) {
+        return (q3_k_scales_byte(blk, is - 8u) >> 4u) | (((q3_k_scales_byte(blk, is) >> 4u) & 3u) << 4);
+    } else {
+        return (q3_k_scales_byte(blk, is - 8u) >> 4u) | (((q3_k_scales_byte(blk, is - 4u) >> 6u) & 3u) << 4);
+    }
+}
+
+FLOAT_TYPE_VEC2 get_dm(uint ib) {
+    const uint blk = ib / 8u;
+    const uint g   = ib % 8u;
+
+    const float d = float(data_a[blk].d);
+    const uint us0 = q3_k_scale(blk, 2u * g);
+    const uint us1 = q3_k_scale(blk, 2u * g + 1u);
+    return FLOAT_TYPE_VEC2(d * (float(us0) - 32.0f), d * (float(us1) - 32.0f));
+}
+
+i32vec2 repack(uint ib, uint iqs) {
+    const uint blk = ib / 8u;
+    const uint g   = ib % 8u;
+
+    const uint ip     = g / 4u;
+    const uint j      = g % 4u;
+    const uint shift  = 2u * j;
+    const uint hm_bit = 1u << g;
+
+    int v0 = 0;
+    int v1 = 0;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint qs0 = q3_k_qs_byte(blk, 32u * ip + 4u * iqs + k);
+        const uint hm0 = q3_k_hmask_byte(blk, 4u * iqs + k);
+        const int q0 = int((qs0 >> shift) & 0x03u) - (((hm0 & hm_bit) != 0u) ? 0 : 4);
+        v0 |= (q0 & 0xff) << (8 * k);
+
+        const uint qs1 = q3_k_qs_byte(blk, 32u * ip + 16u + 4u * iqs + k);
+        const uint hm1 = q3_k_hmask_byte(blk, 16u + 4u * iqs + k);
+        const int q1 = int((qs1 >> shift) & 0x03u) - (((hm1 & hm_bit) != 0u) ? 0 : 4);
+        v1 |= (q1 & 0xff) << (8 * k);
+    }
+    return i32vec2(v0, v1);
+}
+#endif
+
+#if defined(DATA_A_Q4_K) || defined(DATA_A_Q5_K)
+// Q4_K and Q5_K share the same 6-bit per-32 scale/min packing (scales[12]).
+uint q45_k_scales_byte(uint blk, uint b) {
+    const uint16_t w = data_a[blk].scales[b >> 1u];
+    return (b & 1u) != 0u ? uint(w) >> 8 : uint(w) & 0xffu;
+}
+
+void q45_k_scale_min(uint blk, uint g, out uint sc, out uint mb) {
+    if (g < 4u) {
+        sc = q45_k_scales_byte(blk, g) & 0x3Fu;
+        mb = q45_k_scales_byte(blk, g + 4u) & 0x3Fu;
+    } else {
+        sc = (q45_k_scales_byte(blk, g + 4u) & 0xFu) | ((q45_k_scales_byte(blk, g - 4u) >> 6u) << 4u);
+        mb = (q45_k_scales_byte(blk, g + 4u) >> 4u) | ((q45_k_scales_byte(blk, g) >> 6u) << 4u);
+    }
+}
+#endif
+
+#if defined(DATA_A_Q4_K)
+FLOAT_TYPE_VEC2 get_dm(uint ib) {
+    const uint blk = ib / 8u;
+    const uint g   = ib % 8u;
+
+    const float d    = float(data_a[blk].d.x);
+    const float dmin = float(data_a[blk].d.y);
+    uint sc, mb;
+    q45_k_scale_min(blk, g, sc, mb);
+    return FLOAT_TYPE_VEC2(d * float(sc), dmin * float(mb));
+}
+
+i32vec2 repack(uint ib, uint iqs) {
+    const uint blk = ib / 8u;
+    const uint g   = ib % 8u;
+
+    // Q4_K packs two sub-blocks per byte: the low nibble is sub-block 2*(g/2)
+    // and the high nibble is sub-block 2*(g/2)+1.
+    const bool hi_nib = (g & 1u) != 0u;
+    const uint qb0 = 32u * (g / 2u) + 4u * iqs;
+
+    const uint16_t qw00 = data_a[blk].qs[qb0 >> 1u];
+    const uint16_t qw01 = data_a[blk].qs[(qb0 >> 1u) + 1u];
+    const uint16_t qw10 = data_a[blk].qs[(qb0 + 16u) >> 1u];
+    const uint16_t qw11 = data_a[blk].qs[((qb0 + 16u) >> 1u) + 1u];
+    const uint qbytes0 = uint(qw00) | (uint(qw01) << 16);
+    const uint qbytes1 = uint(qw10) | (uint(qw11) << 16);
+
+    int v0 = 0;
+    int v1 = 0;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint q0 = (qbytes0 >> (8u * k)) & 0xffu;
+        const uint q1 = (qbytes1 >> (8u * k)) & 0xffu;
+        v0 |= int(hi_nib ? (q0 >> 4) : (q0 & 0xFu)) << (8 * k);
+        v1 |= int(hi_nib ? (q1 >> 4) : (q1 & 0xFu)) << (8 * k);
+    }
+    return i32vec2(v0, v1);
+}
+#endif
+
+#if defined(DATA_A_Q5_K)
+FLOAT_TYPE_VEC2 get_dm(uint ib) {
+    const uint blk = ib / 8u;
+    const uint g   = ib % 8u;
+
+    const float d    = float(data_a[blk].d.x);
+    const float dmin = float(data_a[blk].d.y);
+    uint sc, mb;
+    q45_k_scale_min(blk, g, sc, mb);
+    return FLOAT_TYPE_VEC2(d * float(sc), dmin * float(mb));
+}
+
+i32vec2 repack(uint ib, uint iqs) {
+    const uint blk = ib / 8u;
+    const uint g   = ib % 8u;
+
+    const bool hi_nib = (g & 1u) != 0u;
+    const uint qb0 = 32u * (g / 2u) + 4u * iqs;
+    const uint hb0 = 4u * iqs;
+
+    const uint16_t qw00 = data_a[blk].qs[qb0 >> 1u];
+    const uint16_t qw01 = data_a[blk].qs[(qb0 >> 1u) + 1u];
+    const uint16_t qw10 = data_a[blk].qs[(qb0 + 16u) >> 1u];
+    const uint16_t qw11 = data_a[blk].qs[((qb0 + 16u) >> 1u) + 1u];
+    const uint qbytes0 = uint(qw00) | (uint(qw01) << 16);
+    const uint qbytes1 = uint(qw10) | (uint(qw11) << 16);
+
+    const uint16_t hw00 = data_a[blk].qh[hb0 >> 1u];
+    const uint16_t hw01 = data_a[blk].qh[(hb0 >> 1u) + 1u];
+    const uint16_t hw10 = data_a[blk].qh[(hb0 + 16u) >> 1u];
+    const uint16_t hw11 = data_a[blk].qh[((hb0 + 16u) >> 1u) + 1u];
+    const uint hbytes0 = uint(hw00) | (uint(hw01) << 16);
+    const uint hbytes1 = uint(hw10) | (uint(hw11) << 16);
+
+    int v0 = 0;
+    int v1 = 0;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint q0 = (qbytes0 >> (8u * k)) & 0xffu;
+        const uint q1 = (qbytes1 >> (8u * k)) & 0xffu;
+        const uint h0 = (hbytes0 >> (8u * k)) & 0xffu;
+        const uint h1 = (hbytes1 >> (8u * k)) & 0xffu;
+        const uint nib0 = hi_nib ? (q0 >> 4) : (q0 & 0xFu);
+        const uint nib1 = hi_nib ? (q1 >> 4) : (q1 & 0xFu);
+        v0 |= int((nib0 + 16u * ((h0 >> g) & 1u)) & 0xffu) << (8 * k);
+        v1 |= int((nib1 + 16u * ((h1 >> g) & 1u)) & 0xffu) << (8 * k);
+    }
+    return i32vec2(v0, v1);
+}
+#endif
+
+#if defined(DATA_A_Q6_K)
+// Q6_K: 16 sub-blocks of 16 6-bit values (4 low bits in ql, 2 high bits in
+// qh) with per-16 int8 scales. The 6-bit value is stored minus 32.
+uint q6_k_ql_byte(uint blk, uint b) {
+    const uint16_t w = data_a[blk].ql[b >> 1u];
+    return (b & 1u) != 0u ? uint(w) >> 8 : uint(w) & 0xffu;
+}
+
+uint q6_k_qh_byte(uint blk, uint b) {
+    const uint16_t w = data_a[blk].qh[b >> 1u];
+    return (b & 1u) != 0u ? uint(w) >> 8 : uint(w) & 0xffu;
+}
+
+FLOAT_TYPE_VEC2 get_dm(uint ib) {
+    const uint blk = ib / 8u;
+    const uint g   = ib % 8u;
+
+    const float d = float(data_a[blk].d);
+    const int s0 = int(data_a[blk].scales[2u * g]);
+    const int s1 = int(data_a[blk].scales[2u * g + 1u]);
+    return FLOAT_TYPE_VEC2(d * float(s0), d * float(s1));
+}
+
+i32vec2 repack(uint ib, uint iqs) {
+    const uint blk = ib / 8u;
+    const uint g   = ib % 8u;
+
+    const uint ip       = g / 4u;
+    const uint off      = g % 4u;
+    const uint shift    = 2u * off;
+    const bool hi_nib   = off >= 2u;
+    const uint ql_extra = (off & 1u) != 0u ? 32u : 0u;
+
+    int v0 = 0;
+    int v1 = 0;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        const uint ql0 = q6_k_ql_byte(blk, 64u * ip + 4u * iqs + ql_extra + k);
+        const uint qh0 = q6_k_qh_byte(blk, 32u * ip + 4u * iqs + k);
+        const uint nib0 = hi_nib ? (ql0 >> 4) : (ql0 & 0xFu);
+        const uint q0 = nib0 | (((qh0 >> shift) & 3u) << 4);
+        v0 |= ((int(q0) - 32) & 0xff) << (8 * k);
+
+        const uint ql1 = q6_k_ql_byte(blk, 64u * ip + 16u + 4u * iqs + ql_extra + k);
+        const uint qh1 = q6_k_qh_byte(blk, 32u * ip + 16u + 4u * iqs + k);
+        const uint nib1 = hi_nib ? (ql1 >> 4) : (ql1 & 0xFu);
+        const uint q1 = nib1 | (((qh1 >> shift) & 3u) << 4);
+        v1 |= ((int(q1) - 32) & 0xff) << (8 * k);
+    }
+    return i32vec2(v0, v1);
+}
+#endif
+
 #if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q6_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 FLOAT_TYPE get_d(uint ib) {
     return FLOAT_TYPE(data_a[ib].d);

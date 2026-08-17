@@ -99,6 +99,12 @@ static double test_tolerance(ggml_type type_a) {
     }
 }
 
+static bool is_legacy_k_type(ggml_type type_a) {
+    return type_a == GGML_TYPE_Q2_K || type_a == GGML_TYPE_Q3_K ||
+           type_a == GGML_TYPE_Q4_K || type_a == GGML_TYPE_Q5_K ||
+           type_a == GGML_TYPE_Q6_K;
+}
+
 static void check_mul_mat(ggml_backend_t backend_tgt, ggml_type type_a,
         int64_t k, int64_t m, int64_t n_tokens) {
     char name[256];
@@ -337,6 +343,7 @@ int main(int argc, char ** argv) {
     printf("target backend: %s\n", ggml_backend_name(backend_tgt));
 
     const ggml_type types[] = {
+        GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
         GGML_TYPE_Q6_0,
         GGML_TYPE_MXFP4,
         GGML_TYPE_IQ2_K, GGML_TYPE_IQ3_K, GGML_TYPE_IQ4_K, GGML_TYPE_IQ5_K, GGML_TYPE_IQ6_K,
@@ -364,9 +371,13 @@ int main(int argc, char ** argv) {
         check_mul_mat_id(backend_tgt, type_a, 4, 2, 256, 256, 8);
         check_mul_mat_id(backend_tgt, type_a, 4, 2, 256, 1024, 8);
 
-        // GET_ROWS (quantized token embeddings): row lookup by id
-        check_get_rows(backend_tgt, type_a, 256, 512, 17);
-        check_get_rows(backend_tgt, type_a, 4096, 128, 5);
+        // GET_ROWS (quantized token embeddings): row lookup by id. The legacy
+        // K quants do not have a Vulkan GET_ROWS pipeline yet, so they are
+        // only exercised for MUL_MAT / MUL_MAT_ID here.
+        if (!is_legacy_k_type(type_a)) {
+            check_get_rows(backend_tgt, type_a, 256, 512, 17);
+            check_get_rows(backend_tgt, type_a, 4096, 128, 5);
+        }
     }
 
     // DSV4 FFN shapes (large M): the MXFP4 cm2 matmul tiles M in BM-sized
