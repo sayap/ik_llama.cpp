@@ -758,9 +758,11 @@ Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3
 IQ4_NL` plus the full **IQK/K-family** (`IQ2_K, IQ3_K, IQ4_K, IQ5_K, IQ6_K, IQ2_KS, IQ3_KS,
 IQ4_KS, IQ4_KSS, IQ5_KS, IQ2_KL`) and **KT-family** (`IQ1_KT, IQ2_KT, IQ3_KT, IQ4_KT`). The
 decode path uses
-native per-type `mul_mat_vec` kernels; prompt processing uses the flat dequant-to-F16 +
-tensor-core matmul (the cm2 per-element inline dequant, scalar or V=4, turned out slower and
-is no longer used for these types).
+native per-type `mul_mat_vec` kernels; prompt processing on coopmat1/scalar devices
+now uses byte-addressed inline-dequant A-tile decoders in `mul_mm.comp` (one per type,
+feeding the coopmat F16-WMMA tiles like the legacy K quants); on coopmat2 devices it
+uses the flat dequant-to-F16 + tensor-core matmul (the cm2 per-element inline dequant,
+scalar or V=4, turned out slower and is no longer used for these types).
 
 Still not supported (their matmuls run on CPU), in priority order:
 
@@ -907,10 +909,10 @@ artifact — the iGPU sits at ~100% busy during the runs):
 
 ¹ after the follow-up MXFP4 coopmat1 inline-dequant port (see "coopmat1 devices");
 the original round measured the flat dequant-to-F16 fallback.
-² after the follow-up IQK/KT coopmat1 inline-dequant A-tile port (IQ4_KS, IQ4_K,
-IQ3_K, IQ3_KT — same note); the original round measured the fallback. The
-remaining IQK/KT types (IQ2_K, IQ5_K, IQ6_K, the other KS/KSS/KL/KT variants)
-are still on the fallback.
+² after the follow-up IQK/KT coopmat1 inline-dequant A-tile port — this now
+covers all 15 IQK/KT types (the IQ4_KS/IQ4_K/IQ3_K/IQ3_KT rows above, plus
+IQ2_K/IQ5_K/IQ6_K/IQ2_KS/IQ3_KS/IQ4_KSS/IQ5_KS/IQ2_KL/IQ1_KT/IQ2_KT/IQ4_KT);
+the original round measured the flat dequant-to-F16 fallback.
 
 Takeaways:
 
@@ -928,7 +930,8 @@ Takeaways:
   `DATA_A_*` inline-dequant A-tile decoders now exist in `mul_mm.comp` for MXFP4 and
   IQ4_KS/IQ4_K/IQ3_K/IQ3_KT (see the ¹/² rows above), lifting those types to ~302-383
   tok/s pp1024, at the legacy-K-quant / mainline level and well above the mmq-era
-  numbers. The remaining IQK/KT types are the follow-up.
+  numbers. The remaining IQK/KT types have since been added the same way
+  (see the ² footnote).
 - TG is unaffected by the prompt-path work (decode uses the per-type `mul_mat_vec`
   Q8_1 kernels); IQ3_K trails IQ4_K/IQ3_KT as before (110-byte 2-byte-aligned blocks,
   unaligned uint32 loader).
