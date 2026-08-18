@@ -757,6 +757,28 @@ void main() {
             const uint k_pair = loadr_a;
             store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(kvalues_iq4nl[vui & 0xF] * d, kvalues_iq4nl[bitfieldExtract(vui, 8, 4)] * d));
             store_a(loadc_a + l, k_pair + 8, FLOAT_TYPE_VEC2(kvalues_iq4nl[bitfieldExtract(vui, 4, 4)] * d, kvalues_iq4nl[vui >> 12] * d));
+#elif defined(DATA_A_MXFP4)
+            const uint idx = pos_a + (loadc_a + l) * p.stride_a / LOAD_VEC_A + loadr_a;
+
+            // One 17-byte block (1 E8M0 byte + 16 nibble bytes) per BK=32 tile.
+            // A LOAD_VEC_A=4 granule is 2 bytes: their lo nibbles are elements
+            // (2s, 2s+1) and their hi nibbles are (2s+16, 2s+17) of the block
+            // (the Q4_0 nibble layout), stored 8 vec2-pairs apart.
+            const uint ib = idx / 8;
+            const uint iqs = (idx & 0x07) * 2;
+
+            const uint vui  = uint(data_a[ib].qs[iqs]);
+            const uint vui2 = uint(data_a[ib].qs[iqs + 1]);
+
+            // E8M0 scale halved to match the doubled e2m1 value table
+            // (kvalues_mxfp4; see ggml_e8m0_to_fp32_half): 2^(e-128) for
+            // e >= 2, 2^-126 for e == 0 and 2^-125 for e == 1.
+            const uint e = uint(data_a[ib].e);
+            const float d = uintBitsToFloat(e >= 2u ? ((e - 1u) << 23u) : (e == 0u ? 0x00200000u : 0x00400000u));
+
+            const uint k_pair = loadr_a;
+            store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(kvalues_mxfp4[vui  & 0xF] * d, kvalues_mxfp4[vui2 & 0xF] * d));
+            store_a(loadc_a + l, k_pair + 8, FLOAT_TYPE_VEC2(kvalues_mxfp4[vui  >>  4] * d, kvalues_mxfp4[vui2 >>  4] * d));
 #endif
         }
         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
