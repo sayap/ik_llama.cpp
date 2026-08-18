@@ -694,11 +694,22 @@ record PP tok/s and TG tok/s for both.
    `LOAD_VEC_B=16`), mainline's Q5_K/Q6_K byte-packed decoders, and
    x4/subgroup `quantize_q8_1` variants. On Vulkan1 / Qwen3.8-27B-Q4_K_L
    (`-ub 512` pp1024) this lifts the mmq from ~206 to ~244-249 tok/s, now
-   beating the coopmat1 F16-WMMA inline-dequant path (~238). It is still short
-   of mainline's number (~356 tok/s measured with `../llama.cpp/build-dl` on
-   the same box; the docs' earlier ~363): the shader, B staging and quantize
-   now mirror mainline, so the residual gap is ik-specific prompt-path
-   overhead outside `mul_mmq`, not the mmq kernel structure.
+   beating the coopmat1 F16-WMMA inline-dequant path (~238). **Follow-up:
+   mainline does not use the SIMT mmq on coopmat1 devices at all.** On RADV,
+   mainline's `CREATE_MMQ` lives in the `fp16` (non-coopmat) branch, so the
+   prompt path runs the coopmat F16-WMMA inline-dequant matmul
+   (`mul_mm.comp` + `mul_mm_funcs`, `pipeline_dequant_mul_mat_mat[*]`), which
+   reaches ~22 TFLOPS (4.1 ms for the q4_K FFN gate matmul) vs ~17 TF for the
+   SIMT dot4 mmq. The parity fix therefore moved the ik mmq out of the
+   coopmat branch (back to the `fp16` branch, matching mainline), re-enabled
+   the `l` (128x128) tile on AMD RADV (it had been stale-disabled since
+   before mainline's coopmat1 support), and ported mainline's AMD/RADV chip
+   tuning (`l_warptile_mmq = {256,128,128,32,sg8,64,2,tm_m,tn_m,tk_m,sg8}`).
+   Warm end-to-end pp1024 goes ~225 -> ~289 tok/s (mainline ~336-342 with the
+   same server harness); the residual gap is the older ik `mul_mm.comp`
+   coopmat shmem layout (scalar `FLOAT_TYPE` with `BK+8` stride vs mainline's
+   `f16vec2` with `BK/2+4` padding) plus the documented prompt-path CPU
+   overhead, not the mmq kernel.
    MoE `MUL_MAT_ID` remains on the dequant-to-F16 path (see "coopmat1 devices
    (AMD / Intel)" under Performance / architecture).
 
@@ -853,6 +864,19 @@ I.e. at large `-ub` the current path is **compute-bound on f16 WMMA** (the only 
 leaving F16), and at small/medium `-ub` it is **bandwidth-bound on the F16 intermediate**
 (removing the intermediate wins). Options, highest value first:
 
+**Correction (what mainline actually does).** Mainline's `CREATE_MMQ` (the SIMT dot4
+`mul_mmq.comp` pipelines) sits in the `fp16` / non-coopmat branch only, so on RADV the
+prompt path **never uses the SIMT mmq** — it uses the coopmat F16-WMMA inline-dequant
+matmul (`mul_mm.comp` + `mul_mm_funcs`, `pipeline_dequant_mul_mat_mat[*]`) with the AMD
+chip-tuned `l_warptile_mmq = {256,128,128,32,sg8,64,2,tm_m,tn_m,tk_m,sg8}` tile. That
+path reaches ~22 TFLOPS on the Strix Halo (4.1 ms for the q4_K FFN gate matmul), beating
+the SIMT dot4 mmq's ~17 TF (5.4 ms) and the old scalar-shmem WMMA path. Matching
+mainline — moving the ik mmq out of the coopmat branch and porting the AMD tile + the
+`mul_mat_l` re-enable — lifts warm pp1024 from ~225 to ~289 tok/s. The option-1/option-2
+analysis below is retained for historical context; option 1 (SIMT dot4) is now measured
+to be *slower* than the coopmat F16 WMMA path on RDNA3.5, so it is kept only for the
+non-coopmat `fp16` devices where mainline also uses it.
+
 1. **SIMT `dot4` MMQ for the IQK/KT families (per-32 and per-16 scales)** (KS/KSS/KT/KL,
    the base `_K` types, plus Q6_0): **now implemented for all of them.**
    `mul_mmq.comp` + `mul_mmq_funcs.comp` gained byte-addressed tile loaders for
@@ -907,8 +931,14 @@ leaving F16), and at small/medium `-ub` it is **bandwidth-bound on the F16 inter
    (roughly `-ub <= 512-1024`); at `-ub 2048` they hit the same f16 compute wall.
 
 Option 1 is now measured on the Strix Halo iGPU (Vulkan1) for `IQ4_KS`, `IQ3_KT` and
-`IQ5_KS` — see the numbers above. Remaining work, in order:
+`IQ5_KS` — see the numbers above. **But it loses to mainline's coopmat F16-WMMA path**
+(~22 vs ~17 TF), so the ik mmq has been moved out of the coopmat branch (matching
+mainline; it now lives in the `fp16` branch). Remaining work, in order:
 
+- **Port mainline's modern `mul_mm.comp` coopmat shmem layout**: the remaining ~14% PP
+  gap to mainline is the older ik coopmat path (scalar `FLOAT_TYPE` shmem with
+  `BK+8` stride, vs mainline's `f16vec2` with `BK/2+4` padding and its
+  `dot_product_funcs` B conversion). Warm pp1024 is ~289 tok/s vs mainline ~336-342.
 - **MoE `MUL_MAT_ID`**: the mmq covers dense `MUL_MAT` only; MoE prompt processing still
   pays dequant-to-F16 for the IQK/KT types on coopmat1 (a `matmul_id_*_q8_1` mmq variant
   is the missing piece).
