@@ -1103,9 +1103,18 @@ mainline; it now lives in the `fp16` branch). Remaining work, in order:
   decode was missing), and `ggml_vk_get_mul_mat_mat_id_pipeline` now treats an empty
   pipeline as a fallback to dequant-to-F16, so `Q6_0`/`MXFP4` MoE prompt processing
   dequantizes like the dense path.
-- Still open: base-`_K` (`IQ4_K`/`IQ5_K`/`IQ6_K`) `FUSED_UP_GATE` cases return wrong
-  results on Vulkan1 (`test-fused-up-gate`; `IQ2_K`/`IQ3_K` pass). Unrelated to the
-  mmq work.
+- ~~Still open: base-`_K` (`IQ4_K`/`IQ5_K`/`IQ6_K`) `FUSED_UP_GATE` cases return wrong
+  results on Vulkan1 (`test-fused-up-gate`; `IQ2_K`/`IQ3_K` pass).~~ **Not a Vulkan
+  bug**: bisecting with a plain-`MUL_MAT` harness at the test's shapes showed the Vulkan
+  results match the format's scalar dequant (max abs diff ~0.02-0.06, i.e. normal
+  F16/F32 accumulation error) while the **CPU backend's optimized `iqk_mul_mat`
+  kernels diverge from their own `to_float`** for these three types (~0.7-2.1 abs at
+  k=256..1024) — the documented CPU scale-convention caveat, which the test's
+  `test_cpu_reference_ok` whitelist wrongly claimed did not apply to them. The three
+  types were removed from that whitelist (they are still fully exercised by the
+  fused-vs-non-fused bit-identity check and by `test-iqk-quants` against the scalar
+  dequant); `test-fused-up-gate` now passes on `Vulkan0`, `Vulkan1` and `CPU` (the
+  `CUDA0` run crashes in `ggml_cuda_moe_up_gate_unary` — pre-existing, unrelated).
 
 ### Integration
 
