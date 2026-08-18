@@ -14,6 +14,7 @@
 layout (push_constant) uniform parameter
 {
     uint ne;
+    uint num_blocks;
 } p;
 
 #include "types.comp"
@@ -32,8 +33,7 @@ layout (binding = 1) writeonly buffer D {block_q8_1_packed32 data_b[];};
 shared float shmem[GROUP_SIZE];
 #endif
 
-void quantize() {
-    const uint wgid = gl_WorkGroupID.x;
+void quantize(const uint wgid) {
     const uint tid = INVOCATION_ID;
 
     // Each thread handles a vec4, so 8 threads handle a block
@@ -43,10 +43,6 @@ void quantize() {
 
     const uint ib = wgid * blocks_per_group + block_in_wg;
     const uint iqs = tid % 8;
-
-    if (ib >= gl_NumWorkGroups.x * blocks_per_group) {
-        return;
-    }
 
 #ifdef QBLOCK_X4
     const uint ibx4_outer = ib / 4;
@@ -60,14 +56,13 @@ void quantize() {
 
     const uint a_idx = ib * 8 + iqs;
 
-    vec4 vals = a_idx < p.ne ? data_a[a_idx] : vec4(0.0f);
+    vec4 vals = a_idx < p.ne / 4 ? data_a[a_idx] : vec4(0.0f);
     const vec4 abs_vals = abs(vals);
 
-#ifdef USE_SUBGROUPS
-    const float amax = subgroupClusteredMax(max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w)), 8);
-#else
     // Find absolute max for each block
-    shmem[tid] = max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w));
+    const float thread_max = max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w));
+#ifndef USE_SUBGROUPS
+    shmem[tid] = thread_max;
     barrier();
     [[unroll]] for (uint s = 4; s > 0; s >>= 1) {
         if (iqs < s) {
@@ -77,23 +72,28 @@ void quantize() {
     }
 
     const float amax = shmem[block_in_wg * 8];
+#else
+    const float amax = subgroupClusteredMax(thread_max, 8);
 #endif
 
     const float d = amax / 127.0;
     const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
     vals = round(vals * d_inv);
+
 #ifdef QBLOCK_X4
     data_b[ibx4_outer].qs[ibx4_inner * 8 + iqs] = pack32(i8vec4(round(vals)));
 #else
     data_b[ib].qs[iqs] = pack32(i8vec4(round(vals)));
 #endif
 
-#ifdef USE_SUBGROUPS
-    const float sum = subgroupClusteredAdd(vals.x + vals.y + vals.z + vals.w, 8);
-#else
-    // Calculate the sum for each block
+#ifndef USE_SUBGROUPS
     barrier();
-    shmem[tid] = vals.x + vals.y + vals.z + vals.w;
+#endif
+
+    // Calculate the sum for each block
+    const float thread_sum = vals.x + vals.y + vals.z + vals.w;
+#ifndef USE_SUBGROUPS
+    shmem[tid] = thread_sum;
     barrier();
     [[unroll]] for (uint s = 4; s > 0; s >>= 1) {
         if (iqs < s) {
@@ -101,10 +101,14 @@ void quantize() {
         }
         barrier();
     }
-    const float sum = shmem[tid];
+#else
+    const float sum = subgroupClusteredAdd(thread_sum, 8);
+#endif
+    if (iqs == 0) {
+#ifndef USE_SUBGROUPS
+        const float sum = shmem[tid];
 #endif
 
-    if (iqs == 0) {
 #ifdef QBLOCK_X4
         data_b[ibx4_outer].ds[ibx4_inner] = f16vec2(vec2(d, sum * d));
 #else
@@ -114,5 +118,9 @@ void quantize() {
 }
 
 void main() {
-    quantize();
+    uint wgid = gl_WorkGroupID.x;
+    while (wgid < p.num_blocks) {
+        quantize(wgid);
+        wgid += gl_NumWorkGroups.x;
+    }
 }
