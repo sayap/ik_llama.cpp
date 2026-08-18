@@ -553,6 +553,42 @@ stay on the same backend as the view source.
   `ggml_vk_op_f32` turns any future cross-backend miss into a clear error instead of
   a segfault.
 
+### 17. MTP / multi-context device sharing
+
+Enabling MTP (`--spec-type mtp:n_max=...,p_min=...`) makes `common_speculative_init`
+create a **second `llama_context`** (the MTP/draft context) from the *same* model on the
+same Vulkan device as the target context. The backend assumed one backend context per
+device and stored a single back-pointer:
+
+- `vk_device_struct::backend_ctx` was a single `ggml_backend_vk_context *`,
+  overwritten by every `ggml_vk_init()`. With MTP, it ended up pointing at the MTP
+  context (initialized last), not the target context.
+- `graph_compute` submits fenceless and returns with `submit_pending = true`; host
+  reads (`ggml_vk_buffer_read` → `ggml_vk_device_flush_pending_compute`) drain pending
+  compute before touching a device buffer. Because that drain used
+  `device->backend_ctx`, it flushed the MTP context (no pending work) instead of the
+  target context, so the target's in-flight compute was read too early and the sampled
+  logits / hidden states were stale. Result: immediate gibberish on the very first
+  generated token, only on Vulkan (CPU MTP was correct).
+
+The fix tracks **all** live contexts per device:
+
+- `backend_ctx` is now `std::vector<ggml_backend_vk_context *> backend_ctxs`;
+  `ggml_vk_init` appends the context and `ggml_backend_vk_free` erases it.
+- `ggml_vk_device_flush_pending_compute` flushes every context on the device.
+- The reduce path (`ggml_vk_reduce_read_wait` / `ggml_vk_reduce_write_back` /
+  `ggml_vk_reduce_finish` and the CUDA/P2P reduce flush sites) sets/clears
+  `submit_pending` on all contexts via `ggml_vk_set_device_submit_pending`.
+
+Validated on Qwen3.8-27B IQ4_KS with `-dev Vulkan1`: baseline and
+`--spec-type mtp:n_max=1,p_min=0.0` now match CPU, and the original
+`n_max=4,p_min=0.4` repro no longer emits the `...aterater...` garbage.
+
+**Remaining gap**: with `n_max > 1` the output is still not byte-identical to CPU after
+the first accepted token. That traces to the recurrent per-step checkpoint restore
+(`llama_kv_cache::per_step_restore`) when a second context is present on the same
+device, not to the `backend_ctx` bug above; it still needs investigation.
+
 ## Benchmarks (RTX 3090, Vulkan0)
 
 Qwen2.5-Coder-0.5B-Instruct-Q8_0 (dense, `-c 2048`, single token batch):

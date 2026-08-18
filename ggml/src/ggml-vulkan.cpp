@@ -430,9 +430,11 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
 struct vk_device_struct {
     std::recursive_mutex mutex;
 
-    // Back-pointer to the backend context that owns this device (one per device), used
-    // by cross-device operations to flush another device's pending compute.
-    ggml_backend_vk_context * backend_ctx {};
+    // Back-pointers to the backend contexts that own this device. A device can host
+    // several contexts (e.g. a target context and an MTP/draft context built from the
+    // same model), so pending compute must be flushed for every live context, not just
+    // the most recently initialized one.
+    std::vector<ggml_backend_vk_context *> backend_ctxs;
 
     vk::PhysicalDevice physical_device;
     vk::PhysicalDeviceProperties properties;
@@ -1417,6 +1419,19 @@ struct ggml_backend_vk_context {
     int num_additional_fused_ops {};
 };
 
+// Mark every context on a device as having (or not having) in-flight compute work.
+// A single compute queue serves all contexts on a device, so a host/transfer operation
+// that needs the queue drained must clear the flag on all of them, not just the context
+// that happens to be remembered by the device.
+static void ggml_vk_set_device_submit_pending(vk_device& device, bool pending) {
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    for (ggml_backend_vk_context * ctx : device->backend_ctxs) {
+        if (ctx != nullptr) {
+            ctx->submit_pending = pending;
+        }
+    }
+}
+
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
 
 static uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
@@ -1548,8 +1563,11 @@ static void ggml_vk_flush_pending_reduces();
 // buffers. graph_compute defers its drain, so a transfer that reads or overwrites a
 // device buffer must first ensure the compute queue has finished with it.
 static void ggml_vk_device_flush_pending_compute(vk_device& device) {
-    if (device->backend_ctx) {
-        ggml_vk_flush_pending_compute(device->backend_ctx);
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    for (ggml_backend_vk_context * ctx : device->backend_ctxs) {
+        if (ctx != nullptr) {
+            ggml_vk_flush_pending_compute(ctx);
+        }
     }
 }
 
@@ -5082,7 +5100,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->name = GGML_VK_NAME + std::to_string(idx);
 
     ctx->device = ggml_vk_get_device(idx);
-    ctx->device->backend_ctx = ctx;
+    ctx->device->backend_ctxs.push_back(ctx);
 
     ctx->semaphore_idx = 0;
     ctx->event_idx = 0;
@@ -11600,9 +11618,7 @@ static void * ggml_vk_reduce_read_wait(vk_reduce_read& rd) {
     rd.dev->device.resetFences({ rd.dev->fence });
 
     // Everything previously submitted to this device has now completed.
-    if (rd.dev->backend_ctx) {
-        rd.dev->backend_ctx->submit_pending = false;
-    }
+    ggml_vk_set_device_submit_pending(rd.dev, false);
 
     return rd.mapped;
 }
@@ -11631,9 +11647,7 @@ static void ggml_vk_reduce_write_back(vk_device& dev, vk_buffer dst, uint64_t of
     ggml_vk_ctx_end(subctx);
 
     ggml_vk_submit(subctx, vk::Fence{});
-    if (dev->backend_ctx) {
-        dev->backend_ctx->submit_pending = true;
-    }
+    ggml_vk_set_device_submit_pending(dev, true);
 }
 
 // Lazy reduce bookkeeping: a REDUCE split only stashes the exchange parameters and
@@ -11676,9 +11690,7 @@ static void ggml_vk_reduce_finish(vk_pending_reduce& pr, std::vector<uint8_t>& s
         vk_reduce_read& rd = pr.reads[i];
         rd.dev->device.waitForFences({ rd.dev->fence }, true, UINT64_MAX);
         rd.dev->device.resetFences({ rd.dev->fence });
-        if (rd.dev->backend_ctx) {
-            rd.dev->backend_ctx->submit_pending = false;
-        }
+        ggml_vk_set_device_submit_pending(rd.dev, false);
     }
 
     // Sum the partials on the CPU.
@@ -11913,7 +11925,7 @@ static void ggml_vk_op_reduce_impl(ggml_backend_vk_context * ctx, ggml_tensor * 
 
             if (local_ctx && remote_ctx && local_base && remote_base && staging_base) {
                 ggml_vk_flush_pending_compute(ctx);
-                ggml_vk_flush_pending_compute(remote_dev->backend_ctx);
+                ggml_vk_device_flush_pending_compute(remote_dev);
 
                 g_cuda.cuCtxSetCurrent(local_ctx);
                 CUresult r = g_cuda.cuMemcpyPeer(staging_base, local_ctx, remote_base + remote_off, remote_ctx, nbytes);
@@ -11966,7 +11978,7 @@ static void ggml_vk_op_reduce_impl(ggml_backend_vk_context * ctx, ggml_tensor * 
 
                 // Flush the deferred compute on both devices before moving the partials.
                 ggml_vk_flush_pending_compute(ctx);
-                ggml_vk_flush_pending_compute(remote_dev->backend_ctx);
+                ggml_vk_device_flush_pending_compute(remote_dev);
 
                 vk_buffer local_buf  = lb_ctx->dev_buffer;
                 uint64_t  local_off  = vk_tensor_offset(node) + node->view_offs;
@@ -13137,6 +13149,9 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
     ggml_vk_cleanup(ctx);
+
+    auto & backend_ctxs = ctx->device->backend_ctxs;
+    backend_ctxs.erase(std::remove(backend_ctxs.begin(), backend_ctxs.end(), ctx), backend_ctxs.end());
 
     // Destroy any shared-buffer reduce pairs while the Vulkan devices are still alive.
     // They live in a static map, so leaving them until static destruction would free the
