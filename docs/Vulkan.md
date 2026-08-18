@@ -584,10 +584,18 @@ Validated on Qwen3.8-27B IQ4_KS with `-dev Vulkan1`: baseline and
 `--spec-type mtp:n_max=1,p_min=0.0` now match CPU, and the original
 `n_max=4,p_min=0.4` repro no longer emits the `...aterater...` garbage.
 
-**Remaining gap**: with `n_max > 1` the output is still not byte-identical to CPU after
-the first accepted token. That traces to the recurrent per-step checkpoint restore
-(`llama_kv_cache::per_step_restore`) when a second context is present on the same
-device, not to the `backend_ctx` bug above; it still needs investigation.
+A second, unrelated bug surfaced with `n_max > 1` (i.e. as soon as a speculative round
+rejects a draft and takes the per-step checkpoint-restore path).
+`llama_kv_cache::restore_recurrent_cache_tensors` builds two local `ggml_tensor`s for
+the restore copy by copying `*s_l` and then pointing `src.data` into the per-step
+checkpoint tensor. It did **not** also update `src.buffer`, so the local source tensor
+kept `s_l`'s buffer while `data` pointed into the per-step buffer. CPU backends copy by
+`data` pointer and were unaffected, but the Vulkan `cpy_tensor` derives the source
+sub-buffer from `src->buffer` plus the offset from `src->data`, so it read from `s_l`'s
+buffer at the per-step tensor's offset and restored garbage into the recurrent state.
+Fixed by setting `src.buffer = per_step_*->buffer` (and clearing `view_src`/`view_offs`)
+before the copy. Qwen3.8-27B now matches CPU end-to-end with
+`--spec-type mtp:n_max=4,p_min=0.0/0.4` on both `Vulkan0` and `Vulkan1`.
 
 ## Benchmarks (RTX 3090, Vulkan0)
 

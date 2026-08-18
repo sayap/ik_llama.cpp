@@ -2297,6 +2297,9 @@ static void restore_recurrent_cache_tensors(int step, ggml_backend_sched_t sched
     dst.data  = (char *)s_l->data + conv_bytes;
     auto src = dst;
     src.data = (char *)per_step_ssm->data + (size_t)step * ssm_bytes;
+    src.buffer = per_step_ssm->buffer;
+    src.view_src = nullptr;
+    src.view_offs = 0;
     ggml_backend_tensor_copy_async(dst_backend, dst_backend, &src, &dst);
     backends_to_sync.insert(dst_backend);
 
@@ -2304,6 +2307,9 @@ static void restore_recurrent_cache_tensors(int step, ggml_backend_sched_t sched
     dst.ne[0] = conv_bytes/sizeof(float);
     src = dst;
     src.data = (char *)per_step_conv->data + (size_t)step * conv_bytes;
+    src.buffer = per_step_conv->buffer;
+    src.view_src = nullptr;
+    src.view_offs = 0;
     ggml_backend_tensor_copy_async(dst_backend, dst_backend, &src, &dst);
 }
 
