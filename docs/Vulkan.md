@@ -706,10 +706,10 @@ record PP tok/s and TG tok/s for both.
    before mainline's coopmat1 support), and ported mainline's AMD/RADV chip
    tuning (`l_warptile_mmq = {256,128,128,32,sg8,64,2,tm_m,tn_m,tk_m,sg8}`).
    Warm end-to-end pp1024 goes ~225 -> ~289 tok/s (mainline ~336-342 with the
-   same server harness); the residual gap is the older ik `mul_mm.comp`
-   coopmat shmem layout (scalar `FLOAT_TYPE` with `BK+8` stride vs mainline's
-   `f16vec2` with `BK/2+4` padding) plus the documented prompt-path CPU
-   overhead, not the mmq kernel.
+   same server harness). The ik `mul_mm.comp` coopmat shared-memory layout has
+   since been ported to mainline's `f16vec2` with `BK/2+4` padding (the scalar
+   `FLOAT_TYPE` + `BK+8` stride is gone), so the residual gap is the documented
+   prompt-path CPU overhead, not the matmul kernel.
    MoE `MUL_MAT_ID` remains on the dequant-to-F16 path (see "coopmat1 devices
    (AMD / Intel)" under Performance / architecture).
 
@@ -935,10 +935,13 @@ Option 1 is now measured on the Strix Halo iGPU (Vulkan1) for `IQ4_KS`, `IQ3_KT`
 (~22 vs ~17 TF), so the ik mmq has been moved out of the coopmat branch (matching
 mainline; it now lives in the `fp16` branch). Remaining work, in order:
 
-- **Port mainline's modern `mul_mm.comp` coopmat shmem layout**: the remaining ~14% PP
-  gap to mainline is the older ik coopmat path (scalar `FLOAT_TYPE` shmem with
-  `BK+8` stride, vs mainline's `f16vec2` with `BK/2+4` padding and its
-  `dot_product_funcs` B conversion). Warm pp1024 is ~289 tok/s vs mainline ~336-342.
+- **Port mainline's modern `mul_mm.comp` coopmat shmem layout**: **now implemented.**
+  The ik `mul_mm.comp` shared memory is now `FLOAT_TYPE_VEC2` with `BK/2+4` padding
+  (and `BK/2+1` for the non-coopmat SIMT path), matching mainline: the scalar
+  `FLOAT_TYPE` + `BK+8` stride is gone, the coopmat1 F16-WMMA load reads `i/2` vec2
+  pairs, and the SIMT path accumulates both halves of each vec2. The remaining PP gap
+  to mainline is the prompt-path CPU overhead, not the matmul kernel. Warm pp1024 is
+  ~289 tok/s vs mainline ~336-342.
 - **MoE `MUL_MAT_ID`**: the mmq covers dense `MUL_MAT` only; MoE prompt processing still
   pays dequant-to-F16 for the IQK/KT types on coopmat1 (a `matmul_id_*_q8_1` mmq variant
   is the missing piece).
