@@ -74,6 +74,38 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
 layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
 #endif
 
+#if defined(DATA_A_IQ4_KS) || defined(DATA_A_IQ4_K) || defined(DATA_A_IQ3_K) || defined(DATA_A_IQ3_KT)
+// IQK/KT byte-addressed A-tile decode (see the A-load branches below). The
+// binding-0 uint8_t view (A_TYPE for these types) is what iqk_tables.comp's
+// loaders read; mul_mm.comp declares its own buffers, so skip the include's.
+#define IQK_TABLES_NO_BINDING 1
+#include "iqk_tables.comp"
+#undef IQK_TABLES_NO_BINDING
+
+// Dynamically-indexed value tables go through shared memory (the const arrays
+// would be lowered to global-memory accesses).
+#if defined(DATA_A_IQ4_KS) || defined(DATA_A_IQ4_K)
+shared FLOAT_TYPE iq4k_sh[32];
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize) {
+    for (uint i = gl_LocalInvocationIndex.x; i < 32u; i += wgsize.x) {
+        iq4k_sh[i] = FLOAT_TYPE(iq4k_values[i]);
+    }
+    barrier();
+}
+#endif
+#if defined(DATA_A_IQ3_K)
+shared FLOAT_TYPE iq3nl_sh[16];
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize) {
+    for (uint i = gl_LocalInvocationIndex.x; i < 16u; i += wgsize.x) {
+        iq3nl_sh[i] = FLOAT_TYPE(iq3nl_values[i]);
+    }
+    barrier();
+}
+#endif
+#endif
+
 layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
@@ -779,6 +811,140 @@ void main() {
             const uint k_pair = loadr_a;
             store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(kvalues_mxfp4[vui  & 0xF] * d, kvalues_mxfp4[vui2 & 0xF] * d));
             store_a(loadc_a + l, k_pair + 8, FLOAT_TYPE_VEC2(kvalues_mxfp4[vui  >>  4] * d, kvalues_mxfp4[vui2 >>  4] * d));
+#elif defined(DATA_A_IQ4_KS)
+            // Byte-addressed: fp32 row header + 136-byte blocks (8 per-32-group
+            // scale/selector bytes + 128 quant bytes). One BK=32 tile = one
+            // 32-element group; the nibble interleave is the Q4_0 one (byte j:
+            // lo nibble = element j, hi nibble = element 16+j).
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = (start_k + block) / 32u;  // k splits are 256-aligned
+                const uint g    = grp & 7u;
+
+                const uint row_byte   = row * (4u + nbpb * 136u);
+                const uint block_byte = row_byte + 4u + (grp >> 3) * 136u;
+
+                const float d  = uintBitsToFloat(iqk_load_u32(row_byte));
+                const uint sc = uint(data_a[block_byte + g]);
+                const float dl = d * (float(sc & 254u) - 127.0f);
+                const uint v_off = (sc & 1u) != 0u ? 16u : 0u;
+
+                // byte j: lo nibble = element j, hi nibble = element 16+j. The
+                // LOAD_VEC_A=4 granule is the byte pair (2r, 2r+1) → shmem pairs
+                // r (elements 2r, 2r+1) and r+8 (elements 16+2r, 17+2r).
+                const uint w = iqk_load_u16(block_byte + 8u + 16u * g + 2u * loadr_a);
+                const uint vui  = w & 0xffu;
+                const uint vui2 = w >> 8;
+                const uint k_pair = loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(dl * iq4k_sh[(vui  & 0xFu) + v_off], dl * iq4k_sh[(vui2 & 0xFu) + v_off]));
+                store_a(loadc_a + l, k_pair + 8, FLOAT_TYPE_VEC2(dl * iq4k_sh[(vui  >> 4)    + v_off], dl * iq4k_sh[(vui2 >> 4)    + v_off]));
+            }
+#elif defined(DATA_A_IQ4_K)
+            // Byte-addressed: 144-byte blocks (d + extra + 4 sh bytes + 8 scale
+            // bytes + 128 quant bytes), no row header; per-16 scales (the
+            // granule never crosses the 16-element half boundary).
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = (start_k + block) / 32u;
+                const uint g    = grp & 7u;
+
+                const uint block_byte = row * (nbpb * 144u) + (grp >> 3) * 144u;
+
+                const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+                const uint e_shift = iqk_load_u16(block_byte + 2u) >> (2u * g);
+                const uint v1_off = (e_shift & 1u) != 0u ? 16u : 0u;
+                const uint v2_off = (e_shift & 2u) != 0u ? 16u : 0u;
+                const uint sh = uint(data_a[block_byte + 4u + g / 2u]) >> (4u * (g & 1u));
+                const uint sc = uint(data_a[block_byte + 8u + g]);
+                const float dl_lo = d * (float((sc & 0xFu) | ((sh << 4) & 0x30u)) - 32.0f);
+                const float dl_hi = d * (float((sc >> 4)     | ((sh << 2) & 0x30u)) - 32.0f);
+
+                // Q4_0 nibble interleave: byte pair (2r, 2r+1) → pairs r and r+8
+                const uint w = iqk_load_u16(block_byte + 16u + 16u * g + 2u * loadr_a);
+                const uint vui  = w & 0xffu;
+                const uint vui2 = w >> 8;
+                const uint k_pair = loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(dl_lo * iq4k_sh[(vui  & 0xFu) + v1_off], dl_lo * iq4k_sh[(vui2 & 0xFu) + v1_off]));
+                store_a(loadc_a + l, k_pair + 8, FLOAT_TYPE_VEC2(dl_hi * iq4k_sh[(vui  >> 4)    + v2_off], dl_hi * iq4k_sh[(vui2 >> 4)    + v2_off]));
+            }
+#elif defined(DATA_A_IQ3_K)
+            // Byte-addressed: 110-byte blocks (d + extra + sh + 8 scale bytes +
+            // 64 qs bytes + 32 qh bytes), 2-byte aligned only (the loaders are
+            // unaligned-safe). qs byte j holds the 2-bit codes of element j for
+            // four consecutive groups; qh byte j holds the high-bit of element j
+            // for eight groups.
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = (start_k + block) / 32u;
+                const uint g    = grp & 7u;
+
+                const uint block_byte = row * (nbpb * 110u) + (grp >> 3) * 110u;
+
+                const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+                const uint e_shift = iqk_load_u16(block_byte + 2u) >> (2u * g);
+                const uint v1_off = (e_shift & 1u) != 0u ? 8u : 0u;
+                const uint v2_off = (e_shift & 2u) != 0u ? 8u : 0u;
+                const uint sh = iqk_load_u16(block_byte + 4u);
+                const uint sc = uint(data_a[block_byte + 6u + g]);
+                const bool lo16 = loadr_a < 4u;  // elements 4*loadr_a..+3 < 16
+                const float dl = d * (2.0f * float(lo16 ? (sc & 0xFu) : (sc >> 4)) + 1.0f)
+                               * (((sh >> (2u * g + (lo16 ? 0u : 1u))) & 1u) != 0u ? -1.0f : 1.0f);
+                const uint v_off = lo16 ? v1_off : v2_off;
+
+                const uint qw = iqk_load_u32(block_byte + 14u + (g / 4u) * 32u + 4u * loadr_a);
+                const uint hw = iqk_load_u32(block_byte + 78u + 4u * loadr_a);
+                const uint qsh = 2u * (g & 3u);
+#define IQ3_K_VAL(kk) (dl * iq3nl_sh[(((((qw >> (8u * (kk))) & 0xffu) >> qsh) & 3u) | (((((hw >> (8u * (kk))) & 0xffu) >> g) & 1u) << 2)) + v_off])
+                // sequential layout: elements 4r..4r+3 → shmem pairs 2r and 2r+1
+                const uint k_pair = 2u * loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(IQ3_K_VAL(0), IQ3_K_VAL(1)));
+                store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(IQ3_K_VAL(2), IQ3_K_VAL(3)));
+#undef IQ3_K_VAL
+            }
+#elif defined(DATA_A_IQ3_KT)
+            // Byte-addressed: fp32 row header + 100-byte blocks (4 scale bytes +
+            // 64 seed bytes + 32 sign bytes). Each 8-element sub-group j derives
+            // its 8 values from a 16-bit seed via the multiplicative hash (4
+            // rounds per call); a granule covers seed rounds k0+1..k0+4.
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = (start_k + block) / 32u;
+                const uint g    = grp & 7u;
+
+                const uint row_byte   = row * (4u + nbpb * 100u);
+                const uint block_byte = row_byte + 4u + (grp >> 3) * 100u;
+
+                const float d  = uintBitsToFloat(iqk_load_u32(row_byte));
+                const uint sc = uint(data_a[block_byte + (g & 3u)]) >> (4u * (g >> 2));
+                const float dl = d * 1.01f * float(sc & 0xFu);
+
+                const uint j  = loadr_a / 2u;           // 8-element sub-group
+                const uint k0 = (loadr_a & 1u) * 4u;    // round offset within it
+
+                // 4 consecutive sign bytes, bit g selects the group's sign bit
+                const uint hw = iqk_load_u32(block_byte + 68u + 8u * j + k0);
+                uint sign_mask = 0u;
+                [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+                    sign_mask |= (((hw >> (8u * t)) >> g) & 1u) << t;
+                }
+
+                uint x = iqk_load_u16(block_byte + 4u + 8u * g + 2u * j) + 4096u;
+                if (k0 != 0u) {
+                    // skip the first four rounds of the chain
+                    [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+                        x *= 0xCBAC1FEDu;
+                    }
+                }
+                const vec4 v = dl * iqk_hash_values(x, true, sign_mask);
+                // sequential layout: elements 4r..4r+3 → shmem pairs 2r and 2r+1
+                const uint k_pair = 2u * loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(v.x, v.y));
+                store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(v.z, v.w));
+            }
 #endif
         }
         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
