@@ -872,10 +872,48 @@ chip-tuned `l_warptile_mmq = {256,128,128,32,sg8,64,2,tm_m,tn_m,tk_m,sg8}` tile.
 path reaches ~22 TFLOPS on the Strix Halo (4.1 ms for the q4_K FFN gate matmul), beating
 the SIMT dot4 mmq's ~17 TF (5.4 ms) and the old scalar-shmem WMMA path. Matching
 mainline — moving the ik mmq out of the coopmat branch and porting the AMD tile + the
-`mul_mat_l` re-enable — lifts warm pp1024 from ~225 to ~289 tok/s. The option-1/option-2
-analysis below is retained for historical context; option 1 (SIMT dot4) is now measured
+`mul_mat_l` re-enable — lifts warm pp1024 from ~225 to ~289 tok/s, and the follow-up
+`f16vec2` shmem-layout port ("port mainline mul_mm.comp coopmat shmem layout") lifts it
+further to ~319 (see the benchmark round below). The option-1/option-2 analysis below is retained for historical context;
+option 1 (SIMT dot4) is now measured
 to be *slower* than the coopmat F16 WMMA path on RDNA3.5, so it is kept only for the
 non-coopmat `fp16` devices where mainline also uses it.
+
+**Benchmark round 2026-08-18 (ik at "port mainline mul_mm.comp coopmat shmem layout"
+(branch HEAD, pre-rebase) vs
+mainline d83f72d46, Vulkan1 = Strix Halo
+8060S / RADV Mesa 26.1.6).** `llama-bench -dev Vulkan1 -r 3`, full offload
+(`-ngl 999`, `-fa 1`, 16 CPU threads; the "CPU" backend label is a `GGML_BACKEND_DL`
+artifact — the iGPU sits at ~100% busy during the runs):
+
+| Qwen3.8-27B quant | pp1024 `-ub 512` | pp1024 `-ub 2048` | tg128 |
+|---|---:|---:|---:|
+| Q4_K_L (17.2 GB) | **318.7** | **303.3** | **11.66** |
+| mainline Q4_K_L | 353.0 | 317.1 | 12.03 |
+| IQ4_K (14.4 GB) | 141.2 | 163.2 | 13.34 |
+| IQ4_KS (13.3 GB) | 137.5 | 160.7 | 14.07 |
+| IQ3_K (11.1 GB) | 119.9 | 146.9 | 11.25 |
+| IQ3_KT (9.8 GB) | 130.1 | 154.6 | 13.13 |
+| MXFP4 (13.7 GB) | 133.7 | 160.7 | 13.75 |
+| mainline MXFP4 | 381.7 | 360.8 | 14.20 |
+
+Takeaways:
+
+- **Standard K quants are at mainline parity**: Q4_K_L reaches ~90% of mainline PP at
+  `-ub 512` and ~96% at `-ub 2048`, and ~97% on TG. (The quoted ~336-342 mainline
+  figure was with the server harness; llama-bench measures ~353.)
+- **The ik-only quants (IQK/KT) and MXFP4 lost their SIMT mmq** in the mainline-parity
+  commit ("match mainline's coopmat1 prompt path" kept only mainline's type set,
+  Q4_0..Q6_K): on coopmat1 devices they
+  now take the flat dequant-to-F16 + F16 WMMA path, so their PP is *below* the mmq-era
+  numbers above (IQ4_KS ~137 vs ~186, IQ3_KT ~130 vs ~170, MXFP4 ~134 vs ~178 at
+  `-ub 512`). The typed decoders are still in `mul_mmq_funcs.comp` (dormant); re-adding
+  their `CREATE_MMQ` pipelines — or porting PR #2332's coopmat1 inline-dequant A-tile
+  decodes — is the lever for these types. MXFP4 has a real mainline gap (~35% at
+  `-ub 512`) because mainline runs its own native MXFP4 prompt path.
+- TG is unaffected by the prompt-path work (decode uses the per-type `mul_mat_vec`
+  Q8_1 kernels); IQ3_K trails IQ4_K/IQ3_KT as before (110-byte 2-byte-aligned blocks,
+  unaligned uint32 loader).
 
 1. **SIMT `dot4` MMQ for the IQK/KT families (per-32 and per-16 scales)** (KS/KSS/KT/KL,
    the base `_K` types, plus Q6_0): **now implemented for all of them.**
@@ -888,10 +926,16 @@ non-coopmat `fp16` devices where mainline also uses it.
    kernel; the base `_K` types keep two per-16 scales per tile (`QUANT_AUXF == 2`) and
    the accumulator scales the two 16-element half-dots separately.
    The KT hash decode reuses `iqk_hash_values_packed` (`iqk_tables.comp`); `Q6_0` folds
-   its −32 zero point into the block-sum correction. The pipelines are created on
+   its −32 zero point into the block-sum correction. The pipelines were created on
    coopmat1 devices in the `integer_dot_product` branch
    (`pipeline_dequant_mul_mat_mat_q8_1[TYPE]`), so the existing MMQ-first dispatch in
-   `ggml_vk_mul_mat_q_f16` picks them up automatically. Measured on Qwen3.8-27B /
+   `ggml_vk_mul_mat_q_f16` picked them up automatically. **Superseded**: the
+   mainline-parity commit ("match mainline's coopmat1 prompt path") removed these
+   pipelines for the ik-only types (only mainline's
+   Q4_0..Q6_K set is created, and only in the non-coopmat `fp16` branch); on coopmat1
+   devices the IQK/KT/MXFP4 types now take the flat dequant-to-F16 fallback, and the
+   numbers below are the historical mmq-era measurements (the 2026-08-18 round above has
+   the current ones). Measured on Qwen3.8-27B /
    Vulkan1 (Strix Halo, 2600-token prompt):
 
    | quant | `-ub 512` | `-ub 2048` |
@@ -941,7 +985,9 @@ mainline; it now lives in the `fp16` branch). Remaining work, in order:
   `FLOAT_TYPE` + `BK+8` stride is gone, the coopmat1 F16-WMMA load reads `i/2` vec2
   pairs, and the SIMT path accumulates both halves of each vec2. The remaining PP gap
   to mainline is the prompt-path CPU overhead, not the matmul kernel. Warm pp1024 is
-  ~289 tok/s vs mainline ~336-342.
+  ~289 tok/s before the layout port and ~319 after ("port mainline mul_mm.comp coopmat
+  shmem layout") vs mainline ~353 measured
+  with the same `llama-bench` harness (~336-342 with the server harness).
 - **MoE `MUL_MAT_ID`**: the mmq covers dense `MUL_MAT` only; MoE prompt processing still
   pays dequant-to-F16 for the IQK/KT types on coopmat1 (a `matmul_id_*_q8_1` mmq variant
   is the missing piece).
@@ -952,7 +998,9 @@ mainline; it now lives in the `fp16` branch). Remaining work, in order:
   power-of-two scale in f32 (kept f32 even in the f16 path because the exponent range
   reaches 2^-128). Measured on Qwen3.8-27B-MXFP4 / Vulkan1 (Strix Halo, 2600-token
   prompt): `-ub 512` ~178 tok/s (vs ~92 dequant-to-F16, ~1.9×), `-ub 2048` ~181 tok/s
-  (vs ~106, ~1.7×).
+  (vs ~106, ~1.7×). **Superseded**: these mmq pipelines were removed by the
+  mainline-parity commit like the IQK/KT ones above; the current numbers are in the
+  2026-08-18 round (~134/~161, vs mainline ~382/~361).
 - **Option 2** (`coopmat<int8_t>` WMMA MMQ) and **option 3** (shrink the F16 intermediate)
   are still open.
 - A pre-existing Vulkan1 correctness gap surfaced while testing: `q6_0`/`mxfp4`
