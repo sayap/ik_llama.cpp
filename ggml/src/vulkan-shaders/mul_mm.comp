@@ -74,7 +74,10 @@ layout (binding = 0) readonly buffer A_PACKED16 {A_TYPE_PACKED16 data_a_packed16
 layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32[];};
 #endif
 
-#if defined(DATA_A_IQ4_KS) || defined(DATA_A_IQ4_K) || defined(DATA_A_IQ3_K) || defined(DATA_A_IQ3_KT)
+#if defined(DATA_A_IQ2_K) || defined(DATA_A_IQ3_K) || defined(DATA_A_IQ4_K) || defined(DATA_A_IQ5_K) || \
+    defined(DATA_A_IQ6_K) || defined(DATA_A_IQ2_KS) || defined(DATA_A_IQ3_KS) || defined(DATA_A_IQ4_KS) || \
+    defined(DATA_A_IQ4_KSS) || defined(DATA_A_IQ5_KS) || defined(DATA_A_IQ2_KL) || defined(DATA_A_IQ1_KT) || \
+    defined(DATA_A_IQ2_KT) || defined(DATA_A_IQ3_KT) || defined(DATA_A_IQ4_KT)
 // IQK/KT byte-addressed A-tile decode (see the A-load branches below). The
 // binding-0 uint8_t view (A_TYPE for these types) is what iqk_tables.comp's
 // loaders read; mul_mm.comp declares its own buffers, so skip the include's.
@@ -84,22 +87,105 @@ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32
 
 // Dynamically-indexed value tables go through shared memory (the const arrays
 // would be lowered to global-memory accesses).
-#if defined(DATA_A_IQ4_KS) || defined(DATA_A_IQ4_K)
+#if defined(DATA_A_IQ4_KS) || defined(DATA_A_IQ4_K) || defined(DATA_A_IQ4_KSS) || \
+    defined(DATA_A_IQ1_KT) || defined(DATA_A_IQ2_KT) || defined(DATA_A_IQ4_KT)
 shared FLOAT_TYPE iq4k_sh[32];
+#define IQK_NEED_IQ4K 1
+#endif
+#if defined(DATA_A_IQ3_K) || defined(DATA_A_IQ3_KS)
+shared FLOAT_TYPE iq3nl_sh[16];
+#define IQK_NEED_IQ3NL 1
+#endif
+#if defined(DATA_A_IQ2_K) || defined(DATA_A_IQ2_KS)
+shared FLOAT_TYPE iq2nl_sh[8];
+#define IQK_NEED_IQ2NL 1
+#endif
+#if defined(DATA_A_IQ5_K) || defined(DATA_A_IQ5_KS)
+shared FLOAT_TYPE iq5nl_sh[64];
+#define IQK_NEED_IQ5NL 1
+#endif
+#if defined(DATA_A_IQ6_K)
+shared FLOAT_TYPE iq6nl_sh[128];
+#define IQK_NEED_IQ6NL 1
+#endif
+#if defined(DATA_A_IQ2_KL)
+// iq2kl_values packs two int8 per uint16 (lo = even element, hi = odd)
+shared FLOAT_TYPE iq2kl_sh[64];
+#define IQK_NEED_IQ2KL 1
+#endif
+
+#ifdef IQK_NEED_IQ4K
 #define NEEDS_INIT_IQ_SHMEM
 void init_iq_shmem(uvec3 wgsize) {
     for (uint i = gl_LocalInvocationIndex.x; i < 32u; i += wgsize.x) {
         iq4k_sh[i] = FLOAT_TYPE(iq4k_values[i]);
     }
+#ifdef IQK_NEED_IQ3NL
+    for (uint i = gl_LocalInvocationIndex.x; i < 16u; i += wgsize.x) {
+        iq3nl_sh[i] = FLOAT_TYPE(iq3nl_values[i]);
+    }
+#endif
+#ifdef IQK_NEED_IQ2NL
+    for (uint i = gl_LocalInvocationIndex.x; i < 8u; i += wgsize.x) {
+        iq2nl_sh[i] = FLOAT_TYPE(iq2nl_values[i]);
+    }
+#endif
+#ifdef IQK_NEED_IQ5NL
+    for (uint i = gl_LocalInvocationIndex.x; i < 64u; i += wgsize.x) {
+        iq5nl_sh[i] = FLOAT_TYPE(iq5nl_values[i]);
+    }
+#endif
+#ifdef IQK_NEED_IQ6NL
+    for (uint i = gl_LocalInvocationIndex.x; i < 128u; i += wgsize.x) {
+        iq6nl_sh[i] = FLOAT_TYPE(iq6nl_values[i]);
+    }
+#endif
+#ifdef IQK_NEED_IQ2KL
+    for (uint i = gl_LocalInvocationIndex.x; i < 32u; i += wgsize.x) {
+        iq2kl_sh[i]      = FLOAT_TYPE(int8_t(iq2kl_values[i] & 0xffu));
+        iq2kl_sh[32u + i] = FLOAT_TYPE(int8_t(iq2kl_values[i] >> 8));
+    }
+#endif
     barrier();
 }
-#endif
-#if defined(DATA_A_IQ3_K)
-shared FLOAT_TYPE iq3nl_sh[16];
+#elif defined(IQK_NEED_IQ3NL)
 #define NEEDS_INIT_IQ_SHMEM
 void init_iq_shmem(uvec3 wgsize) {
     for (uint i = gl_LocalInvocationIndex.x; i < 16u; i += wgsize.x) {
         iq3nl_sh[i] = FLOAT_TYPE(iq3nl_values[i]);
+    }
+    barrier();
+}
+#elif defined(IQK_NEED_IQ2NL)
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize) {
+    for (uint i = gl_LocalInvocationIndex.x; i < 8u; i += wgsize.x) {
+        iq2nl_sh[i] = FLOAT_TYPE(iq2nl_values[i]);
+    }
+    barrier();
+}
+#elif defined(IQK_NEED_IQ5NL)
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize) {
+    for (uint i = gl_LocalInvocationIndex.x; i < 64u; i += wgsize.x) {
+        iq5nl_sh[i] = FLOAT_TYPE(iq5nl_values[i]);
+    }
+    barrier();
+}
+#elif defined(IQK_NEED_IQ6NL)
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize) {
+    for (uint i = gl_LocalInvocationIndex.x; i < 128u; i += wgsize.x) {
+        iq6nl_sh[i] = FLOAT_TYPE(iq6nl_values[i]);
+    }
+    barrier();
+}
+#elif defined(IQK_NEED_IQ2KL)
+#define NEEDS_INIT_IQ_SHMEM
+void init_iq_shmem(uvec3 wgsize) {
+    for (uint i = gl_LocalInvocationIndex.x; i < 32u; i += wgsize.x) {
+        iq2kl_sh[i]      = FLOAT_TYPE(int8_t(iq2kl_values[i] & 0xffu));
+        iq2kl_sh[32u + i] = FLOAT_TYPE(int8_t(iq2kl_values[i] >> 8));
     }
     barrier();
 }
@@ -819,7 +905,7 @@ void main() {
             {
                 const uint nbpb = p.stride_a / 256u;
                 const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
-                const uint grp  = (start_k + block) / 32u;  // k splits are 256-aligned
+                const uint grp  = block / 32u;  // k splits are 256-aligned (block starts at start_k)
                 const uint g    = grp & 7u;
 
                 const uint row_byte   = row * (4u + nbpb * 136u);
@@ -847,7 +933,7 @@ void main() {
             {
                 const uint nbpb = p.stride_a / 256u;
                 const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
-                const uint grp  = (start_k + block) / 32u;
+                const uint grp  = block / 32u;
                 const uint g    = grp & 7u;
 
                 const uint block_byte = row * (nbpb * 144u) + (grp >> 3) * 144u;
@@ -878,7 +964,7 @@ void main() {
             {
                 const uint nbpb = p.stride_a / 256u;
                 const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
-                const uint grp  = (start_k + block) / 32u;
+                const uint grp  = block / 32u;
                 const uint g    = grp & 7u;
 
                 const uint block_byte = row * (nbpb * 110u) + (grp >> 3) * 110u;
@@ -912,7 +998,7 @@ void main() {
             {
                 const uint nbpb = p.stride_a / 256u;
                 const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
-                const uint grp  = (start_k + block) / 32u;
+                const uint grp  = block / 32u;
                 const uint g    = grp & 7u;
 
                 const uint row_byte   = row * (4u + nbpb * 100u);
@@ -941,6 +1027,369 @@ void main() {
                 }
                 const vec4 v = dl * iqk_hash_values(x, true, sign_mask);
                 // sequential layout: elements 4r..4r+3 → shmem pairs 2r and 2r+1
+                const uint k_pair = 2u * loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(v.x, v.y));
+                store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(v.z, v.w));
+            }
+#elif defined(DATA_A_IQ2_K)
+            // 76-byte blocks (d + extra + 8 scale bytes + 64 qs bytes), no row
+            // header; per-32 groups with per-16 scales. qs byte j carries the
+            // 2-bit codes of element j for four consecutive groups.
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = block / 32u;
+                const uint g    = grp & 7u;
+
+                const uint block_byte = row * (nbpb * 76u) + (grp >> 3) * 76u;
+
+                const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+                const uint e_shift = iqk_load_u16(block_byte + 2u) >> (2u * g);
+                const uint v1_off = (e_shift & 1u) != 0u ? 4u : 0u;
+                const uint v2_off = (e_shift & 2u) != 0u ? 4u : 0u;
+                const uint sc = uint(data_a[block_byte + 4u + g]);
+                const bool lo16 = loadr_a < 4u;
+                const float dl = d * (float(lo16 ? (sc & 0xFu) : (sc >> 4)) - 8.0f);
+                const uint v_off = lo16 ? v1_off : v2_off;
+
+                const uint qw = iqk_load_u32(block_byte + 12u + (g / 4u) * 32u + 4u * loadr_a);
+                const uint qsh = 2u * (g & 3u);
+#define IQ2_K_VAL(kk) (dl * iq2nl_sh[(((qw >> (8u * (kk))) >> qsh) & 3u) + v_off])
+                const uint k_pair = 2u * loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(IQ2_K_VAL(0), IQ2_K_VAL(1)));
+                store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(IQ2_K_VAL(2), IQ2_K_VAL(3)));
+#undef IQ2_K_VAL
+            }
+#elif defined(DATA_A_IQ5_K)
+            // 176-byte blocks; per-64 groups (part = k half), per-16 scales.
+            // qs byte j: lo nibble = element j of part 0, hi = part 1; hb byte j
+            // holds one high bit per group.
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = block / 32u;
+                const uint ib64 = (grp & 7u) / 2u;  // within the 256-element block
+                const uint part = grp & 1u;
+
+                const uint block_byte = row * (nbpb * 176u) + (grp >> 3) * 176u;
+
+                const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+                const uint e_shift = iqk_load_u16(block_byte + 2u) >> (4u * ib64);
+                const uint v1_off = (e_shift & (1u << (2u * part))) != 0u ? 32u : 0u;
+                const uint v2_off = (e_shift & (2u << (2u * part))) != 0u ? 32u : 0u;
+                const uint sh = uint(data_a[block_byte + 4u + ib64]);
+                const uint sl = uint(data_a[block_byte + 8u + 2u * ib64 + part]);
+                const bool lo16 = loadr_a < 4u;
+                const uint s = (part == 0u)
+                    ? (lo16 ? ((sl & 0xFu) | ((sh << 4) & 0x30u)) : ((sl >> 4) | ((sh << 2) & 0x30u)))
+                    : (lo16 ? ((sl & 0xFu) | (sh & 0x30u))        : ((sl >> 4) | ((sh >> 2) & 0x30u)));
+                const float dl = d * (float(s) - 32.0f);
+                const uint v_off = lo16 ? v1_off : v2_off;
+
+                const uint shift = 2u * ib64;
+                const uint qw = iqk_load_u32(block_byte + 16u + 32u * ib64 + 4u * loadr_a);
+                const uint hw = iqk_load_u32(block_byte + 144u + 4u * loadr_a);
+                // Note: keep the per-element index computation inline (named
+                // temps) — a ternary inside the array subscript miscompiles.
+                const uint q0 = (qw)       & 0xffu; const uint q1 = (qw >> 8)  & 0xffu;
+                const uint q2 = (qw >> 16) & 0xffu; const uint q3 = (qw >> 24) & 0xffu;
+                const uint h0 = (hw)       & 0xffu; const uint h1 = (hw >> 8)  & 0xffu;
+                const uint h2 = (hw >> 16) & 0xffu; const uint h3 = (hw >> 24) & 0xffu;
+                const uint i0 = (part == 0u) ? ((q0 & 0xFu) | (((h0 >> shift) & 1u) << 4)) : ((q0 >> 4) | (((h0 >> shift) & 2u) << 3));
+                const uint i1 = (part == 0u) ? ((q1 & 0xFu) | (((h1 >> shift) & 1u) << 4)) : ((q1 >> 4) | (((h1 >> shift) & 2u) << 3));
+                const uint i2 = (part == 0u) ? ((q2 & 0xFu) | (((h2 >> shift) & 1u) << 4)) : ((q2 >> 4) | (((h2 >> shift) & 2u) << 3));
+                const uint i3 = (part == 0u) ? ((q3 & 0xFu) | (((h3 >> shift) & 1u) << 4)) : ((q3 >> 4) | (((h3 >> shift) & 2u) << 3));
+                const uint k_pair = 2u * loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(dl * iq5nl_sh[i0 + v_off], dl * iq5nl_sh[i1 + v_off]));
+                store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(dl * iq5nl_sh[i2 + v_off], dl * iq5nl_sh[i3 + v_off]));
+            }
+#elif defined(DATA_A_IQ6_K)
+            // 212-byte blocks; per-64 groups (part), per-16 int8 scales; hb byte
+            // holds two high bits per group.
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = block / 32u;
+                const uint ib64 = (grp & 7u) / 2u;  // within the 256-element block
+                const uint part = grp & 1u;
+
+                const uint block_byte = row * (nbpb * 212u) + (grp >> 3) * 212u;
+
+                const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
+                const uint e_shift = iqk_load_u16(block_byte + 2u) >> (4u * ib64);
+                const uint v1_off = (e_shift & (1u << (2u * part))) != 0u ? 64u : 0u;
+                const uint v2_off = (e_shift & (2u << (2u * part))) != 0u ? 64u : 0u;
+                const bool lo16 = loadr_a < 4u;
+                const float dl = d * float(int8_t(data_a[block_byte + 4u + 4u * ib64 + part * 2u + (lo16 ? 0u : 1u)]));
+                const uint v_off = lo16 ? v1_off : v2_off;
+
+                const uint shift = 4u * (ib64 & 1u);
+                const uint qw = iqk_load_u32(block_byte + 20u + 32u * ib64 + 4u * loadr_a);
+                const uint hw = iqk_load_u32(block_byte + 148u + 32u * (ib64 / 2u) + 4u * loadr_a);
+                const uint q0 = (qw)       & 0xffu; const uint q1 = (qw >> 8)  & 0xffu;
+                const uint q2 = (qw >> 16) & 0xffu; const uint q3 = (qw >> 24) & 0xffu;
+                const uint h0 = (hw)       & 0xffu; const uint h1 = (hw >> 8)  & 0xffu;
+                const uint h2 = (hw >> 16) & 0xffu; const uint h3 = (hw >> 24) & 0xffu;
+                const uint i0 = (part == 0u) ? ((q0 & 0xFu) | (((h0 >> shift) & 0x3u) << 4)) : ((q0 >> 4) | (((h0 >> shift) & 0xCu) << 2));
+                const uint i1 = (part == 0u) ? ((q1 & 0xFu) | (((h1 >> shift) & 0x3u) << 4)) : ((q1 >> 4) | (((h1 >> shift) & 0xCu) << 2));
+                const uint i2 = (part == 0u) ? ((q2 & 0xFu) | (((h2 >> shift) & 0x3u) << 4)) : ((q2 >> 4) | (((h2 >> shift) & 0xCu) << 2));
+                const uint i3 = (part == 0u) ? ((q3 & 0xFu) | (((h3 >> shift) & 0x3u) << 4)) : ((q3 >> 4) | (((h3 >> shift) & 0xCu) << 2));
+                const uint k_pair = 2u * loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(dl * iq6nl_sh[i0 + v_off], dl * iq6nl_sh[i1 + v_off]));
+                store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(dl * iq6nl_sh[i2 + v_off], dl * iq6nl_sh[i3 + v_off]));
+            }
+#elif defined(DATA_A_IQ2_KS)
+            // 2-byte f16 row header + 70-byte blocks (2 extra + 8 scale bytes +
+            // 64 qs bytes); per-64 groups (part), per-16 scales.
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = block / 32u;
+                const uint ib64 = (grp & 7u) / 2u;  // within the 256-element block
+                const uint part = grp & 1u;
+
+                const uint row_byte   = row * (2u + nbpb * 70u);
+                const uint block_byte = row_byte + 2u + (grp >> 3) * 70u;
+
+                const float d = iqk_f16_to_f32(iqk_load_u16(row_byte));
+                const uint extra = iqk_load_u16(block_byte);
+                const uint e_shift = extra >> (2u * ib64);
+                const uint v_off = ((part == 0u ? (e_shift & 1u) : (e_shift & 2u)) != 0u) ? 4u : 0u;
+                const uint sc = uint(data_a[block_byte + 2u + ib64]);
+                // scale nibble is selected by part (the 32-element half of the
+                // 64-group), not by the 16-element half
+                const float dl = d * (float(((part == 0u) ? (sc & 0xFu) : (sc >> 4)) | ((extra >> (4u + 2u * ib64 + part)) & 0x10u)) - 16.0f);
+
+                const uint shift = 4u * (ib64 & 1u) + 2u * part;
+                const uint qw = iqk_load_u32(block_byte + 6u + 32u * (ib64 / 2u) + 4u * loadr_a);
+#define IQ2_KS_VAL(kk) (dl * iq2nl_sh[(((qw >> (8u * (kk))) >> shift) & 3u) + v_off])
+                const uint k_pair = 2u * loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(IQ2_KS_VAL(0), IQ2_KS_VAL(1)));
+                store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(IQ2_KS_VAL(2), IQ2_KS_VAL(3)));
+#undef IQ2_KS_VAL
+            }
+#elif defined(DATA_A_IQ3_KS)
+            // 2-byte f16 row header + 102-byte blocks (2 extra + 8 scale bytes +
+            // 64 qs bytes + 32 hb bytes); per-32 groups.
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = block / 32u;
+                const uint g    = grp & 7u;
+
+                const uint row_byte   = row * (2u + nbpb * 102u);
+                const uint block_byte = row_byte + 2u + (grp >> 3) * 102u;
+
+                const float d = iqk_f16_to_f32(iqk_load_u16(row_byte));
+                const uint extra = iqk_load_u16(block_byte);
+                const uint sc = uint(data_a[block_byte + 2u + (g & 3u)]);
+                const float dl = d * (float(((sc >> (4u * (g >> 2))) & 0xFu) | (((extra >> g) & 1u) << 4)) - 16.0f);
+                const uint v_off = ((extra >> (8u + g)) & 1u) != 0u ? 8u : 0u;
+
+                const uint qsh = 2u * (g & 3u);
+                const uint qw = iqk_load_u32(block_byte + 6u + 32u * (g / 4u) + 4u * loadr_a);
+                const uint hw = iqk_load_u32(block_byte + 70u + 4u * loadr_a);
+#define IQ3_KS_VAL(kk) (dl * iq3nl_sh[((((qw >> (8u * (kk))) >> qsh) & 3u) | ((((hw >> (8u * (kk))) >> g) & 1u) << 2)) + v_off])
+                const uint k_pair = 2u * loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(IQ3_KS_VAL(0), IQ3_KS_VAL(1)));
+                store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(IQ3_KS_VAL(2), IQ3_KS_VAL(3)));
+#undef IQ3_KS_VAL
+            }
+#elif defined(DATA_A_IQ4_KSS)
+            // 4-byte fp32 row header + 128-byte blocks. Each 32-element group is
+            // four uint32 words (16 packed uint16 values); every uint16 decodes
+            // to two nibble-pair table indices and contributes one scale bit.
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = block / 32u;
+                const uint g    = grp & 7u;
+
+                const uint row_byte   = row * (4u + nbpb * 128u);
+                const uint block_byte = row_byte + 4u + (grp >> 3) * 128u;
+                const uint group_byte = block_byte + 16u * g;
+
+                const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+                uint ls = 0u;
+                [[unroll]] for (uint m = 0u; m < 4u; ++m) {
+                    const uint w = iqk_load_u32(group_byte + 4u * m);
+                    [[unroll]] for (uint h = 0u; h < 2u; ++h) {
+                        ls |= (((w >> (16u * h)) & 1u)) << (2u * m + h);
+                    }
+                }
+                const float dl = d * (float(ls & 254u) - 127.0f);
+                const uint v_off = (ls & 1u) != 0u ? 16u : 0u;
+
+                // uint16 2r holds elements 4r,4r+1 (bytes 0,1); the a^=a>>1
+                // chain preserves byte alignment. Byte b's lo nibble is element
+                // (2b) of the low 16 half, hi nibble element (2b)+16.
+                const bool lo16 = loadr_a < 4u;
+                const uint nib = lo16 ? 0xFu : 0xF0u;
+                const uint nsh = lo16 ? 0u : 4u;
+                // byte b of the group holds element b (lo nibble) and b+16 (hi
+                // nibble), so the hi half of the tile reads bytes 4r-16..4r-13
+                const uint u16_off = group_byte + 4u * loadr_a - (lo16 ? 0u : 16u);
+                uint a0 = iqk_load_u16(u16_off)      & 0xfffeu; a0 ^= a0 >> 1;
+                uint a1 = iqk_load_u16(u16_off + 2u) & 0xfffeu; a1 ^= a1 >> 1;
+                const uint i00 = ((a0       & nib) >> nsh) + v_off;
+                const uint i01 = (((a0 >> 8) & nib) >> nsh) + v_off;
+                const uint i10 = ((a1       & nib) >> nsh) + v_off;
+                const uint i11 = (((a1 >> 8) & nib) >> nsh) + v_off;
+                const uint k_pair = 2u * loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(dl * iq4k_sh[i00], dl * iq4k_sh[i01]));
+                store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(dl * iq4k_sh[i10], dl * iq4k_sh[i11]));
+            }
+#elif defined(DATA_A_IQ5_KS)
+            // 4-byte fp32 row header + 168-byte blocks; per-64 groups (part),
+            // one per-32 scale byte with the table selector in bit 0.
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = block / 32u;
+                const uint ib64 = (grp & 7u) / 2u;  // within the 256-element block
+                const uint part = grp & 1u;
+
+                const uint row_byte   = row * (4u + nbpb * 168u);
+                const uint block_byte = row_byte + 4u + (grp >> 3) * 168u;
+
+                const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+                const uint sc = uint(data_a[block_byte + 2u * ib64 + part]);
+                const float dl = d * (float(sc & 254u) - 127.0f);
+                const uint v_off = (sc & 1u) != 0u ? 32u : 0u;
+
+                const uint sft_h = 2u * ib64 + part;
+                const uint qw = iqk_load_u32(block_byte + 8u + 32u * ib64 + 4u * loadr_a);
+                const uint hw = iqk_load_u32(block_byte + 136u + 4u * loadr_a);
+                const uint q0 = (qw)       & 0xffu; const uint q1 = (qw >> 8)  & 0xffu;
+                const uint q2 = (qw >> 16) & 0xffu; const uint q3 = (qw >> 24) & 0xffu;
+                const uint h0 = (hw)       & 0xffu; const uint h1 = (hw >> 8)  & 0xffu;
+                const uint h2 = (hw >> 16) & 0xffu; const uint h3 = (hw >> 24) & 0xffu;
+                const uint i0 = (part == 0u) ? (q0 & 0xFu) : (q0 >> 4); const uint i1 = (part == 0u) ? (q1 & 0xFu) : (q1 >> 4);
+                const uint i2 = (part == 0u) ? (q2 & 0xFu) : (q2 >> 4); const uint i3 = (part == 0u) ? (q3 & 0xFu) : (q3 >> 4);
+                const uint k_pair = 2u * loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(dl * iq5nl_sh[(i0 | (((h0 >> sft_h) & 1u) << 4)) + v_off], dl * iq5nl_sh[(i1 | (((h1 >> sft_h) & 1u) << 4)) + v_off]));
+                store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(dl * iq5nl_sh[(i2 | (((h2 >> sft_h) & 1u) << 4)) + v_off], dl * iq5nl_sh[(i3 | (((h3 >> sft_h) & 1u) << 4)) + v_off]));
+            }
+#elif defined(DATA_A_IQ2_KL)
+            // 2-byte f16 row header + 86-byte blocks; per-64 groups (part),
+            // per-16 scales with two extra high bits from the block header.
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = block / 32u;
+                const uint ib64 = (grp & 7u) / 2u;  // within the 256-element block
+                const uint part = grp & 1u;
+
+                const uint row_byte   = row * (2u + nbpb * 86u);
+                const uint block_byte = row_byte + 2u + (grp >> 3) * 86u;
+
+                const float d = iqk_f16_to_f32(iqk_load_u16(row_byte));
+                const uint scales_h = iqk_load_u16(block_byte);
+                const uint sc = uint(data_a[block_byte + 2u + (2u * ib64 + part) % 4u]);
+                const bool lo16 = loadr_a < 4u;
+                const float dl = d * (float(((sc >> (4u * (ib64 / 2u))) & 0xFu) | (((scales_h >> (4u * ib64 + 2u * part)) & 3u) << 4)) - 32.0f);
+
+                // byte (j/2) packs elements 2b (lo nibble, part 0) and 2b+1;
+                // hb byte (j/2) holds one high bit per group. The uint16 value
+                // table entry's lo/hi byte is selected by (j & 1).
+                const uint sft_h = 2u * ib64 + part;
+                const uint qb0 = uint(data_a[block_byte + 6u  + 16u * ib64 + 2u * loadr_a]);
+                const uint qb1 = uint(data_a[block_byte + 6u  + 16u * ib64 + 2u * loadr_a + 1u]);
+                const uint hb0 = uint(data_a[block_byte + 70u + 2u * loadr_a]);
+                const uint hb1 = uint(data_a[block_byte + 70u + 2u * loadr_a + 1u]);
+                const uint v0 = (part == 0u) ? (qb0 & 0xFu) : (qb0 >> 4);
+                const uint v1 = (part == 0u) ? (qb1 & 0xFu) : (qb1 >> 4);
+                const uint qv0 = (v0 | (((hb0 >> sft_h) & 1u) << 4));
+                const uint qv1 = (v1 | (((hb1 >> sft_h) & 1u) << 4));
+                const uint k_pair = 2u * loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(dl * iq2kl_sh[qv0],      dl * iq2kl_sh[qv0 + 32u]));
+                store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(dl * iq2kl_sh[qv1],      dl * iq2kl_sh[qv1 + 32u]));
+            }
+#elif defined(DATA_A_IQ1_KT)
+            // 4-byte fp32 row header + 56-byte blocks (8 sh bytes + 32 ql + 16
+            // qh); hash decode without abs, seed per 8-element sub-group.
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = block / 32u;
+                const uint g    = grp & 7u;
+
+                const uint row_byte   = row * (4u + nbpb * 56u);
+                const uint block_byte = row_byte + 4u + (grp >> 3) * 56u;
+
+                const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+                const uint sh_byte = uint(data_a[block_byte + g]);
+                const float dl = d * float(iq4k_sh[sh_byte & 0xFu]);
+
+                const uint j  = loadr_a / 2u;
+                const uint k0 = (loadr_a & 1u) * 4u;
+
+                const uint sh_shift = 8u - 4u * (g >> 2);
+                uint x = uint(data_a[block_byte + 8u + 4u * g + j])
+                       + 4096u
+                       + ((uint(data_a[block_byte + 40u + 4u * (g & 3u) + j]) << sh_shift) & 0xf00u)
+                       + ((sh_byte << (8u - j)) & 0x1000u);
+                if (k0 != 0u) {
+                    [[unroll]] for (uint t = 0u; t < 4u; ++t) x *= 0xCBAC1FEDu;
+                }
+                const vec4 v = dl * iqk_hash_values(x, false, 0u);
+                const uint k_pair = 2u * loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(v.x, v.y));
+                store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(v.z, v.w));
+            }
+#elif defined(DATA_A_IQ2_KT)
+            // 4-byte fp32 row header + 68-byte blocks (4 scale bytes + 64 seed
+            // bytes); hash decode without abs, 1.05 calibration factor.
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = block / 32u;
+                const uint g    = grp & 7u;
+
+                const uint row_byte   = row * (4u + nbpb * 68u);
+                const uint block_byte = row_byte + 4u + (grp >> 3) * 68u;
+
+                const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+                const uint sc = uint(data_a[block_byte + (g & 3u)]) >> (4u * (g >> 2));
+                const float dl = d * 1.05f * float(iq4k_sh[sc & 0xFu]);
+
+                const uint j  = loadr_a / 2u;
+                const uint k0 = (loadr_a & 1u) * 4u;
+
+                uint x = iqk_load_u16(block_byte + 4u + 8u * g + 2u * j) + 4096u;
+                if (k0 != 0u) {
+                    [[unroll]] for (uint t = 0u; t < 4u; ++t) x *= 0xCBAC1FEDu;
+                }
+                const vec4 v = dl * iqk_hash_values(x, false, 0u);
+                const uint k_pair = 2u * loadr_a;
+                store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(v.x, v.y));
+                store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(v.z, v.w));
+            }
+#elif defined(DATA_A_IQ4_KT)
+            // 4-byte fp32 row header + 128-byte blocks (32 qs bytes + 32 ql +
+            // 32 qh + 32 sh); one 4-value hash chain per granule.
+            {
+                const uint nbpb = p.stride_a / 256u;
+                const uint row  = batch_idx_a * p.M + ir * BM + loadc_a + l;
+                const uint grp  = block / 32u;
+                const uint g    = grp & 7u;
+
+                const uint row_byte   = row * (4u + nbpb * 128u);
+                const uint block_byte = row_byte + 4u + (grp >> 3) * 128u;
+
+                const float d = uintBitsToFloat(iqk_load_u32(row_byte));
+                const uint qs32 = iqk_load_u32(block_byte + 4u * g);
+                const float dl = d * (float((qs32 & 0xffu) >> 1) - 64.0f);
+                const uint idx0 = ((qs32 & 1u) << 15) + 4096u;
+
+                const uint j = loadr_a;  // one 4-element chain per granule
+                const uint sh = qs32 >> (8u + 3u * j);
+                const uint sh_shift = 8u - 4u * (g >> 2);
+                uint x = uint(data_a[block_byte + 32u + 8u * g + j])
+                       + ((uint(data_a[block_byte + 96u + 8u * (g & 3u) + j]) << sh_shift) & 0xf00u)
+                       + ((sh & 7u) << 12)
+                       + idx0;
+                const vec4 v = dl * iqk_hash_values(x, false, 0u);
                 const uint k_pair = 2u * loadr_a;
                 store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(v.x, v.y));
                 store_a(loadc_a + l, k_pair + 1, FLOAT_TYPE_VEC2(v.z, v.w));
