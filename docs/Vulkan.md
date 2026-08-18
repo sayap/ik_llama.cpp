@@ -226,9 +226,13 @@ scale exponent, 17-byte blocks) is now supported by `MUL_MAT`, `MUL_MAT_ID` and
 - **prompt (`mul_mat`)**: on `NV_coopmat2` devices, a native cm2 inline-dequant
   matmul (`mul_mm_cm2.comp` + `dequantFuncMXFP4`) reads the 17-byte blocks directly;
   `ggml_vk_get_mul_mat_mat_pipeline` no longer falls back to dequant+F16 for MXFP4.
-  Non-coopmat2 devices keep the flat `dequant_mxfp4.comp` → F16 matmul fallback, except
-  coopmat1 devices with integer dot, which now run a native SIMT dot4 Q8_1 mmq
-  (`mul_mmq.comp` typed MXFP4 decode) — see "coopmat1 devices" below.
+  Coopmat1 (and scalar) devices also run an inline-dequant matmul now: a
+  `DATA_A_MXFP4` A-tile decode in `mul_mm.comp` (ported from mainline; the E8M0
+  scale is halved to match ik's doubled `kvalues_mxfp4` table) feeds the F16-WMMA
+  coopmat tiles, matching mainline's prompt path. Devices without cooperative
+  matrices keep the flat `dequant_mxfp4.comp` → F16 matmul fallback (the earlier
+  SIMT dot4 Q8_1 mmq variant was removed with the mainline-parity prompt-path
+  rework — see "coopmat1 devices" below).
 - **`MUL_MAT_ID`**: the mat-mat-id path now uses the same native cm2 inline-dequant
   matmul on coopmat2 (this matters for large MoE models: the old dequant-to-F16 path
   dequantized the *entire* expert matrix — 8 GiB of F16 for DeepSeek-V4's fused
@@ -894,8 +898,11 @@ artifact — the iGPU sits at ~100% busy during the runs):
 | IQ4_KS (13.3 GB) | 137.5 | 160.7 | 14.07 |
 | IQ3_K (11.1 GB) | 119.9 | 146.9 | 11.25 |
 | IQ3_KT (9.8 GB) | 130.1 | 154.6 | 13.13 |
-| MXFP4 (13.7 GB) | 133.7 | 160.7 | 13.75 |
+| MXFP4 (13.7 GB) | 133.7 → **383.2**¹ | 160.7 → **382.8**¹ | 13.75 |
 | mainline MXFP4 | 381.7 | 360.8 | 14.20 |
+
+¹ after the follow-up MXFP4 coopmat1 inline-dequant port (see "coopmat1 devices");
+the original round measured the flat dequant-to-F16 fallback.
 
 Takeaways:
 
@@ -909,8 +916,10 @@ Takeaways:
   numbers above (IQ4_KS ~137 vs ~186, IQ3_KT ~130 vs ~170, MXFP4 ~134 vs ~178 at
   `-ub 512`). The typed decoders are still in `mul_mmq_funcs.comp` (dormant); re-adding
   their `CREATE_MMQ` pipelines — or porting PR #2332's coopmat1 inline-dequant A-tile
-  decodes — is the lever for these types. MXFP4 has a real mainline gap (~35% at
-  `-ub 512`) because mainline runs its own native MXFP4 prompt path.
+  decodes — is the lever for these types. MXFP4 had the same gap (~35% at
+  `-ub 512`); it has since been closed by porting mainline's `DATA_A_MXFP4`
+  inline-dequant A-tile decode (see the MXFP4 bullet under "coopmat1 devices"),
+  which is the template for doing the same for the IQK/KT types.
 - TG is unaffected by the prompt-path work (decode uses the per-type `mul_mat_vec`
   Q8_1 kernels); IQ3_K trails IQ4_K/IQ3_KT as before (110-byte 2-byte-aligned blocks,
   unaligned uint32 loader).
@@ -998,9 +1007,16 @@ mainline; it now lives in the `fp16` branch). Remaining work, in order:
   power-of-two scale in f32 (kept f32 even in the f16 path because the exponent range
   reaches 2^-128). Measured on Qwen3.8-27B-MXFP4 / Vulkan1 (Strix Halo, 2600-token
   prompt): `-ub 512` ~178 tok/s (vs ~92 dequant-to-F16, ~1.9×), `-ub 2048` ~181 tok/s
-  (vs ~106, ~1.7×). **Superseded**: these mmq pipelines were removed by the
-  mainline-parity commit like the IQK/KT ones above; the current numbers are in the
-  2026-08-18 round (~134/~161, vs mainline ~382/~361).
+  (vs ~106, ~1.7×). **Superseded twice**: first by the mainline-parity commit, which
+  removed these mmq pipelines (like the IQK/KT ones above) and left MXFP4 on the flat
+  dequant-to-F16 fallback (~134/~161 tok/s, vs mainline ~382/~361); then by a
+  `DATA_A_MXFP4` A-tile inline-dequant decode in `mul_mm.comp` (ported from
+  mainline's `mul_mm_funcs.glsl`, with the E8M0 scale halved for ik's doubled
+  `kvalues_mxfp4` table and pipelines created in the coopmat1 + scalar-fp16
+  branches). That restores mainline's prompt path for MXFP4: ~383/~383 tok/s pp1024
+  on Qwen3.8-27B-MXFP4 / Vulkan1 (mainline ~382/~361), `test-iqk-quants` passes
+  (including the multi-token mat-mat cases), and a 32-token greedy generation after
+  a 2600-token prompt is byte-identical to mainline.
 - **Option 2** (`coopmat<int8_t>` WMMA MMQ) and **option 3** (shrink the F16 intermediate)
   are still open.
 - A pre-existing Vulkan1 correctness gap surfaced while testing: `q6_0`/`mxfp4`
