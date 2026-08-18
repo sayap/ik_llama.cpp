@@ -920,11 +920,24 @@ covers all 15 IQK/KT types (the IQ4_KS/IQ4_K/IQ3_K/IQ3_KT rows above, plus
 IQ2_K/IQ5_K/IQ6_K/IQ2_KS/IQ3_KS/IQ4_KSS/IQ5_KS/IQ2_KL/IQ1_KT/IQ2_KT/IQ4_KT);
 the original round measured the flat dequant-to-F16 fallback.
 
+**Follow-up (Q4_K_L parity fix).** The remaining Q4_K_L pp gap in the round above was
+not the warptile tuning (the AMD/RADV `l_warptile` and the f16vec2 `BK/2+4` shared-memory
+layout were already ported) but the per-type A-tile load width: `q2_k`/`q4_k`/`q5_k` were
+still emitted with `LOAD_VEC_A = 2` in `vulkan-shaders-gen.cpp` and decoded with scalar
+byte-nibble reads in `mul_mm.comp`, while mainline emits `LOAD_VEC_A = 4` and uses the
+packed-uint32 `unpack8` decoders in `mul_mm_funcs.glsl`. Porting those three decoders and
+adding them to the `LOAD_VEC_A = 4` list closes the gap. Measured on Qwen3.8-27B-Q4_K_L /
+Vulkan1 (same harness): pp512 ~313 → ~356 tok/s (mainline ~361), pp1024 `-ub 512` ~358
+tok/s (mainline ~357). TG is unchanged (~11.6 vs ~12.0) because decode uses the
+`mul_mat_vec` kernels, not `mul_mm.comp`. IQK/Trellis/MXFP4/Q6_0 were already at
+`LOAD_VEC_A = 4` (MXFP4 matches mainline; Q6_0 has no mainline inline-dequant
+equivalent) and needed no change.
+
 Takeaways:
 
-- **Standard K quants are at mainline parity**: Q4_K_L reaches ~90% of mainline PP at
-  `-ub 512` and ~96% at `-ub 2048`, and ~97% on TG. (The quoted ~336-342 mainline
-  figure was with the server harness; llama-bench measures ~353.)
+- **Standard K quants are at mainline parity**: Q4_K_L pp512/pp1024 at `-ub 512` now
+  reach ~99–100% of mainline (was ~90% / ~10% behind), and TG ~96%. (The quoted
+  ~336-342 mainline figure was with the server harness; llama-bench measures ~353.)
 - **The ik-only quants (IQK/KT) and MXFP4 lost their SIMT mmq** in the mainline-parity
   commit ("match mainline's coopmat1 prompt path" kept only mainline's type set,
   Q4_0..Q6_K): on coopmat1 devices they
