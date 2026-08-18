@@ -198,7 +198,13 @@ arch list is the only thing forcing F32. Added `LLM_ARCH_QWEN3NEXT`,
 is now supported by `MUL_MAT` and `GET_ROWS`, using the same paths as the other
 legacy quants: native `mul_mat_vec` decode (`dequantize`/`dequantize4` in
 `dequant_funcs.comp`) and the flat dequant-to-F16 prompt path (`dequant_q6_0.comp`;
-like the IQK/KT families, this beats the cm2 inline dequant). The flat dequant was
+like the IQK/KT families, this beats the cm2 inline dequant). The coopmat1/scalar
+prompt path now also runs an inline-dequant matmul: a `DATA_A_Q6_0` A-tile decode in
+`mul_mm.comp` feeds the F16-WMMA coopmat tiles (matching the MXFP4/IQK/KT A-tiles),
+so `ggml_vk_get_mul_mat_mat_pipeline` no longer falls back to dequant+F16 for dense
+`Q6_0` on those devices. Coopmat2 and MoE `MUL_MAT_ID` keep the flat
+`dequant_q6_0.comp` fallback (the per-N-tile inline decode loses there, as for the
+IQK/KT families). The flat dequant was
 initially a naive byte-addressed scalar shader; it is now uint32-load + f16vec4-store
 (like the IQK/KT dequants), which cut the Q6_0 projection matmuls ~2× each.
 `MUL_MAT_ID` (MoE experts) is wired too, for both the vec and mat-mat paths. This
@@ -931,7 +937,9 @@ Takeaways:
   IQ4_KS/IQ4_K/IQ3_K/IQ3_KT (see the ¹/² rows above), lifting those types to ~302-383
   tok/s pp1024, at the legacy-K-quant / mainline level and well above the mmq-era
   numbers. The remaining IQK/KT types have since been added the same way
-  (see the ² footnote).
+  (see the ² footnote), and `Q6_0` has been added the same way too (dense
+  `MUL_MAT` on coopmat1/scalar devices; coopmat2 and `MUL_MAT_ID` keep the
+  flat dequant fallback).
 - TG is unaffected by the prompt-path work (decode uses the per-type `mul_mat_vec`
   Q8_1 kernels); IQ3_K trails IQ4_K/IQ3_KT as before (110-byte 2-byte-aligned blocks,
   unaligned uint32 loader).

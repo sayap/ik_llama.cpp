@@ -531,6 +531,34 @@ void main() {
             const uint k_pair = loadr_a;
             store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(v.x, v.z));
             store_a(loadc_a + l, k_pair + 8, FLOAT_TYPE_VEC2(v.y, v.w));
+#elif defined(DATA_A_Q6_0)
+            const uint idx = pos_a + (loadc_a + l) * p.stride_a / LOAD_VEC_A + loadr_a;
+
+            const uint ib = idx / 8;
+            const uint iqs = idx & 0x07;
+
+            // Q6_0: qs byte j holds elements j (low nibble) and j+16 (high
+            // nibble); qh byte j&7 supplies the two high bits (low nibble for
+            // j < 8, high nibble otherwise). A LOAD_VEC_A=4 granule is the
+            // byte pair (2g, 2g+1) -> elements (2g, 2g+1) and (2g+16, 2g+17).
+            const float d = float(data_a[ib].d);
+            const uint j0 = 2u * iqs;
+            const uint hshift = 4u * (j0 >> 3);
+            const uint h0 = uint(data_a[ib].qh[j0 & 7u]) >> hshift;
+            const uint h1 = uint(data_a[ib].qh[(j0 + 1u) & 7u]) >> hshift;
+            const uint qs0 = uint(data_a[ib].qs[j0]);
+            const uint qs1 = uint(data_a[ib].qs[j0 + 1u]);
+
+            const vec4 v = d * (vec4(
+                float((qs0 & 0xFu) | ((h0 << 4u) & 0x30u)),
+                float((qs0 >> 4u) | ((h0 << 2u) & 0x30u)),
+                float((qs1 & 0xFu) | ((h1 << 4u) & 0x30u)),
+                float((qs1 >> 4u) | ((h1 << 2u) & 0x30u))
+            ) - 32.0f);
+
+            const uint k_pair = loadr_a;
+            store_a(loadc_a + l, k_pair,     FLOAT_TYPE_VEC2(v.x, v.z));
+            store_a(loadc_a + l, k_pair + 8, FLOAT_TYPE_VEC2(v.y, v.w));
 #elif defined(DATA_A_Q8_0)
             const uint idx = pos_a + (loadc_a + l) * p.stride_a / LOAD_VEC_A + loadr_a;
 
