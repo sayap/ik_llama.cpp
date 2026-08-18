@@ -458,6 +458,21 @@ void matmul_shaders(bool fp16, bool matmul_id, bool coopmat, bool coopmat2, bool
     }
 #endif
 
+    if (!coopmat2 && !matmul_id) {
+        // IQK/KT inline-dequant A-tiles (mul_mm.comp) for the coopmat1 F16-WMMA
+        // and scalar paths, matching mainline's prompt path for its quant types.
+        // coopmat2 keeps the flat dequant-to-F16 fallback (the per-N-tile inline
+        // decode loses there; see ggml_vk_get_mul_mat_mat_pipeline) and
+        // MUL_MAT_ID keeps the dequant fallback (no expert-id byte addressing).
+        for (const char* tname : {"iq4_ks", "iq4_k", "iq3_k", "iq3_kt"}) {
+            std::string data_a_key = std::string("DATA_A_") + to_uppercase(tname);
+            string_to_spv(shader_name + "_" + tname + "_f32",         source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"LOAD_VEC_A", "4"},                         {"B_TYPE", "float"},            {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(shader_name + "_" + tname + "_f32_aligned", source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"LOAD_VEC_A", "4"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(shader_name + "_" + tname + "_f16",         source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"LOAD_VEC_A", "4"},                         {"B_TYPE", "float16_t"},        {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+            string_to_spv(shader_name + "_" + tname + "_f16_aligned", source_name, merge_maps(base_dict, {{"FLOAT_TYPE", FLOAT_TYPE(tname)}, {data_a_key, "1"}, {"LOAD_VEC_A", "4"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f16}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
+        }
+    }
+
     if (coopmat2 && !matmul_id) {
         // IQK / KT quant families (QK_K = 256, byte-addressed with per-row META
         // headers): coopmat2 tensor-core matmul with inline dequant. The A side

@@ -900,9 +900,17 @@ artifact — the iGPU sits at ~100% busy during the runs):
 | IQ3_KT (9.8 GB) | 130.1 | 154.6 | 13.13 |
 | MXFP4 (13.7 GB) | 133.7 → **383.2**¹ | 160.7 → **382.8**¹ | 13.75 |
 | mainline MXFP4 | 381.7 | 360.8 | 14.20 |
+| IQ4_KS (13.3 GB) | 137.5 → **356.1**² | 160.7 → **333.6**² | 14.07 |
+| IQ4_K (14.4 GB) | 141.2 → **359.1**² | 163.2 → **345.2**² | 13.34 |
+| IQ3_K (11.1 GB) | 119.9 → **302.4**² | 146.9 → **290.5**² | 11.25 |
+| IQ3_KT (9.8 GB) | 130.1 → **315.5**² | 154.6 → **299.5**² | 13.13 |
 
 ¹ after the follow-up MXFP4 coopmat1 inline-dequant port (see "coopmat1 devices");
 the original round measured the flat dequant-to-F16 fallback.
+² after the follow-up IQK/KT coopmat1 inline-dequant A-tile port (IQ4_KS, IQ4_K,
+IQ3_K, IQ3_KT — same note); the original round measured the fallback. The
+remaining IQK/KT types (IQ2_K, IQ5_K, IQ6_K, the other KS/KSS/KL/KT variants)
+are still on the fallback.
 
 Takeaways:
 
@@ -916,10 +924,11 @@ Takeaways:
   numbers above (IQ4_KS ~137 vs ~186, IQ3_KT ~130 vs ~170, MXFP4 ~134 vs ~178 at
   `-ub 512`). The typed decoders are still in `mul_mmq_funcs.comp` (dormant); re-adding
   their `CREATE_MMQ` pipelines — or porting PR #2332's coopmat1 inline-dequant A-tile
-  decodes — is the lever for these types. MXFP4 had the same gap (~35% at
-  `-ub 512`); it has since been closed by porting mainline's `DATA_A_MXFP4`
-  inline-dequant A-tile decode (see the MXFP4 bullet under "coopmat1 devices"),
-  which is the template for doing the same for the IQK/KT types.
+  decodes — is the lever for these types. **Update: that lever has since been pulled** —
+  `DATA_A_*` inline-dequant A-tile decoders now exist in `mul_mm.comp` for MXFP4 and
+  IQ4_KS/IQ4_K/IQ3_K/IQ3_KT (see the ¹/² rows above), lifting those types to ~302-383
+  tok/s pp1024, at the legacy-K-quant / mainline level and well above the mmq-era
+  numbers. The remaining IQK/KT types are the follow-up.
 - TG is unaffected by the prompt-path work (decode uses the per-type `mul_mat_vec`
   Q8_1 kernels); IQ3_K trails IQ4_K/IQ3_KT as before (110-byte 2-byte-aligned blocks,
   unaligned uint32 loader).
