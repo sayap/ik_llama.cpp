@@ -2401,11 +2401,13 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
     }
 
     // Needs to be kept up to date on shader changes
-    const uint32_t bank_conflict_offset = device->coopmat_support ? 8 : 1;
+    // Shared memory is FLOAT_TYPE_VEC2 with SHMEM_STRIDE = BK/2 + pad
+    // (pad = 4 for coopmat, 1 otherwise; see mul_mm.comp).
+    const uint32_t shmem_stride_pad = device->coopmat_support ? 4 : 1;
     const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
     const uint32_t warps = warptile[0] / warptile[10];
 
-    const uint32_t load_bufs = (warptile[1] + warptile[2]) * (warptile[3] + bank_conflict_offset) * type_size;
+    const uint32_t load_bufs = (warptile[1] + warptile[2]) * (warptile[3] / 2 + shmem_stride_pad) * 2 * type_size;
     const uint32_t mmid_row_ids = mul_mat_id ? (4096 * sizeof(uint32_t) + 4/*_ne1*/) : 0;
     const uint32_t coopmat_stage = device->coopmat_support ? warptile[7] * warptile[8] / warps * sizeof(float) : 0;
 
