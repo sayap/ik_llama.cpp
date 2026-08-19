@@ -940,7 +940,8 @@ non-coopmat `fp16` devices where mainline also uses it.
 mainline d83f72d46, Vulkan1 = Strix Halo
 8060S / RADV Mesa 26.1.6).** `llama-bench -dev Vulkan1 -r 3`, full offload
 (`-ngl 999`, `-fa 1`, 16 CPU threads; the "CPU" backend label is a `GGML_BACKEND_DL`
-artifact — the iGPU sits at ~100% busy during the runs):
+artifact — the iGPU sits at ~100% busy during the runs. The label was later fixed to
+report the runtime-registered backend, so re-running this round now shows `Vulkan`):
 
 | Qwen3.8-27B quant | pp1024 `-ub 512` | pp1024 `-ub 2048` | tg128 |
 |---|---:|---:|---:|
