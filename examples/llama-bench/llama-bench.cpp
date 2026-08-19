@@ -143,6 +143,38 @@ static std::string get_cpu_info() {
     return id;
 }
 
+// Note: the ggml library is compiled without the GGML_USE_* defines in GGML_BACKEND_DL
+// builds, so the backends in use cannot be determined at compile time (and
+// ggml_cpu_has_*() always returns 0). Instead, enumerate the backends that are
+// registered at runtime. This also works in classic builds, where the backends
+// register themselves when the ggml library is initialized.
+//
+// Must only be called after llama_backend_init(): in GGML_BACKEND_DL builds the
+// backends are only registered once they have been dynamically loaded. For this
+// reason it is lazily initialized on first use (and must not be used to
+// initialize static variables, which are evaluated before main()).
+static const std::vector<std::string> & get_registered_backends() {
+    static const std::vector<std::string> backends = [] {
+        std::vector<std::string> names;
+        for (size_t i = 0; i < ggml_backend_reg_get_count(); i++) {
+            names.emplace_back(ggml_backend_reg_get_name(i));
+        }
+        return names;
+    }();
+    return backends;
+}
+
+static bool has_registered_backend(const char * name_prefix) {
+    const std::string prefix(name_prefix);
+    for (const auto & backend : get_registered_backends()) {
+        // backend device names have the form "<name><index>" (e.g. "CUDA0", "Vulkan1")
+        if (backend.compare(0, prefix.size(), prefix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static std::string get_gpu_info() {
     std::string id;
 #ifdef GGML_USE_CUDA
@@ -179,6 +211,20 @@ static std::string get_gpu_info() {
     }
 #endif
     // TODO: other backends
+
+    // in GGML_BACKEND_DL builds the device descriptions cannot be queried at compile
+    // time, fall back to the names of the backends registered at runtime (e.g. "CUDA0")
+    if (id.empty()) {
+        for (const auto & backend : get_registered_backends()) {
+            if (backend == "CPU") {
+                continue;
+            }
+            if (!id.empty()) {
+                id += "/";
+            }
+            id += backend;
+        }
+    }
     return id;
 }
 
@@ -1304,14 +1350,17 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
 struct test {
     static const std::string build_commit;
     static const int build_number;
-    static const bool cuda;
-    static const bool vulkan;
-    static const bool metal;
-    static const bool sycl;
-    static const bool gpu_blas;
-    static const bool blas;
+    // the backend capabilities are queried at runtime from the ggml backend registry
+    // (lazily initialized, see get_registered_backends()), so that they are also
+    // correct in GGML_BACKEND_DL builds
+    static bool has_cuda();
+    static bool has_vulkan();
+    static bool has_metal();
+    static bool has_sycl();
+    static bool has_gpu_blas();
+    static bool has_blas();
     static const std::string cpu_info;
-    static const std::string gpu_info;
+    static const std::string & get_gpu_info();
     std::string model_filename;
     std::string model_type;
     uint64_t model_size;
@@ -1465,22 +1514,22 @@ struct test {
     }
 
     static std::string get_backend() {
-        if (cuda) {
+        if (has_cuda()) {
             return GGML_CUDA_NAME;
         }
-        if (vulkan) {
+        if (has_vulkan()) {
             return "Vulkan";
         }
-        if (metal) {
+        if (has_metal()) {
             return "Metal";
         }
-        if (sycl) {
+        if (has_sycl()) {
             return GGML_SYCL_NAME;
         }
-        if (gpu_blas) {
+        if (has_gpu_blas()) {
             return "GPU BLAS";
         }
-        if (blas) {
+        if (has_blas()) {
             return "BLAS";
         }
 
@@ -1535,9 +1584,9 @@ struct test {
         bool is_gen = n_gen > 0;
         std::vector<std::string> values = {
             build_commit, std::to_string(build_number),
-            std::to_string(cuda), std::to_string(vulkan),
-            std::to_string(metal), std::to_string(sycl), std::to_string(has_rpc), std::to_string(gpu_blas), std::to_string(blas),
-            cpu_info, gpu_info,
+            std::to_string(has_cuda()), std::to_string(has_vulkan()),
+            std::to_string(has_metal()), std::to_string(has_sycl()), std::to_string(has_rpc), std::to_string(has_gpu_blas()), std::to_string(has_blas()),
+            cpu_info, get_gpu_info(),
             model_filename, model_type, std::to_string(model_size), std::to_string(model_n_params),
             std::to_string(n_batch), std::to_string(n_ubatch),
             std::to_string(is_gen ? n_threads.first : n_threads.second), ggml_type_name(type_k), ggml_type_name(type_v),
@@ -1588,14 +1637,22 @@ struct test {
 
 const std::string test::build_commit = LLAMA_COMMIT;
 const int         test::build_number = LLAMA_BUILD_NUMBER;
-const bool        test::cuda         = !!ggml_cpu_has_cuda();
-const bool        test::vulkan       = !!ggml_cpu_has_vulkan();
-const bool        test::metal        = !!ggml_cpu_has_metal();
-const bool        test::gpu_blas     = !!ggml_cpu_has_gpublas();
-const bool        test::blas         = !!ggml_cpu_has_blas();
-const bool        test::sycl         = !!ggml_cpu_has_sycl();
 const std::string test::cpu_info     = get_cpu_info();
-const std::string test::gpu_info     = get_gpu_info();
+
+// Note: lazily initialized on first use, which happens after llama_backend_init()
+// has been called, because in GGML_BACKEND_DL builds the backends are only known
+// after they have been dynamically loaded
+bool test::has_cuda()     { static const bool v = has_registered_backend(GGML_CUDA_NAME); return v; }
+bool test::has_vulkan()   { static const bool v = has_registered_backend("Vulkan");       return v; }
+bool test::has_metal()    { static const bool v = has_registered_backend("Metal");        return v; }
+bool test::has_sycl()     { static const bool v = has_registered_backend(GGML_SYCL_NAME); return v; }
+bool test::has_gpu_blas() { static const bool v = has_cuda() || has_vulkan() || has_sycl(); return v; }
+bool test::has_blas()     { return false; }
+
+const std::string & test::get_gpu_info() {
+    static const std::string gpu_info = ::get_gpu_info();
+    return gpu_info;
+}
 
 struct printer {
     virtual ~printer() {}
