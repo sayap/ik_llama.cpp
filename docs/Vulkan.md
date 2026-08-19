@@ -603,6 +603,43 @@ stay on the same backend as the view source.
   `ggml_vk_op_f32` turns any future cross-backend miss into a clear error instead of
   a segfault.
 
+### 16a. DSV4 prompt processing: op coverage ≠ GPU residency at real shapes
+
+A brief full-offload test (no `-cmoe`, `-ub 2048`) showed slow PP with high CPU usage:
+the op set is complete (sections above), but at real model shapes several nodes still
+fail `supports_op` and fall back to the CPU backend — each one splitting the graph per
+layer per ubatch with GPU→CPU→GPU copies, the same failure mode as the original
+FUSED_UP_GATE/IQK fallback (see "Fixed: large IQK/KT models were slow on Vulkan").
+Note the end-to-end DSV4 validation ran `-sm layer -cmoe` (MoE FFN on CPU), so it never
+exercised full-GPU PP throughput. Three culprits:
+
+- **`INDEXER_TOPK` is gated to `n_top_k <= 64`** (`supports_op` rejects
+  `op->ne[0] > 64`). DSA-family checkpoints configure `attention.indexer.top_k` in
+  the thousands (2048 is the value the `--dsa-top-k` tuning comment in
+  `build_deepseek2.cpp` cites), so the per-layer indexer top-k — the default path,
+  `fused_idx_topk` defaults to true — runs on the CPU. The tournament-select shader
+  (`indexer_topk_select.comp`) needs tiling for large k. The unfused alternative
+  (`ggml_top_k` → `GGML_OP_TOP_K`) has no Vulkan implementation either, so `-no-fidx`
+  does not help. `tests/test-dsa.cpp` only exercises `n_top_k` 6/8, which is why it
+  passes while real models fall back.
+- **`HADAMARD` has no Vulkan shader** (CUDA has `hadamard.cu`). DSV4 inserts one per
+  layer on the indexer q (`dsv4_build_lid_top_k_shared`), on the compressed latent
+  state (`HC_PRE`/`HC_POST` neighborhood), and on q/kv when `k_cache_hadamard` is on —
+  which is **forced** on for checkpoints with Hadamard-folded `wv_b`/`wk_b_pp`
+  (llama.cpp logs "model has Hadamard-folded wv_b/wk_b_pp; forcing
+  k_cache_hadamard=true").
+- **MoE `MUL_MAT_ID`** is covered for DSV4's MXFP4 fused experts on coopmat2: the
+  native `matmul_id_mxfp4_f16` was added precisely because the flat dequant
+  materialized the whole 256×4096×4096 expert matrix (~8 GiB) and OOM'd. Residual
+  gaps: coopmat1/scalar devices still take the flat dequant for MXFP4 `MUL_MAT_ID`,
+  and any expert tensor in an IQK/KT or legacy-K type does too, even on coopmat2
+  (priority item 2 below).
+
+Fix directions: tile `indexer_topk_select.comp` for k in the thousands (a bucketed
+pre-pass like the CPU `iqk_bucket_topk`, or a multi-round threshold-rescan), port
+`hadamard.cu` (block sizes 64/128/256/512), and the priority-2 matmul_id work for
+non-MXFP4 expert types.
+
 ### 17. MTP / multi-context device sharing
 
 Enabling MTP (`--spec-type mtp:n_max=...,p_min=...`) makes `common_speculative_init`
@@ -823,6 +860,11 @@ record PP tok/s and TG tok/s for both.
    "DSA / GLM-DSA / DeepSeek-V4 sparse-attention ops" above and `tests/test-dsa.cpp`).
    End-to-end DeepSeek-V4 is now blocked by a separate ggml-core scheduler/gallocr bug for
    in-place view ops at a GPU→CPU boundary (see "Known gap: hybrid CPU/GPU view-allocation").
+   **Follow-up finding (real-model PP)**: op-level coverage is complete, but a
+   full-offload prompt run still executes partially on the CPU — `INDEXER_TOPK`'s
+   `supports_op` gate rejects `n_top_k > 64` (real checkpoints use 2048), and
+   `HADAMARD` and `GGML_OP_TOP_K` have no Vulkan implementation at all. See "DSV4
+   prompt processing: op coverage ≠ GPU residency at real shapes" above.
 4. **Hybrid CPU/GPU view-allocation (`ROPE_BACK`)** — **fixed**: the scheduler now keeps
    in-place view ops on the view source's backend, so `-sm layer -cmoe` no longer crashes
    on a null device buffer (see "Hybrid CPU/GPU view-allocation" above).
