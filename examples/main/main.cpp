@@ -854,9 +854,19 @@ int main(int argc, char ** argv) {
 
                 llama_batch batch = {};
                 if (need_prompt_target_features) {
+                    // logits=false: MTP/DFlash target features are the per-token hidden
+                    // states (embeddings), which are extracted for all rows regardless of
+                    // the logits flags; requesting logits for the whole prompt would run
+                    // the lm_head as a full-width mat-mat over the ubatch. The last
+                    // prompt token's logits are produced by the "keep last output only"
+                    // fallback, like the non-speculative path below.
                     batch = llama_batch_init(n_eval, 0, 1);
                     for (int j = 0; j < n_eval; ++j) {
-                        common_batch_add(batch, embd[i + j], n_past + j, { 0 }, true);
+                        // flag only the last prompt token of the last chunk: its logits
+                        // are needed to sample the first generated token (the hidden-state
+                        // capture below works off the embeddings, not the logits)
+                        const bool last_prompt_tok = (j == n_eval - 1) && (i + n_eval >= (int) embd.size());
+                        common_batch_add(batch, embd[i + j], n_past + j, { 0 }, last_prompt_tok);
                     }
                 } else {
                     batch = llama_batch_get_one(&embd[i], n_eval, n_past, 0);

@@ -1260,15 +1260,21 @@ ggml_cgraph * llm_build_context::build_openpangu() {
     }
 
     // select only the output tokens (the framework binds n_outputs rows, not all n_tokens).
-    // With MTP enabled, keep every token: the speculative framework consumes per-token
-    // hidden states (result_norm via pooling) to warm up / feed the NextN head.
+    // With MTP, keep every token in the normed states: the speculative framework consumes
+    // per-token hidden states (result_norm via pooling) to warm up / feed the NextN head.
+    // The lm_head multiply itself is still cropped to the n_outputs logit rows.
+    struct ggml_tensor * inp_out_ids = nullptr;
     if (!cparams.mtp) {
-        ggml_tensor * inp_out_ids = build_inp_out_ids();
+        inp_out_ids = build_inp_out_ids();
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
     cur = llm_build_norm(ctx0, cur, hparams, model.output_norm, NULL, LLM_NORM_RMS, cb, -1);
     cb(cur, "result_norm", -1);
+    if (cparams.mtp && n_tokens > 1 && n_outputs < n_tokens) {
+        struct ggml_tensor * inp_out_ids_mtp = build_inp_out_ids();
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids_mtp);
+    }
     cur = llm_build_lora_mm(lctx, ctx0, model.output, cur);
     cb(cur, "result_output", -1);
     ggml_build_forward_expand(gf, cur);

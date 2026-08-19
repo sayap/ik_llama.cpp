@@ -26,6 +26,12 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
 
         ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
         ggml_tensor * inp_out_ids = (n_tokens > 1 && !lctx.cparams.mtp) ? build_inp_out_ids() : nullptr;
+        // With MTP the last layer must keep every token (the NextN head consumes the
+        // per-token normed states), but the lm_head only needs the n_outputs logit rows:
+        // crop them at the output instead of multiplying the whole ubatch against the
+        // vocab (a full-width lm_head matmul is very expensive on some backends, e.g.
+        // the Vulkan dequant fallback for IQK/KT output tensors).
+        ggml_tensor * inp_out_ids_mtp = (lctx.cparams.mtp && n_tokens > 1 && n_outputs < n_tokens) ? build_inp_out_ids() : nullptr;
         ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
         lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
@@ -64,7 +70,7 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
             inpL = cur;
         }
 
-        cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
+        cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb, true, inp_out_ids_mtp);
         cb(cur, "result_output", -1);
     }
 
@@ -97,6 +103,9 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
         ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
         ggml_tensor * inp_out_ids = (n_tokens > 1 && !lctx.cparams.mtp) ? build_inp_out_ids() : nullptr;
+        // see build_qwen35moe(): with MTP keep full-row normed states for the NextN
+        // head, but crop the lm_head multiply to the n_outputs logit rows
+        ggml_tensor * inp_out_ids_mtp = (lctx.cparams.mtp && n_tokens > 1 && n_outputs < n_tokens) ? build_inp_out_ids() : nullptr;
         ggml_tensor * KQ_mask = build_inp_KQ_mask();
 
         lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
@@ -130,7 +139,7 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             inpL = cur;
         }
 
-        cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
+        cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb, true, inp_out_ids_mtp);
         cb(cur, "result_output", -1);
     }
 

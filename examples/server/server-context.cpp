@@ -555,10 +555,6 @@ void server_slot::reset() {
     task.reset();
 }
 
-bool server_slot::need_embd() const {
-    return embedding || uses_mtp();
-}
-
 bool server_slot::uses_mtp() const {
     return params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
 }
@@ -4145,7 +4141,17 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     }
 
                     int p0 = system_tokens.size() + slot.cache_tokens.pos_next();
-                    common_batch_add(batch, cur_tok, p0, { slot.id }, slot.need_embd());
+                    // Do not request logits for every prompt token when the slot uses MTP/
+                    // DFlash target features: those stages consume the target's per-token
+                    // hidden states (embeddings), which are extracted for all rows
+                    // regardless of the batch logits flags. Requesting logits for the
+                    // whole prompt makes the lm_head run as a full-width mat-mat over the
+                    // ubatch (n_outputs == n_tokens), which is very expensive on some
+                    // backends (e.g. the Vulkan dequant fallback for IQK/KT output
+                    // tensors) and copies n_vocab-wide logits nobody reads. The last
+                    // prompt token is flagged below ("extract the logits only for the
+                    // last token").
+                    common_batch_add(batch, cur_tok, p0, { slot.id }, slot.embedding);
 
                     slot.cache_tokens.push_back(cur_tok);
 
