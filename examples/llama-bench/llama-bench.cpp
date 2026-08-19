@@ -396,7 +396,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ngl, --n-gpu-layers <n>            (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  --n-cpu-moe <n>                     (default: none)\n");
     printf("  -rpc, --rpc <rpc_servers>           (default: %s)\n", join(cmd_params_defaults.rpc_servers, ",").c_str());
-    printf("  -dev, --device <dev1,dev2,...>       (default: %s)\n", join(cmd_params_defaults.devices, ",").c_str());
+    printf("  -dev, --device <dev0/dev1/...>       (default: auto; 'none' = don't offload)\n");
+    printf("  --list-devices                       list available devices and exit\n");
     printf("  -sm, --split-mode <none|layer|graph>(default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                 (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>        (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -550,6 +551,67 @@ bool operator==(const std::vector<llama_model_tensor_buft_override> & lhs, const
 }
 }
 
+// Ported from mainline llama-bench -dev semantics:
+//   - "auto" (default): use the devices of the default backend
+//   - "none":           do not offload
+//   - device names separated by '/' are used together in one run (e.g. "CUDA0/Vulkan0")
+// Multiple device sets separated by ',' are benchmarked as separate variants
+// (e.g. "-dev CUDA0,CUDA0/Vulkan0" benchmarks CUDA0 alone, then CUDA0+Vulkan0).
+// Note: this differs from llama-cli/llama-server, where '-dev dev1,dev2' uses
+// both devices together in a single run.
+static std::string parse_devices_arg(const std::string & value) {
+    std::string trimmed = string_strip(value);
+    if (trimmed.empty()) {
+        throw std::invalid_argument("no devices specified");
+    }
+    if (trimmed == "auto") {
+        return "";
+    }
+    auto dev_names = string_split<std::string>(trimmed, '/');
+    if (dev_names.size() == 1 && string_strip(dev_names[0]) == "none") {
+        return "none";
+    }
+    // make sure dynamically loadable backends are registered (GGML_BACKEND_DL)
+    ggml_backend_load_all();
+    for (auto & dev_name : dev_names) {
+        dev_name = string_strip(dev_name);
+        if (dev_name.empty()) {
+            throw std::invalid_argument("invalid device specification");
+        }
+        // RPC devices ("RPC<index>[<host:port>]") are resolved later from -rpc
+        if (dev_name.compare(0, 3, "RPC") == 0) {
+            continue;
+        }
+        bool found = false;
+        for (size_t i = 0; i < ggml_backend_reg_get_count(); i++) {
+            if (strcmp(ggml_backend_reg_get_name(i), "CPU") == 0) {
+                continue;
+            }
+            // the accepted device names are the buffer type names of the registered
+            // backends (e.g. "CUDA0", "Vulkan1"), matching what llama_model_load uses
+            ggml_backend_buffer_type_t buft = ggml_backend_reg_get_default_buffer_type(i);
+            if (buft != nullptr && dev_name == ggml_backend_buft_name(buft)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            throw std::invalid_argument("invalid device: " + dev_name);
+        }
+    }
+    return join(dev_names, ",");
+}
+
+static std::string devices_to_string(const std::string & devices) {
+    if (devices.empty()) {
+        return "auto";
+    }
+    if (devices == "none") {
+        return "none";
+    }
+    return join(string_split<std::string>(devices, ','), "/");
+}
+
 static cmd_params parse_cmd_params(int argc, char ** argv) {
     cmd_params params;
     std::string arg;
@@ -698,12 +760,47 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 break;
             }
             params.rpc_servers.push_back(argv[i]);
+        } else if (arg == "--list-devices") {
+            ggml_backend_load_all();
+            printf("Available devices:\n");
+            int n_dev = 0;
+            for (size_t i = 0; i < ggml_backend_reg_get_count(); i++) {
+                if (strcmp(ggml_backend_reg_get_name(i), "CPU") == 0) {
+                    continue;
+                }
+                ggml_backend_buffer_type_t buft = ggml_backend_reg_get_default_buffer_type(i);
+                if (!buft) {
+                    continue;
+                }
+                size_t dev_free = 0, dev_total = 0;
+                ggml_backend_reg_get_device_memory(i, &dev_free, &dev_total);
+                printf("  %s (%zu MiB, %zu MiB free)\n", ggml_backend_buft_name(buft), dev_total >> 20, dev_free >> 20);
+                n_dev++;
+            }
+            if (n_dev == 0) {
+                printf("  (none)\n");
+            }
+            exit(0);
         } else if (arg == "-dev" || arg == "--device") {
             if (++i >= argc) {
                 invalid_param = true;
                 break;
             }
-            params.devices.push_back(argv[i]);
+            // device sets separated by ',' are benchmarked as separate variants
+            // (see parse_devices_arg for the semantics)
+            auto combos = string_split<std::string>(argv[i], split_delim);
+            for (const auto & combo : combos) {
+                try {
+                    params.devices.push_back(parse_devices_arg(combo));
+                } catch (const std::exception & e) {
+                    fprintf(stderr, "error: %s\n", e.what());
+                    invalid_param = true;
+                    break;
+                }
+            }
+            if (invalid_param) {
+                break;
+            }
         } else if (arg == "-sm" || arg == "--split-mode") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -1373,6 +1470,7 @@ struct test {
     ggml_type type_v;
     int n_gpu_layers;
     llama_split_mode split_mode;
+    std::string devices;
     int main_gpu;
     bool no_kv_offload;
     bool flash_attn;
@@ -1421,6 +1519,7 @@ struct test {
         type_v = inst.type_v;
         n_gpu_layers = inst.n_gpu_layers;
         split_mode = inst.split_mode;
+        devices = inst.devices;
         main_gpu = inst.main_gpu;
         no_kv_offload = inst.no_kv_offload;
         flash_attn = inst.flash_attn;
@@ -1591,6 +1690,7 @@ struct test {
             std::to_string(n_batch), std::to_string(n_ubatch),
             std::to_string(is_gen ? n_threads.first : n_threads.second), ggml_type_name(type_k), ggml_type_name(type_v),
             std::to_string(n_gpu_layers), split_mode_str(split_mode),
+            devices_to_string(devices),
             std::to_string(main_gpu), std::to_string(no_kv_offload), std::to_string(flash_attn),
             std::to_string(mla_attn), std::to_string(attn_max_batch), ser_to_string(ser), std::to_string(reuse),
             tensor_split_str, std::to_string(use_mmap), std::to_string(embeddings),
@@ -1614,7 +1714,7 @@ struct test {
             "model_filename", "model_type", "model_size", "model_n_params",
             "n_batch", "n_ubatch",
             "n_threads", "type_k", "type_v",
-            "n_gpu_layers", "split_mode",
+            "n_gpu_layers", "split_mode", "devices",
             "main_gpu", "no_kv_offload", "flash_attn", "mla_attn", "attn_max_batch", "ser", "reuse",
             "tensor_split", "use_mmap", "embeddings", "repack", "mqkv", "muge", "defer_experts", "fused_moe", "grouped_er",
             "no_fused_up_gate", "use_thp", "no_ooae", "rcache", "sas", "max_gpu", "cuda_params", "override_tensor",
@@ -1796,6 +1896,9 @@ struct markdown_printer : public printer {
         if (field == "reuse") {
             return 2;
         }
+        if (field == "devices") {
+            return -12;
+        }
         if (field == "ser") {
             return 10;
         }
@@ -1874,6 +1977,9 @@ struct markdown_printer : public printer {
         }
         if (field == "reuse") {
             return "gr";
+        }
+        if (field == "devices") {
+            return "dev";
         }
         if (field == "ser") {
             return "ser";
@@ -1977,6 +2083,9 @@ struct markdown_printer : public printer {
         }
         if (params.reuse.size() > 1 || params.reuse != cmd_params_defaults.reuse) {
             fields.emplace_back("reuse");
+        }
+        if (params.devices.size() > 1 || params.devices != cmd_params_defaults.devices) {
+            fields.emplace_back("devices");
         }
         if (params.ser.size() > 1 || params.ser != cmd_params_defaults.ser) {
             fields.emplace_back("ser");

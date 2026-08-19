@@ -154,6 +154,13 @@ makes a device like the AMD Radeon 8060S show up as `Vulkan1` and selectable via
 `-dev CUDA0`, `-dev Vulkan1`, `-dev CUDA0,Vulkan1` etc. select devices from the ggml
 backend registry. See `docs/build.md` and the `-dev` commit for details.
 
+Note the separator semantics differ between the tools: in `llama-cli`/`llama-server` a
+comma-joined list (`-dev CUDA0,Vulkan1`) uses the devices together in one run, while
+`llama-bench` (ported to match mainline) uses `/` for that (`-dev CUDA0/Vulkan1`) and
+reserves the comma for separate benchmark variants (`-dev CUDA0,Vulkan1` benchmarks
+CUDA0 alone, then Vulkan1 alone). `llama-bench --list-devices` prints the accepted
+device names.
+
 ### 7. Gated delta-net (`qwen35` / `qwen3next`)
 
 The four recurrent ops are now implemented on Vulkan (see "Op coverage"):
