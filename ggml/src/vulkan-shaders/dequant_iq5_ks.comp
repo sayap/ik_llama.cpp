@@ -10,26 +10,25 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define BLOCK_BYTES 168
 #define META 4
 
-vec4 iq5ks_lo(uint qw, uint hw, uint sft_h, uint vo) {
-    return vec4(
-        float(iq5nl_values[((qw & 0xFu) | ((((hw & 0xffu) >> sft_h) & 1u) << 4)) + vo]),
-        float(iq5nl_values[((((qw >> 8) & 0xFu) | ((((hw >> 8) & 0xffu) >> sft_h & 1u) << 4))) + vo]),
-        float(iq5nl_values[((((qw >> 16) & 0xFu) | ((((hw >> 16) & 0xffu) >> sft_h & 1u) << 4))) + vo]),
-        float(iq5nl_values[((((qw >> 24) & 0xFu) | ((((hw >> 24) & 0xffu) >> sft_h & 1u) << 4))) + vo]));
-}
-
-vec4 iq5ks_hi(uint qw, uint hw, uint sft_h, uint vo) {
-    return vec4(
-        float(iq5nl_values[((((qw >> 4) & 0xFu) | ((((hw & 0xffu) >> sft_h) & 1u) << 4))) + vo]),
-        float(iq5nl_values[((((qw >> 12) & 0xFu) | ((((hw >> 8) & 0xffu) >> sft_h & 1u) << 4))) + vo]),
-        float(iq5nl_values[((((qw >> 20) & 0xFu) | ((((hw >> 16) & 0xffu) >> sft_h & 1u) << 4))) + vo]),
-        float(iq5nl_values[((((qw >> 28) & 0xFu) | ((((hw >> 24) & 0xffu) >> sft_h & 1u) << 4))) + vo]));
-}
+// Value table staged in shared memory: entry i = iq5nl_values[i].
+shared int8_t iq5ks_tbl[64];
 
 void main() {
-    const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
-    const uint ib64 = gl_LocalInvocationID.x % 4;
-    const uint part = (gl_LocalInvocationID.x % 8) / 4;
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint idx = tid; idx < 16; idx += 256) {
+        const uint w = iq5nl_values_packed[idx];
+        iq5ks_tbl[4 * idx + 0] = int8_t(w & 0xffu);
+        iq5ks_tbl[4 * idx + 1] = int8_t((w >> 8) & 0xffu);
+        iq5ks_tbl[4 * idx + 2] = int8_t((w >> 16) & 0xffu);
+        iq5ks_tbl[4 * idx + 3] = int8_t(w >> 24);
+    }
+    barrier();
+
+    // 64 threads per block: thread (ib64, part, j) decodes one vec4.
+    const uint ib = gl_WorkGroupID.x * 4 + tid / 64;
+    const uint ib64 = (tid % 64) / 16;
+    const uint part = (tid % 16) / 8;
+    const uint j = tid % 8;
 
     if (ib >= p.nel / QUANT_K) {
         return;
@@ -44,7 +43,7 @@ void main() {
     const float d = uintBitsToFloat(data_a32[(row * row_bytes) / 4]);
     const uint sc01 = data_a32[block_byte / 4];
     const uint sc23 = data_a32[block_byte / 4 + 1];
-    const uint b_idx = QUANT_K * ib + 64 * ib64 + 32 * part;
+    const uint b_idx = QUANT_K * ib + 64 * ib64 + 32 * part + 4 * j;
 
     const uint sc_dw = ib64 < 2 ? sc01 : sc23;
     const uint sc = (sc_dw >> (16 * (ib64 & 1) + 8 * part)) & 0xffu;
@@ -54,13 +53,19 @@ void main() {
     const uint qs_dw = (block_byte + 8 + 32 * ib64) / 4;
     const uint qh_dw = (block_byte + 136) / 4;
 
+    const uint qw = data_a32[qs_dw + j];
+    const uint hw = data_a32[qh_dw + j];
     if (part == 0) {
-        [[unroll]] for (uint j = 0; j < 8; ++j) {
-            iqk_store4(b_idx + 4 * j, dl * iq5ks_lo(data_a32[qs_dw + j], data_a32[qh_dw + j], sft_h, v_off));
-        }
+        iqk_store4(b_idx, dl * vec4(
+            float(iq5ks_tbl[((qw & 0xFu)       | ((((hw & 0xffu) >> sft_h) & 1u) << 4)) + v_off]),
+            float(iq5ks_tbl[(((qw >> 8) & 0xFu)  | ((((hw >> 8 & 0xffu) >> sft_h) & 1u) << 4)) + v_off]),
+            float(iq5ks_tbl[(((qw >> 16) & 0xFu) | ((((hw >> 16 & 0xffu) >> sft_h) & 1u) << 4)) + v_off]),
+            float(iq5ks_tbl[(((qw >> 24) & 0xFu) | ((((hw >> 24 & 0xffu) >> sft_h) & 1u) << 4)) + v_off])));
     } else {
-        [[unroll]] for (uint j = 0; j < 8; ++j) {
-            iqk_store4(b_idx + 4 * j, dl * iq5ks_hi(data_a32[qs_dw + j], data_a32[qh_dw + j], sft_h, v_off));
-        }
+        iqk_store4(b_idx, dl * vec4(
+            float(iq5ks_tbl[(((qw >> 4) & 0xFu)  | ((((hw & 0xffu) >> sft_h) & 1u) << 4)) + v_off]),
+            float(iq5ks_tbl[(((qw >> 12) & 0xFu) | ((((hw >> 8 & 0xffu) >> sft_h) & 1u) << 4)) + v_off]),
+            float(iq5ks_tbl[(((qw >> 20) & 0xFu) | ((((hw >> 16 & 0xffu) >> sft_h) & 1u) << 4)) + v_off]),
+            float(iq5ks_tbl[(((qw >> 28) & 0xFu) | ((((hw >> 24 & 0xffu) >> sft_h) & 1u) << 4)) + v_off])));
     }
 }

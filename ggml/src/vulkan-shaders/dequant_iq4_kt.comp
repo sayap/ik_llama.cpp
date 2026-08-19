@@ -11,10 +11,12 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define META 4
 
 void main() {
-    // 8 threads per block, one 32-element sub-block per thread (original mapping,
-    // but with u32 loads, f16vec4 stores and the optional dot4 hash).
-    const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
-    const uint ib32 = gl_LocalInvocationID.x % 8;
+    // 64 threads per block: thread (g, j) decodes the 4 elements of
+    // sub-block g (of 8), byte j (of 8). One hash chain and one f16vec4
+    // output per thread keeps the register footprint minimal.
+    const uint ib = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
+    const uint g  = (gl_LocalInvocationID.x % 64) / 8;
+    const uint j  = gl_LocalInvocationID.x % 8;
 
     if (ib >= p.nel / QUANT_K) {
         return;
@@ -27,25 +29,22 @@ void main() {
     const uint block_byte = row * row_bytes + META + (ib % nbpb) * BLOCK_BYTES;
 
     const float d = uintBitsToFloat(data_a32[(row * row_bytes) / 4]);
-    const uint qs32 = data_a32[(block_byte + 4 * ib32) / 4];
+    const uint qs32 = data_a32[(block_byte + 4 * g) / 4];
     const float dl = d * (float((qs32 & 0xffu) >> 1) - 64.0f);
     const uint idx0 = ((qs32 & 1u) << 15) + 4096u;
 
-    const uint b_idx = QUANT_K * ib + 32 * ib32;
-    const uint ql0 = data_a32[(block_byte + 32 + 8 * ib32) / 4];
-    const uint ql1 = data_a32[(block_byte + 32 + 8 * ib32) / 4 + 1];
-    const uint qh0 = data_a32[(block_byte + 96 + 8 * (ib32 % 4)) / 4];
-    const uint qh1 = data_a32[(block_byte + 96 + 8 * (ib32 % 4)) / 4 + 1];
-    const uint sh_shift = 8 - 4 * (ib32 / 4);
+    const uint b_idx = QUANT_K * ib + 32 * g + 4 * j;
 
-    [[unroll]] for (uint j = 0; j < 8; ++j) {
-        const uint qlb = ((j < 4 ? ql0 : ql1) >> (8 * (j & 3))) & 0xffu;
-        const uint qhb = ((j < 4 ? qh0 : qh1) >> (8 * (j & 3))) & 0xffu;
-        uint x = qlb
-               + ((qhb << sh_shift) & 0xf00u)
-               + ((qs32 >> (8 + 3 * j)) & 7u) * 4096u
-               + idx0;
-        const vec4 v = iqk_hash_values(x, false, 0u);
-        iqk_store4(b_idx + 4 * j, dl * v);
-    }
+    const uint ql_dw = data_a32[(block_byte + 32 + 8 * g) / 4 + (j / 4)];
+    const uint qh_dw = data_a32[(block_byte + 96 + 8 * (g % 4)) / 4 + (j / 4)];
+    const uint sh_shift = 8 - 4 * (g / 4);
+
+    const uint qlb = (ql_dw >> (8 * (j & 3))) & 0xffu;
+    const uint qhb = (qh_dw >> (8 * (j & 3))) & 0xffu;
+    uint x = qlb
+           + ((qhb << sh_shift) & 0xf00u)
+           + ((qs32 >> (8 + 3 * j)) & 7u) * 4096u
+           + idx0;
+    const vec4 v = iqk_hash_values(x, false, 0u);
+    iqk_store4(b_idx, dl * v);
 }

@@ -18,8 +18,11 @@ vec4 iq3k_unpack(uint qw, uint hw, uint shift_l, uint shift_h, uint vo) {
 }
 
 void main() {
-    const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
-    const uint ib32 = gl_LocalInvocationID.x % 8;
+    // 32 threads per block: thread (g, j) decodes the low- and high-half
+    // vec4s of sub-block g (of 8), qs/qh dword j (of 4).
+    const uint ib = gl_WorkGroupID.x * 8 + gl_LocalInvocationID.x / 32;
+    const uint g  = (gl_LocalInvocationID.x % 32) / 4;
+    const uint j  = gl_LocalInvocationID.x % 4;
 
     if (ib >= p.nel / QUANT_K) {
         return;
@@ -33,23 +36,21 @@ void main() {
     const float d = iqk_f16_to_f32(iqk_load_u16(block_byte));
     const uint extra = iqk_load_u16(block_byte + 2);
     const uint sh = iqk_load_u16(block_byte + 4);
-    const uint b_idx = QUANT_K * ib + 32 * ib32;
+    const uint b_idx = QUANT_K * ib + 32 * g + 4 * j;
 
-    const uint sc = data_a[block_byte + 6 + ib32];
-    const float s1 = ((sh >> (2 * ib32)) & 1u) != 0 ? -1.0f : 1.0f;
-    const float s2 = ((sh >> (2 * ib32 + 1)) & 1u) != 0 ? -1.0f : 1.0f;
+    const uint sc = data_a[block_byte + 6 + g];
+    const float s1 = ((sh >> (2 * g)) & 1u) != 0 ? -1.0f : 1.0f;
+    const float s2 = ((sh >> (2 * g + 1)) & 1u) != 0 ? -1.0f : 1.0f;
     const float dl1 = d * (2.0f * float(sc & 0xFu) + 1.0f) * s1;
     const float dl2 = d * (2.0f * float((sc >> 4) & 0xFu) + 1.0f) * s2;
-    const uint e = extra >> (2 * ib32);
+    const uint e = extra >> (2 * g);
     const uint v1_off = (e & 1u) != 0 ? 8u : 0u;
     const uint v2_off = (e & 2u) != 0 ? 8u : 0u;
-    const uint shift_l = 2 * (ib32 % 4);
-    const uint shift_h = ib32 % 8;
-    const uint qs_base = block_byte + 14 + (ib32 / 4) * 32;
+    const uint shift_l = 2 * (g % 4);
+    const uint shift_h = g % 8;
+    const uint qs_base = block_byte + 14 + (g / 4) * 32;
     const uint qh_base = block_byte + 78;
 
-    [[unroll]] for (uint j = 0; j < 4; ++j) {
-        iqk_store4(b_idx + 4 * j,      dl1 * iq3k_unpack(iqk_load_u32a(qs_base + 4 * j),      iqk_load_u32a(qh_base + 4 * j),      shift_l, shift_h, v1_off));
-        iqk_store4(b_idx + 16 + 4 * j, dl2 * iq3k_unpack(iqk_load_u32a(qs_base + 16 + 4 * j), iqk_load_u32a(qh_base + 16 + 4 * j), shift_l, shift_h, v2_off));
-    }
+    iqk_store4(b_idx,      dl1 * iq3k_unpack(iqk_load_u32a(qs_base + 4 * j),      iqk_load_u32a(qh_base + 4 * j),      shift_l, shift_h, v1_off));
+    iqk_store4(b_idx + 16, dl2 * iq3k_unpack(iqk_load_u32a(qs_base + 16 + 4 * j), iqk_load_u32a(qh_base + 16 + 4 * j), shift_l, shift_h, v2_off));
 }

@@ -11,8 +11,13 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define META 4
 
 void main() {
-    const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
-    const uint ib32 = gl_LocalInvocationID.x % 8;
+    // 32 threads per block: thread (g, j) handles the 8 elements of
+    // sub-block g (of 8), ql word j (of 4). 8 elements per thread keep the
+    // register footprint small (two dependent mul chains, two f16vec4
+    // outputs) so occupancy covers the chain latency.
+    const uint ib = gl_WorkGroupID.x * 8 + gl_LocalInvocationID.x / 32;
+    const uint g  = (gl_LocalInvocationID.x % 32) / 4;
+    const uint j  = gl_LocalInvocationID.x % 4;
 
     if (ib >= p.nel / QUANT_K) {
         return;
@@ -26,30 +31,26 @@ void main() {
 
     const float d = uintBitsToFloat(data_a32[(row * row_bytes) / 4]);
     const uint sc = data_a32[block_byte / 4];
-    const uint ql0 = data_a32[(block_byte + 4) / 4 + 2 * ib32];
-    const uint ql1 = data_a32[(block_byte + 4) / 4 + 2 * ib32 + 1];
-    const uint qh_dw = (block_byte + 68) / 4;
-    const uint b_idx = QUANT_K * ib + 32 * ib32;
+    const uint ql_dw = data_a32[(block_byte + 4) / 4 + 2 * g + (j / 2)];
+    const uint q16 = (ql_dw >> (16 * (j & 1))) & 0xffffu;
+    const uint qh_dw = (block_byte + 68) / 4 + 2 * j;
+    const uint h0 = data_a32[qh_dw];
+    const uint h1 = data_a32[qh_dw + 1];
+    const uint b_idx = QUANT_K * ib + 32 * g + 8 * j;
 
-    const uint sc_byte = (sc >> (8 * (ib32 % 4))) & 0xffu;
-    const float dl = d * 1.01f * float((sc_byte >> (4 * (ib32 / 4))) & 0xFu);
+    const uint sc_byte = (sc >> (8 * (g % 4))) & 0xffu;
+    const float dl = d * 1.01f * float((sc_byte >> (4 * (g / 4))) & 0xFu);
 
-    [[unroll]] for (uint j = 0; j < 4; ++j) {
-        const uint q16 = (j < 2 ? ql0 : ql1) >> (16 * (j & 1));
-        uint x = (q16 & 0xffffu) + 4096u;
-        const uint h0 = data_a32[qh_dw + 2 * j];
-        const uint h1 = data_a32[qh_dw + 2 * j + 1];
-
-        uint sign0 = 0u;
-        uint sign1 = 0u;
-        [[unroll]] for (uint k = 0; k < 4; ++k) {
-            sign0 |= (((h0 >> (8 * k)) >> ib32) & 1u) << k;
-            sign1 |= (((h1 >> (8 * k)) >> ib32) & 1u) << k;
-        }
-
-        const vec4 v0 = iqk_hash_values(x, true, sign0);
-        const vec4 v1 = iqk_hash_values(x, true, sign1);
-        iqk_store4(b_idx + 8 * j,     dl * v0);
-        iqk_store4(b_idx + 8 * j + 4, dl * v1);
+    uint x = q16 + 4096u;
+    uint sign0 = 0u;
+    uint sign1 = 0u;
+    [[unroll]] for (uint k = 0; k < 4; ++k) {
+        sign0 |= (((h0 >> (8 * k)) >> g) & 1u) << k;
+        sign1 |= (((h1 >> (8 * k)) >> g) & 1u) << k;
     }
+
+    const vec4 v0 = iqk_hash_values(x, true, sign0);
+    const vec4 v1 = iqk_hash_values(x, true, sign1);
+    iqk_store4(b_idx,     dl * v0);
+    iqk_store4(b_idx + 4, dl * v1);
 }

@@ -19,8 +19,11 @@ vec4 iq3ks_unpack(uint qw, uint hw, uint shift_q, uint shift_h, uint vo) {
 }
 
 void main() {
-    const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
-    const uint k = gl_LocalInvocationID.x % 8;
+    const uint tid = gl_LocalInvocationID.x;
+    // 64 threads per block: thread (k, j) decodes one vec4.
+    const uint ib = gl_WorkGroupID.x * 4 + tid / 64;
+    const uint k = (tid % 64) / 8;
+    const uint j = tid % 8;
 
     if (ib >= p.nel / QUANT_K) {
         return;
@@ -34,7 +37,7 @@ void main() {
 
     const float d = iqk_f16_to_f32(iqk_load_u16(row * row_bytes));
     const uint extra = iqk_load_u16(block_byte);
-    const uint b_idx = QUANT_K * ib + 32 * k;
+    const uint b_idx = QUANT_K * ib + 32 * k + 4 * j;
 
     const uint sc = (data_a[block_byte + 2 + k % 4] >> (4 * (k / 4))) & 0xFu;
     const float dl = d * (float(sc | (((extra >> k) & 1u) << 4)) - 16.0f);
@@ -44,7 +47,5 @@ void main() {
     const uint qs_base = block_byte + 6 + 32 * (k / 4);
     const uint qh_base = block_byte + 70;
 
-    [[unroll]] for (uint j = 0; j < 8; ++j) {
-        iqk_store4(b_idx + 4 * j, dl * iq3ks_unpack(iqk_load_u32a(qs_base + 4 * j), iqk_load_u32a(qh_base + 4 * j), shift_q, shift_h, v_off));
-    }
+    iqk_store4(b_idx, dl * iq3ks_unpack(iqk_load_u32a(qs_base + 4 * j), iqk_load_u32a(qh_base + 4 * j), shift_q, shift_h, v_off));
 }

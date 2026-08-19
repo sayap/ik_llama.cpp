@@ -3642,33 +3642,43 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ3_S],   "dequant_iq3_s",   dequant_iq3_s_len,   dequant_iq3_s_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_XS],  "dequant_iq4_xs",  dequant_iq4_xs_len,  dequant_iq4_xs_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_NL],  "dequant_iq4_nl",  dequant_iq4_nl_len,  dequant_iq4_nl_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
-    // IQK / KT flat dequant (dot4 hash byte-sum when the device has the extension)
+    // IQK / KT flat dequant (dot4 hash byte-sum when the device has the
+    // extension). Fine-grained thread mappings: 32 threads per 256-element
+    // block (8 elements per thread -> 2048 elements per WG) for the types
+    // whose decode emits two vec4s per sub-block word, and 64 threads per
+    // block (4 elements per thread -> 1024 elements per WG) for the types
+    // that emit one vec4 per thread. The small per-thread work keeps the
+    // register footprint low so occupancy covers the dependent hash chains
+    // (measured ~2x faster than the original 8-threads-per-block mapping on
+    // the RTX 3090; the dequant goes from ~300 GB/s to ~660 GB/s).
+    // NOTE: a pipeline slot must be created exactly once (the create helper
+    // keeps the first call's wg_denoms).
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-#define CREATE_DEQUANT_IQK(TYPE, NAMELC) \
+#define CREATE_DEQUANT_IQK(TYPE, NAMELC, DENOM) \
     if (device->integer_dot_product) { \
-        ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], "dequant_" #NAMELC, dequant_ ## NAMELC ## _dot4_len, dequant_ ## NAMELC ## _dot4_data, "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1); \
+        ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], "dequant_" #NAMELC, dequant_ ## NAMELC ## _dot4_len, dequant_ ## NAMELC ## _dot4_data, "main", 2, 5 * sizeof(uint32_t), {DENOM, 1, 1}, {}, 1); \
     } else { \
-        ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], "dequant_" #NAMELC, dequant_ ## NAMELC ## _len, dequant_ ## NAMELC ## _data, "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1); \
+        ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], "dequant_" #NAMELC, dequant_ ## NAMELC ## _len, dequant_ ## NAMELC ## _data, "main", 2, 5 * sizeof(uint32_t), {DENOM, 1, 1}, {}, 1); \
     }
 #else
-#define CREATE_DEQUANT_IQK(TYPE, NAMELC) \
-    ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], "dequant_" #NAMELC, dequant_ ## NAMELC ## _len, dequant_ ## NAMELC ## _data, "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
+#define CREATE_DEQUANT_IQK(TYPE, NAMELC, DENOM) \
+    ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], "dequant_" #NAMELC, dequant_ ## NAMELC ## _len, dequant_ ## NAMELC ## _data, "main", 2, 5 * sizeof(uint32_t), {DENOM, 1, 1}, {}, 1);
 #endif
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ2_K,  iq2_k)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ3_K,  iq3_k)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ4_K,  iq4_k)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ5_K,  iq5_k)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ6_K,  iq6_k)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ2_KS, iq2_ks)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ3_KS, iq3_ks)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ4_KS, iq4_ks)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ4_KSS, iq4_kss)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ5_KS, iq5_ks)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ2_KL, iq2_kl)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ1_KT, iq1_kt)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ2_KT, iq2_kt)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ3_KT, iq3_kt)
-    CREATE_DEQUANT_IQK(GGML_TYPE_IQ4_KT, iq4_kt)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ2_K,  iq2_k,  256 * 8)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ3_K,  iq3_k,  256 * 8)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ4_K,  iq4_k,  256 * 8)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ5_K,  iq5_k,  256 * 4)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ6_K,  iq6_k,  256 * 4)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ2_KS, iq2_ks, 256 * 4)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ3_KS, iq3_ks, 256 * 4)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ4_KS, iq4_ks, 256 * 8)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ4_KSS, iq4_kss, 256 * 8)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ5_KS, iq5_ks, 256 * 4)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ2_KL, iq2_kl, 256 * 4)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ1_KT, iq1_kt, 256 * 8)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ2_KT, iq2_kt, 256 * 8)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ3_KT, iq3_kt, 256 * 8)
+    CREATE_DEQUANT_IQK(GGML_TYPE_IQ4_KT, iq4_kt, 256 * 4)
 #undef CREATE_DEQUANT_IQK
 
     // get_rows

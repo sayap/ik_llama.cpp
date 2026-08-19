@@ -10,9 +10,28 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define BLOCK_BYTES 128
 #define META 4
 
+// Byte-pair value table staged in shared memory (see iq4k_byte_tables.comp):
+// entry [v][b] packs the two iq4k_values nibble lookups of byte b as int8.
+shared uint16_t iq4k_tbl[2][256];
+
 void main() {
-    const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
-    const uint ib32 = gl_LocalInvocationID.x % 8;
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint idx = tid; idx < 128; idx += 256) {
+        const uint e0 = iq4k_values_byte_0[idx];
+        const uint e16 = iq4k_values_byte_16[idx];
+        iq4k_tbl[0][2 * idx]     = uint16_t(e0 & 0xffffu);
+        iq4k_tbl[0][2 * idx + 1] = uint16_t(e0 >> 16);
+        iq4k_tbl[1][2 * idx]     = uint16_t(e16 & 0xffffu);
+        iq4k_tbl[1][2 * idx + 1] = uint16_t(e16 >> 16);
+    }
+    barrier();
+
+    // 32 threads per block: thread (g, t) decodes the two vec4s of
+    // sub-block g (of 8), byte pair t (of 4). The Gray-style a[]/ls decode
+    // of the 16 payload bytes is recomputed per thread (L1-resident).
+    const uint ib = gl_WorkGroupID.x * 8 + tid / 32;
+    const uint g  = (tid % 32) / 4;
+    const uint t  = tid % 4;
 
     if (ib >= p.nel / QUANT_K) {
         return;
@@ -25,8 +44,8 @@ void main() {
     const uint block_byte = row * row_bytes + META + (ib % nbpb) * BLOCK_BYTES;
 
     const float d = uintBitsToFloat(data_a32[(row * row_bytes) / 4]);
-    const uint b_idx = QUANT_K * ib + 32 * ib32;
-    const uint qs_dw = (block_byte + 16 * ib32) / 4;
+    const uint b_idx = QUANT_K * ib + 32 * g + 4 * t;
+    const uint qs_dw = (block_byte + 16 * g) / 4;
 
     uint a[8];
     uint ls = 0u;
@@ -45,22 +64,24 @@ void main() {
     }
 
     const float dl = d * (float(ls & 254u) - 127.0f);
-    const uint v_off = (ls & 1u) != 0 ? 16u : 0u;
+    const uint v = (ls & 1u) != 0 ? 1u : 0u;
 
-    [[unroll]] for (uint t = 0; t < 4; ++t) {
-        const uint b0 = a[2 * t] & 0xffu;
-        const uint b1 = (a[2 * t] >> 8) & 0xffu;
-        const uint b2 = a[2 * t + 1] & 0xffu;
-        const uint b3 = (a[2 * t + 1] >> 8) & 0xffu;
-        iqk_store4(b_idx + 4 * t, dl * vec4(
-            float(iq4k_values[(b0 & 0xFu) + v_off]),
-            float(iq4k_values[(b1 & 0xFu) + v_off]),
-            float(iq4k_values[(b2 & 0xFu) + v_off]),
-            float(iq4k_values[(b3 & 0xFu) + v_off])));
-        iqk_store4(b_idx + 16 + 4 * t, dl * vec4(
-            float(iq4k_values[((b0 >> 4) & 0xFu) + v_off]),
-            float(iq4k_values[((b1 >> 4) & 0xFu) + v_off]),
-            float(iq4k_values[((b2 >> 4) & 0xFu) + v_off]),
-            float(iq4k_values[((b3 >> 4) & 0xFu) + v_off])));
-    }
+    const uint b0 = a[2 * t] & 0xffu;
+    const uint b1 = (a[2 * t] >> 8) & 0xffu;
+    const uint b2 = a[2 * t + 1] & 0xffu;
+    const uint b3 = (a[2 * t + 1] >> 8) & 0xffu;
+    const uint16_t p0 = iq4k_tbl[v][b0];
+    const uint16_t p1 = iq4k_tbl[v][b1];
+    const uint16_t p2 = iq4k_tbl[v][b2];
+    const uint16_t p3 = iq4k_tbl[v][b3];
+    iqk_store4(b_idx, dl * vec4(
+        float(int8_t(p0 & 0xffu)),
+        float(int8_t(p1 & 0xffu)),
+        float(int8_t(p2 & 0xffu)),
+        float(int8_t(p3 & 0xffu))));
+    iqk_store4(b_idx + 16, dl * vec4(
+        float(int8_t(p0 >> 8)),
+        float(int8_t(p1 >> 8)),
+        float(int8_t(p2 >> 8)),
+        float(int8_t(p3 >> 8))));
 }

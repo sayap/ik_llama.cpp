@@ -11,8 +11,11 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define META 4
 
 void main() {
-    const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
-    const uint ib32 = gl_LocalInvocationID.x % 8;
+    // 32 threads per block: thread (g, j) handles the 8 elements of
+    // sub-block g (of 8), ql word j (of 4).
+    const uint ib = gl_WorkGroupID.x * 8 + gl_LocalInvocationID.x / 32;
+    const uint g  = (gl_LocalInvocationID.x % 32) / 4;
+    const uint j  = gl_LocalInvocationID.x % 4;
 
     if (ib >= p.nel / QUANT_K) {
         return;
@@ -26,19 +29,16 @@ void main() {
 
     const float d = uintBitsToFloat(data_a32[(row * row_bytes) / 4]);
     const uint sc = data_a32[block_byte / 4];
-    const uint ql0 = data_a32[(block_byte + 4) / 4 + 2 * ib32];
-    const uint ql1 = data_a32[(block_byte + 4) / 4 + 2 * ib32 + 1];
-    const uint b_idx = QUANT_K * ib + 32 * ib32;
+    const uint ql_dw = data_a32[(block_byte + 4) / 4 + 2 * g + (j / 2)];
+    const uint q16 = (ql_dw >> (16 * (j & 1))) & 0xffffu;
+    const uint b_idx = QUANT_K * ib + 32 * g + 8 * j;
 
-    const uint sc_byte = (sc >> (8 * (ib32 % 4))) & 0xffu;
-    const float dl = d * 1.05f * float(iq4k_values[(sc_byte >> (4 * (ib32 / 4))) & 0xFu]);
+    const uint sc_byte = (sc >> (8 * (g % 4))) & 0xffu;
+    const float dl = d * 1.05f * float(iq4k_values[(sc_byte >> (4 * (g / 4))) & 0xFu]);
 
-    [[unroll]] for (uint j = 0; j < 4; ++j) {
-        const uint q16 = (j < 2 ? ql0 : ql1) >> (16 * (j & 1));
-        uint x = (q16 & 0xffffu) + 4096u;
-        const vec4 v0 = iqk_hash_values(x, false, 0u);
-        const vec4 v1 = iqk_hash_values(x, false, 0u);
-        iqk_store4(b_idx + 8 * j,     dl * v0);
-        iqk_store4(b_idx + 8 * j + 4, dl * v1);
-    }
+    uint x = q16 + 4096u;
+    const vec4 v0 = iqk_hash_values(x, false, 0u);
+    const vec4 v1 = iqk_hash_values(x, false, 0u);
+    iqk_store4(b_idx,     dl * v0);
+    iqk_store4(b_idx + 4, dl * v1);
 }

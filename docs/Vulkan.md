@@ -1604,6 +1604,42 @@ remaining gaps are dominated by the FFN:
     cold-clock artifacts; with 20-iteration warmup the cm2 FFN matmul is ~3.1 ms (n=32)
     to ~4.7 ms (n=512).
 
+    **Follow-up (2026-08-20): the flat dequant kernels were restructured and roughly
+    doubled again.** The original mapping ran 8 threads per 256-element block (32
+    elements, 8 unrolled `f16vec4` outputs per thread); the long unrolled bodies spill
+    registers and the dependent KT hash chains (4 serial `mul`+byte-sum rounds per
+    vec4) serialize, so the kernels ran at only ~300 GB/s effective (vs ~870 GB/s for
+    the trivial-decode `dequant_q8_0`). All 15 shaders now use a fine-grained mapping
+    — 32 threads per block (8 elements/thread, `wg_denoms` 2048) for the types whose
+    decode emits two vec4s per sub-block word, 64 threads per block (4 elements/thread,
+    `wg_denoms` 1024) for the one-vec4 types — keeping one hash chain and 1-2 live
+    vec4s per thread, and the table-lookup types (`iq4_k(s)`, `iq4_kss`, `iq5_ks`,
+    `iq6_k`) stage their value/byte-pair tables in shared memory (mirroring the Q8_1
+    vec kernels; on Ampere shmem won for the big tables and lost for the tiny
+    16-entry `iq3nl`/8-entry `iq2nl` ones, which stay as constants). Measured on the
+    RTX 3090 (FFN shape `[5120, 17408] x n=512, min of 3, warm): iq3_kt 1.66→1.43 ms,
+    iq4_kt 1.68→1.44, iq5_ks 2.23→1.51, iq6_k 2.39→1.75, iq4_ks 1.55→1.45, most others
+    ~1.4-1.5 (the F16 GEMM at n=512 is ~1.11 ms, so the dequant overhead over a pure
+    F16 matmul shrinks from ~0.55 ms to ~0.3 ms; the dequant itself reaches ~660 GB/s).
+    End-to-end (Qwen3.8-27B-IQ3_KT, `llama-bench`): Vulkan0 pp512 822→~905 tok/s
+    (+10%), pp2048 1069→~1100 (+3%), TG unchanged; Vulkan1 (coopmat1, dense path uses
+    the inline-dequant A tiles, not these kernels) unchanged. Two pitfalls found on
+    the way: `ggml_vk_create_pipeline` only takes `wg_denoms`/`align` from the *first*
+    call for a pipeline slot (a second call compiles the new shader but keeps the old
+    denominator, so every type must be created exactly once — a mismatched denominator
+    silently under-dispatches and computes from stale prealloc memory, failing only
+    multi-batch mat-mat tests), and the Ampere coopmat2 F16 tile config (W=256,
+    BM=128, BN=256, BK=64) was re-verified optimal on the 3090 as well (a sweep of
+    BM/BN/BK variants regressed 4-100%). Also re-measured on the 3090: the KHR-coopmat
+    (coopmat1-style inline-dequant `mul_mm.comp`) path for IQK/KT (via
+    `GGML_VK_DISABLE_COOPMAT2=1`) is 14-100% slower than dequant+F16 (1.89 vs 1.66 ms
+    at n=512, 8.93 vs 4.38 at n=2048), confirming the inline-decode ALU cost cannot
+    beat the big cm2 F16 tiles on NVIDIA; and the cm2 per-element/V=4 inline dequant
+    remains 1.6-2.3x slower (2.57/9.96 ms). So on coopmat2 the dequant+F16 structure
+    stays, and the dequant kernels are now within ~1.5x of the memory floor — the
+    remaining n=512 overhead is roughly evenly split between the residual dequant cost
+    and the B-tile re-reads of the F16 GEMM itself.
+
     While investigating this, a pre-existing crash was also fixed:
     `ggml_vk_get_mul_mat_mat_pipeline` returned a non-null but empty
     `pipeline_dequant_mul_mat_mat[type]` struct for the IQK/KT types on coopmat1

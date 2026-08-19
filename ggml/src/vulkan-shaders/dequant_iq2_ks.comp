@@ -10,18 +10,28 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define BLOCK_BYTES 70
 #define META 2
 
+shared int8_t iq2ks_tbl[8];
+
 vec4 iq2ks_unpack(uint w, uint shift, uint vo) {
     return vec4(
-        float(iq2nl_values[(((w & 0xffu) >> shift) & 3u) + vo]),
-        float(iq2nl_values[((((w >> 8) & 0xffu) >> shift) & 3u) + vo]),
-        float(iq2nl_values[((((w >> 16) & 0xffu) >> shift) & 3u) + vo]),
-        float(iq2nl_values[((((w >> 24) & 0xffu) >> shift) & 3u) + vo]));
+        float(iq2ks_tbl[(((w & 0xffu) >> shift) & 3u) + vo]),
+        float(iq2ks_tbl[((((w >> 8) & 0xffu) >> shift) & 3u) + vo]),
+        float(iq2ks_tbl[((((w >> 16) & 0xffu) >> shift) & 3u) + vo]),
+        float(iq2ks_tbl[((((w >> 24) & 0xffu) >> shift) & 3u) + vo]));
 }
 
 void main() {
-    const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
-    const uint ib64 = gl_LocalInvocationID.x % 4;
-    const uint part = (gl_LocalInvocationID.x % 8) / 4;
+    const uint tid = gl_LocalInvocationID.x;
+    [[unroll]] for (uint idx = tid; idx < 8; idx += 256) {
+        iq2ks_tbl[idx] = iq2nl_values[idx];
+    }
+    barrier();
+
+    // 64 threads per block: thread (ib64, part, j) decodes one vec4.
+    const uint ib = gl_WorkGroupID.x * 4 + tid / 64;
+    const uint ib64 = (tid % 64) / 16;
+    const uint part = (tid % 16) / 8;
+    const uint j = tid % 8;
 
     if (ib >= p.nel / QUANT_K) {
         return;
@@ -35,7 +45,7 @@ void main() {
 
     const float d = iqk_f16_to_f32(iqk_load_u16(row * row_bytes));
     const uint extra = iqk_load_u16(block_byte);
-    const uint b_idx = QUANT_K * ib + 64 * ib64 + 32 * part;
+    const uint b_idx = QUANT_K * ib + 64 * ib64 + 32 * part + 4 * j;
 
     const uint e = extra >> (2 * ib64);
     const uint sc = data_a[block_byte + 2 + ib64];
@@ -45,7 +55,5 @@ void main() {
     const uint shift = 4 * (ib64 % 2) + 2 * part;
     const uint qs_base = block_byte + 6 + 32 * (ib64 / 2);
 
-    [[unroll]] for (uint j = 0; j < 8; ++j) {
-        iqk_store4(b_idx + 4 * j, dl * iq2ks_unpack(iqk_load_u32a(qs_base + 4 * j), shift, v_off));
-    }
+    iqk_store4(b_idx, dl * iq2ks_unpack(iqk_load_u32a(qs_base + 4 * j), shift, v_off));
 }

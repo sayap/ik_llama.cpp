@@ -11,8 +11,11 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define META 4
 
 void main() {
-    const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
-    const uint ib32 = gl_LocalInvocationID.x % 8;
+    // 32 threads per block: thread (g, j) handles the 8 elements of
+    // sub-block g (of 8), byte j (of 4).
+    const uint ib = gl_WorkGroupID.x * 8 + gl_LocalInvocationID.x / 32;
+    const uint g  = (gl_LocalInvocationID.x % 32) / 4;
+    const uint j  = gl_LocalInvocationID.x % 4;
 
     if (ib >= p.nel / QUANT_K) {
         return;
@@ -27,24 +30,22 @@ void main() {
     const float d = uintBitsToFloat(data_a32[(row * row_bytes) / 4]);
     const uint sh01 = data_a32[block_byte / 4];
     const uint sh23 = data_a32[block_byte / 4 + 1];
-    const uint ql = data_a32[(block_byte + 8) / 4 + ib32];
-    const uint qh = data_a32[(block_byte + 40) / 4 + (ib32 % 4)];
-    const uint b_idx = QUANT_K * ib + 32 * ib32;
+    const uint ql = data_a32[(block_byte + 8) / 4 + g];
+    const uint qh = data_a32[(block_byte + 40) / 4 + (g % 4)];
+    const uint b_idx = QUANT_K * ib + 32 * g + 8 * j;
 
-    const uint sh_byte = (ib32 < 4 ? sh01 : sh23) >> (8 * (ib32 & 3));
+    const uint sh_byte = (g < 4 ? sh01 : sh23) >> (8 * (g & 3));
     const float dl = d * float(iq4k_values[sh_byte & 0xFu]);
-    const uint sh_shift = 8 - 4 * (ib32 / 4);
+    const uint sh_shift = 8 - 4 * (g / 4);
 
-    [[unroll]] for (uint j = 0; j < 4; ++j) {
-        const uint qlb = (ql >> (8 * j)) & 0xffu;
-        const uint qhb = (qh >> (8 * j)) & 0xffu;
-        uint x = qlb
-               + 4096u
-               + ((qhb << sh_shift) & 0xf00u)
-               + ((sh_byte << (8 - j)) & 0x1000u);
-        const vec4 v0 = iqk_hash_values(x, false, 0u);
-        const vec4 v1 = iqk_hash_values(x, false, 0u);
-        iqk_store4(b_idx + 8 * j,     dl * v0);
-        iqk_store4(b_idx + 8 * j + 4, dl * v1);
-    }
+    const uint qlb = (ql >> (8 * j)) & 0xffu;
+    const uint qhb = (qh >> (8 * j)) & 0xffu;
+    uint x = qlb
+           + 4096u
+           + ((qhb << sh_shift) & 0xf00u)
+           + ((sh_byte << (8 - j)) & 0x1000u);
+    const vec4 v0 = iqk_hash_values(x, false, 0u);
+    const vec4 v1 = iqk_hash_values(x, false, 0u);
+    iqk_store4(b_idx,     dl * v0);
+    iqk_store4(b_idx + 4, dl * v1);
 }

@@ -28,9 +28,12 @@ vec4 iq5k_hi(uint qw, uint hw, uint shift, uint vo) {
 }
 
 void main() {
-    const uint ib = gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x / 8;
-    const uint ib64 = gl_LocalInvocationID.x % 4;
-    const uint part = (gl_LocalInvocationID.x % 8) / 4;
+    // 64 threads per block: thread (ib64, part, t) decodes one vec4;
+    // t < 4 is the low half (j = t), t >= 4 the high half (j = t - 4).
+    const uint ib = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
+    const uint ib64 = (gl_LocalInvocationID.x % 64) / 16;
+    const uint part = (gl_LocalInvocationID.x % 16) / 8;
+    const uint t = gl_LocalInvocationID.x % 8;
 
     if (ib >= p.nel / QUANT_K) {
         return;
@@ -48,7 +51,7 @@ void main() {
     const uint sh01 = data_a32[dw + 1];
     const uint sl01 = data_a32[dw + 2];
     const uint sl23 = data_a32[dw + 3];
-    const uint b_idx = QUANT_K * ib + 64 * ib64 + 32 * part;
+    const uint b_idx = QUANT_K * ib + 64 * ib64 + 32 * part + 4 * t;
 
     const uint shift = 2 * ib64;
     const uint e = extra >> (4 * ib64);
@@ -58,24 +61,27 @@ void main() {
     const uint sl1 = (sl_dw >> (16 * (ib64 & 1) + 8)) & 0xffu;
     const uint qs_dw = (block_byte + 16 + 32 * ib64) / 4;
     const uint qh_dw = (block_byte + 144) / 4;
+    const uint j = t & 3;
 
     if (part == 0) {
         const float dl1 = d * (float((sl0 & 0xFu) | ((sh << 4) & 0x30u)) - 32.0f);
         const float dl2 = d * (float(((sl0 >> 4) & 0xFu) | ((sh << 2) & 0x30u)) - 32.0f);
         const uint v1_off = (e & 1u) != 0 ? 32u : 0u;
         const uint v2_off = (e & 2u) != 0 ? 32u : 0u;
-        [[unroll]] for (uint j = 0; j < 4; ++j) {
-            iqk_store4(b_idx + 4 * j,      dl1 * iq5k_lo(data_a32[qs_dw + j],     data_a32[qh_dw + j],     shift, v1_off));
-            iqk_store4(b_idx + 16 + 4 * j, dl2 * iq5k_lo(data_a32[qs_dw + 4 + j], data_a32[qh_dw + 4 + j], shift, v2_off));
+        if (t < 4) {
+            iqk_store4(b_idx, dl1 * iq5k_lo(data_a32[qs_dw + j], data_a32[qh_dw + j], shift, v1_off));
+        } else {
+            iqk_store4(b_idx, dl2 * iq5k_lo(data_a32[qs_dw + 4 + j], data_a32[qh_dw + 4 + j], shift, v2_off));
         }
     } else {
         const float dl1 = d * (float((sl1 & 0xFu) | (sh & 0x30u)) - 32.0f);
         const float dl2 = d * (float(((sl1 >> 4) & 0xFu) | ((sh >> 2) & 0x30u)) - 32.0f);
         const uint v1_off = (e & 4u) != 0 ? 32u : 0u;
         const uint v2_off = (e & 8u) != 0 ? 32u : 0u;
-        [[unroll]] for (uint j = 0; j < 4; ++j) {
-            iqk_store4(b_idx + 4 * j,      dl1 * iq5k_hi(data_a32[qs_dw + j],     data_a32[qh_dw + j],     shift, v1_off));
-            iqk_store4(b_idx + 16 + 4 * j, dl2 * iq5k_hi(data_a32[qs_dw + 4 + j], data_a32[qh_dw + 4 + j], shift, v2_off));
+        if (t < 4) {
+            iqk_store4(b_idx, dl1 * iq5k_hi(data_a32[qs_dw + j], data_a32[qh_dw + j], shift, v1_off));
+        } else {
+            iqk_store4(b_idx, dl2 * iq5k_hi(data_a32[qs_dw + 4 + j], data_a32[qh_dw + 4 + j], shift, v2_off));
         }
     }
 }
