@@ -56,6 +56,11 @@ static void init_tensor_q8_0(ggml_tensor * tensor) {
     ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
 }
 
+// generic quantized-tensor init (any type ggml_quantize_chunk supports)
+static void init_tensor_quant(ggml_tensor * tensor) {
+    init_tensor_q8_0(tensor);
+}
+
 static double max_abs_diff(const float * a, const float * b, size_t n) {
     double max = 0.0;
     for (size_t i = 0; i < n; i++) {
@@ -173,6 +178,128 @@ static void check_i32(const char * name, ggml_backend_t backend_cpu, ggml_backen
     } else {
         printf("OK   %s (exact)\n", name);
     }
+}
+
+// Compare a quantized output tensor between the CPU reference and the target
+// backend. The GPU quantizer may differ from the CPU one in the last ULP (f16
+// scale rounding, FMA contraction), so a bit-exact memcmp is tried first and a
+// dequantized comparison with tolerance is used as the fallback.
+static void check_quant(const char * name, ggml_backend_t backend_cpu, ggml_backend_t backend_tgt,
+        ggml_context * ctx_cpu, ggml_context * ctx_tgt, ggml_tensor * out_cpu, ggml_tensor * out_tgt,
+        double max_err) {
+    ggml_cgraph * gf_cpu = ggml_new_graph(ctx_cpu);
+    ggml_build_forward_expand(gf_cpu, out_cpu);
+    ggml_cplan plan = ggml_graph_plan(gf_cpu, 4);
+    if (plan.work_size > 0) {
+        plan.work_data = (uint8_t *)malloc(plan.work_size);
+    }
+    ggml_graph_compute(gf_cpu, &plan);
+    free(plan.work_data);
+
+    ggml_cgraph * gf_tgt = ggml_new_graph(ctx_tgt);
+    ggml_build_forward_expand(gf_tgt, out_tgt);
+    fprintf(stderr, "[check] computing %s with backend %s\n", name, ggml_backend_name(backend_tgt));
+    fflush(stderr);
+    if (ggml_backend_graph_compute(backend_tgt, gf_tgt) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "FAIL %s: backend compute failed\n", name);
+        n_failures++;
+        return;
+    }
+
+    const size_t nbytes = ggml_nbytes(out_cpu);
+    std::vector<uint8_t> a(nbytes), b(nbytes);
+    ggml_backend_tensor_get(out_cpu, a.data(), 0, nbytes);
+    ggml_backend_tensor_get(out_tgt, b.data(), 0, nbytes);
+
+    if (memcmp(a.data(), b.data(), nbytes) == 0) {
+        printf("OK   %s (bytes exact)\n", name);
+        return;
+    }
+
+    // fall back to comparing the dequantized values
+    const int64_t ne0 = out_cpu->ne[0];
+    const size_t nrows = nbytes / ggml_row_size(out_cpu->type, ne0);
+    std::vector<float> fa(ggml_nelements(out_cpu)), fb(ggml_nelements(out_cpu));
+    const ggml_type_traits_t & tq = ggml_internal_get_type_traits(out_cpu->type);
+    for (size_t r = 0; r < nrows; r++) {
+        tq.to_float(a.data() + r * ggml_row_size(out_cpu->type, ne0), fa.data() + r * ne0, ne0);
+        tq.to_float(b.data() + r * ggml_row_size(out_cpu->type, ne0), fb.data() + r * ne0, ne0);
+    }
+    double err = max_abs_diff(fa.data(), fb.data(), fa.size());
+    if (err > max_err) {
+        fprintf(stderr, "FAIL %s: dequantized max abs diff = %g > %g\n", name, err, max_err);
+        for (size_t i = 0; i < fa.size() && i < 32; i++) {
+            fprintf(stderr, "  [%zu] cpu=%g tgt=%g\n", i, fa[i], fb[i]);
+        }
+        n_failures++;
+    } else {
+        printf("OK   %s (dequantized max abs diff = %g)\n", name, err);
+    }
+}
+
+// The KV-cache quantized write: ggml_cpy of an F32 [D, T*H] tensor into a
+// strided 2d view of a larger quantized cache (mirrors llm_build_kv_store's
+// k_cache_view), plus the dequantizing read-back (cpy quant -> F32).
+static void test_cpy_kv_write(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt, ggml_type cache_type,
+        int D, int n_head_kv, int n_cache_rows, int kv_head, int n_tokens) {
+    char name[256];
+    snprintf(name, sizeof(name), "cpy_kv_write cache=%s D=%d hkv=%d rows=%d head=%d T=%d",
+            ggml_type_name(cache_type), D, n_head_kv, n_cache_rows, kv_head, n_tokens);
+
+    // two graphs per ctx are created (write + readback checks)
+    ggml_init_params params = { ggml_tensor_overhead()*64 + 4*ggml_graph_overhead(), NULL, true };
+    ggml_context * ctx_cpu = ggml_init(params);
+    ggml_context * ctx_tgt = ggml_init(params);
+
+    const size_t row_size = ggml_row_size(cache_type, D);
+
+    auto build = [&](ggml_context * ctx) {
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, cache_type, D, n_cache_rows);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tokens*n_head_kv);
+        ggml_set_name(src, "src");
+
+        ggml_tensor * view = ggml_view_2d(ctx, cache, D, n_tokens*n_head_kv,
+                row_size, row_size*n_head_kv*kv_head);
+        ggml_tensor * cpy = ggml_cpy(ctx, src, view);
+        ggml_set_name(cpy, "cpy");
+
+        // dequantizing read-back of the written region (cpy quant -> F32)
+        ggml_tensor * rb = ggml_cpy(ctx, view, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tokens*n_head_kv));
+        ggml_set_name(rb, "rb");
+        return cpy;
+    };
+
+    ggml_tensor * cpy_c = build(ctx_cpu);
+    ggml_tensor * cpy_t = build(ctx_tgt);
+
+    ggml_backend_alloc_ctx_tensors(ctx_cpu, backend_cpu);
+    ggml_backend_alloc_ctx_tensors(ctx_tgt, backend_tgt);
+
+    // zero the caches so untouched rows compare equal
+    {
+        const size_t nbytes = ggml_nbytes(ggml_get_tensor(ctx_cpu, "cache"));
+        std::vector<uint8_t> z(nbytes, 0);
+        ggml_backend_tensor_set(ggml_get_tensor(ctx_cpu, "cache"), z.data(), 0, nbytes);
+        ggml_backend_tensor_set(ggml_get_tensor(ctx_tgt, "cache"), z.data(), 0, nbytes);
+    }
+
+    init_tensor_uniform(ggml_get_tensor(ctx_cpu, "src"), -2.0f, 2.0f);
+    copy_tensors_by_name(ctx_cpu, ctx_tgt);
+
+    // the quantized write (checks the cache bytes through the cpy view)
+    check_quant(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, cpy_c, cpy_t, 0.2);
+
+    // the read-back runs after both caches have been written
+    {
+        char rbname[300];
+        snprintf(rbname, sizeof(rbname), "%s readback", name);
+        check_float(rbname, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt,
+                ggml_get_tensor(ctx_cpu, "rb"), ggml_get_tensor(ctx_tgt, "rb"), 0.2);
+    }
+
+    ggml_free(ctx_cpu);
+    ggml_free(ctx_tgt);
 }
 
 // INDEXER_TOPK only defines the *set* of selected rows (the CPU bucket top-k
@@ -529,8 +656,12 @@ static void test_set_rows(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt
     ggml_backend_alloc_ctx_tensors(ctx_cpu, backend_cpu);
     ggml_backend_alloc_ctx_tensors(ctx_tgt, backend_tgt);
 
-    init_tensor_uniform(a_c, -2.0f, 2.0f);
     init_tensor_uniform(b_c, -2.0f, 2.0f);
+    if (ggml_is_quantized(dst_type)) {
+        init_tensor_quant(a_c);
+    } else {
+        init_tensor_uniform(a_c, -2.0f, 2.0f);
+    }
 
     std::vector<int32_t> i32(nrows_src);
     std::vector<int64_t> i64_data(nrows_src);
@@ -552,7 +683,13 @@ static void test_set_rows(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt
         ggml_backend_tensor_set(c_t, i32.data(), 0, nrows_src * sizeof(int32_t));
     }
 
-    check_float(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, 0.0);
+    if (ggml_is_quantized(dst_type)) {
+        // GPU quantizers may differ in the last ULP (f16 scale rounding, FMA
+        // contraction); compare the quantized caches with a dequantized fallback.
+        check_quant(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, 0.2);
+    } else {
+        check_float(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, 0.0);
+    }
     ggml_free(ctx_cpu);
     ggml_free(ctx_tgt);
 }
@@ -730,6 +867,30 @@ static void test_flash_attn_indexed(ggml_backend_t backend_cpu, ggml_backend_t b
     ggml_free(ctx_tgt);
 }
 
+// Dense FA with a quantized KV cache: q is forced onto an exact Q8 grid (each
+// 32-element block has amax = 1.0 and values n/127), so the CPU reference's
+// integer vec_dot (which quantizes q to Q8_2) matches the GPU's f32 dot of the
+// format-dequantized K/V to f32 rounding. This validates the Vulkan kernels
+// against the CPU integer kernels, which are exact for these legacy quants.
+static void init_tensor_q_grid(ggml_tensor * tensor) {
+    std::mt19937 rng(4242);
+    std::uniform_int_distribution<int> dist(-127, 127);
+    const size_t ne0 = tensor->ne[0];
+    const size_t nrows = ggml_nelements(tensor) / ne0;
+    GGML_ASSERT(ne0 % 32 == 0);
+    std::vector<float> data(ggml_nelements(tensor));
+    for (size_t r = 0; r < nrows; r++) {
+        for (size_t i = 0; i < ne0; i++) {
+            data[r*ne0 + i] = (float)dist(rng) / 127.0f;
+        }
+        // force every 32-element block to have amax = 1.0 (Q8_2 d = 1/127)
+        for (size_t b = 0; b < ne0 / 32; b++) {
+            data[r*ne0 + b*32] = 1.0f;
+        }
+    }
+    ggml_backend_tensor_set(tensor, data.data(), 0, data.size() * sizeof(float));
+}
+
 // Dense flash attention with per-head sinks (src[4], no indexer), the DSV4
 // full-attention layer path. The CPU reference uses the generic FA path
 // (op_params[4] = IQK_DISABLED) which handles sinks.
@@ -778,8 +939,10 @@ static void test_flash_attn_dense_sinks(ggml_backend_t backend_cpu, ggml_backend
 
     for (ggml_tensor * t = ggml_get_first_tensor(ctx_cpu); t != NULL; t = ggml_get_next_tensor(ctx_cpu, t)) {
         if (t->data == nullptr || t->view_src != nullptr || t->op == GGML_OP_VIEW) continue;
-        if ((strcmp(t->name, "k") == 0 || strcmp(t->name, "v") == 0) && kvtype == GGML_TYPE_Q8_0) {
-            init_tensor_q8_0(t);
+        if ((strcmp(t->name, "k") == 0 || strcmp(t->name, "v") == 0) && kvtype != GGML_TYPE_F16) {
+            init_tensor_quant(t);
+        } else if (strcmp(t->name, "q") == 0 && ggml_is_quantized(kvtype)) {
+            init_tensor_q_grid(t);
         } else if (strcmp(t->name, "mask") == 0) {
             std::vector<ggml_fp16_t> m(KV * mask_T, ggml_fp32_to_fp16(0.0f));
             ggml_backend_tensor_set(t, m.data(), 0, m.size() * sizeof(ggml_fp16_t));
@@ -875,6 +1038,21 @@ int main(int argc, char ** argv) {
     test_flash_attn_dense_sinks(backend_cpu, backend_tgt, GGML_TYPE_F16, 512, 512, 1, 64, 2048, false);
     test_flash_attn_dense_sinks(backend_cpu, backend_tgt, GGML_TYPE_F16, 64, 64, 2, 3, 128, true);
 
+    // Dense FA with a quantized KV cache (Q6_0/Q8_0 decode + prompt paths).
+    test_flash_attn_dense_sinks(backend_cpu, backend_tgt, GGML_TYPE_Q6_0, 64, 64, 1, 3, 128, false);
+    test_flash_attn_dense_sinks(backend_cpu, backend_tgt, GGML_TYPE_Q6_0, 64, 64, 1, 8, 512, true);
+    test_flash_attn_dense_sinks(backend_cpu, backend_tgt, GGML_TYPE_Q6_0, 128, 128, 5, 2, 256, false);
+    test_flash_attn_dense_sinks(backend_cpu, backend_tgt, GGML_TYPE_Q6_0, 256, 256, 32, 4, 1024, false);
+    test_flash_attn_dense_sinks(backend_cpu, backend_tgt, GGML_TYPE_Q8_0, 64, 64, 1, 3, 128, false);
+    test_flash_attn_dense_sinks(backend_cpu, backend_tgt, GGML_TYPE_Q8_0, 128, 128, 5, 2, 256, false);
+
+    // Quantized KV-cache write (llm_build_kv_store's ggml_cpy into a strided
+    // cache view) and the dequantizing read-back.
+    test_cpy_kv_write(backend_cpu, backend_tgt, GGML_TYPE_Q6_0, 128, 4, 256, 3, 7);
+    test_cpy_kv_write(backend_cpu, backend_tgt, GGML_TYPE_Q6_0, 256, 1, 128, 1, 1);
+    test_cpy_kv_write(backend_cpu, backend_tgt, GGML_TYPE_Q6_0, 64, 8, 512, 5, 32);
+    test_cpy_kv_write(backend_cpu, backend_tgt, GGML_TYPE_Q8_0, 128, 4, 256, 3, 7);
+
     test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F32, 32, 128, 4, 4, 8);
     test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F32, 16, 64, 3, 2, 6);
     test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F16, 32, 128, 4, 4, 8);
@@ -883,6 +1061,10 @@ int main(int argc, char ** argv) {
     test_set_rows(backend_cpu, backend_tgt, GGML_TYPE_F16, 64, 128, 5, false);
     test_set_rows(backend_cpu, backend_tgt, GGML_TYPE_F16, 128, 256, 8, true);
     test_set_rows(backend_cpu, backend_tgt, GGML_TYPE_F32, 32, 64, 4, false);
+    test_set_rows(backend_cpu, backend_tgt, GGML_TYPE_Q6_0, 128, 256, 8, false);
+    test_set_rows(backend_cpu, backend_tgt, GGML_TYPE_Q6_0, 64, 128, 5, true);
+    test_set_rows(backend_cpu, backend_tgt, GGML_TYPE_Q8_0, 128, 256, 8, false);
+    test_set_rows(backend_cpu, backend_tgt, GGML_TYPE_Q8_0, 64, 128, 5, true);
 
     if (backend_tgt != backend_cpu) {
         ggml_backend_free(backend_tgt);
