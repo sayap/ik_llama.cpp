@@ -647,6 +647,64 @@ Fixed by setting `src.buffer = per_step_*->buffer` (and clearing `view_src`/`vie
 before the copy. Qwen3.8-27B now matches CPU end-to-end with
 `--spec-type mtp:n_max=4,p_min=0.0/0.4` on both `Vulkan0` and `Vulkan1`.
 
+### 18. MTP prompt processing fed the whole ubatch into the lm_head (Vulkan OOM)
+
+`llama-server ... -dev Vulkan1 --spec-type mtp:n_max=4,p_min=0.4` on
+Qwen3.8-27B-IQ3_KT aborted at the first prompt batch with
+
+```text
+ggml_vulkan: Device memory allocation of size 2542796800 failed.
+ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory
+```
+
+while the same run fit on `-dev CUDA0`. The size decodes as `2 * n_embd * n_vocab =
+2 * 5120 * 248320`: the F16 of the **lm_head** (`output.weight`) — i.e. the flat-dequant
+`prealloc_x`. (Qwen3.8-27B is `qwen35`, a dense hybrid delta-net model; no MoE
+`MUL_MAT_ID` is involved.) Three things lined up:
+
+- With MTP, the graph builders suppress `inp_out_ids` (`n_tokens > 1 && !cparams.mtp`)
+  because the NextN head consumes the per-token **normed states** (`result_norm`, every
+  row), so the final norm kept the whole ubatch — and the lm_head multiply received it
+  too.
+- The server (`server_slot::need_embd()`) and `llama-cli` additionally set
+  `logits=true` on **every prompt token** of MTP/DFlash "target feature" slots, even
+  though those stages only read the target's hidden states (`ctx->embd`, extracted for
+  all rows whenever `has_mtp`, regardless of the batch logits flags) and nobody reads
+  the intermediate prompt logits. Hence `n_outputs == n_tokens`: the lm_head ran as a
+  `[n_vocab, n_embd] x [n_embd, ubatch]` mat-mat per prompt ubatch, producing an
+  `[n_vocab, ubatch]` F32 logits tensor plus its device-to-host copy.
+- On Vulkan, `IQ3_KT` (like all IQK/KT types and `Q6_0`) has no native mat-mat pipeline
+  on coopmat2 devices, so `ggml_vk_mul_mat_q_f16` dequantized the *entire* lm_head into
+  `prealloc_x` (~2.4 GiB). CUDA's quantized mmq never materializes it, which is why the
+  same run fit.
+
+The fix is backend-agnostic, in two independent parts:
+
+- `llm_build_context::build_output` takes an optional `inp_out_ids` that crops the
+  lm_head multiply to the `n_outputs` logit rows **after** the full-row final norm
+  (`result_norm` keeps every token for the NextN head). The MTP-capable builders
+  (`build_qwen35`/`build_qwen35moe`, GLM-4 MoE, DeepSeek2/GLM-DSA, OpenPangu) pass it
+  whenever `cparams.mtp && n_outputs < n_tokens` — the same pattern `build_step35`,
+  `build_deepseek4` and `build_gemma4` already used (`result_mtp_embd` + `get_rows`).
+- The server and `llama-cli` only flag the last prompt token of MTP/DFlash slots, like
+  the non-MTP path.
+
+Qwen3.8-27B-IQ3_KT on the RTX 3090 (`-wgt 1 --spec-type mtp:n_max=4,p_min=0.4`,
+301-token prompt / 192 generated tokens): the 2.4 GiB prealloc disappears (the largest
+remaining is the FFN matrix, ~170 MiB), ~2.9 GiB VRAM is saved in total (prealloc +
+logits tensor), and prompt processing is ~1.3x faster (~407 -> ~511-549 tok/s — every
+prompt ubatch had been paying the full-vocab matmul). Generation is unchanged
+(~52.6 tok/s before and after: the MTP verify batches legitimately need logits at every
+drafted position, and at `1 + n_max <= 5` columns they take the `mul_mat_vec` path
+regardless). Greedy output is byte-identical to CPU and CUDA (including
+`-cuda graphs=1`), with identical draft-acceptance counters, and multi-ubatch prompts
+work (intermediate ubatches run with `n_outputs == 0`, like the non-MTP path). Without
+MTP nothing changes.
+
+Note that the same whole-matrix dequant still applies whenever a quantized lm_head is
+multiplied with the full ubatch width (`--all-logits`/`-ppl` runs), and to MoE
+`MUL_MAT_ID` — see "Remaining gaps".
+
 ## Benchmarks (RTX 3090, Vulkan0)
 
 Qwen2.5-Coder-0.5B-Instruct-Q8_0 (dense, `-c 2048`, single token batch):
@@ -743,6 +801,23 @@ record PP tok/s and TG tok/s for both.
 ### Priority (highest first)
 
 1. **`MXFP4`** — the micro-scaling 4-bit format (now supported, see "MXFP4 quant").
+2. **Native coopmat2 `MUL_MAT_ID` for the IQK/KT families (or a tiled dequant fallback).**
+   `MUL_MAT_ID` for `IQ2_K`..`IQ6_K`, `IQ*_KS`, `IQ2_KL` and `IQ1_KT`..`IQ4_KT` returns
+   `nullptr` from `ggml_vk_get_mul_mat_mat_id_pipeline`, so `ggml_vk_mul_mat_id_q_f16`
+   takes the dequant-to-F16 fallback and materializes the **entire** expert matrix in
+   `ctx->prealloc_x` (`x_sz * ne02`, where `x_sz = sizeof(f16) * ne01 * ne00`; for a
+   fused `-muge` gate+up MoE tensor that is `2 * ne01 * ne00 * n_expert` bytes),
+   discovered in the dryrun and allocated lazily at the first prompt `graph_compute`.
+   On large MoE models this can OOM where CUDA's native quantized mmq fits. Fix
+   direction: a coopmat2 inline-dequant matmul_id, matching MXFP4's
+   `matmul_id_mxfp4_f16` (the blocker is the per-4-element `coordInBlock` matmul_id
+   decode invocation vs the byte-addressed IQK decode, see the NOTE in
+   `ggml-vulkan.cpp`), or a bounded/tiled dequant fallback as a stopgap — the latter
+   would also harden the dense path against `--all-logits`-style runs, where
+   `n_outputs == n_tokens` legitimately feeds the full ubatch width into a quantized
+   lm_head. Workaround: `-no-fmoe` splits the fused gate+up matmul into two
+   `MUL_MAT_ID`s of half size, halving `prealloc_x`.
+
 3. **Indexer / DSA / CSA / HCA / GLM-DSA**: `INDEXER_TOPK`, `MASK_TOPK`, `MASK_TO_IDX`,
    `SINKHORN`, `HC_PRE`, `HC_POST`, `LATENT_ATTN`, `DS4_COMP` — **now implemented** (see
    "DSA / GLM-DSA / DeepSeek-V4 sparse-attention ops" above and `tests/test-dsa.cpp`).

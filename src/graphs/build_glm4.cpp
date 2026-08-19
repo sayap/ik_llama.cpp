@@ -35,6 +35,9 @@ ggml_cgraph * llm_build_context::build_glm4_moe() {
 
         // output token IDs (for last layer cropping)
         struct ggml_tensor * inp_out_ids = (n_tokens > 1 && !lctx.cparams.mtp) ? build_inp_out_ids() : nullptr;
+        // with MTP the NextN head needs every token's normed state, but the lm_head
+        // only needs the n_outputs logit rows (crop them at the output instead)
+        struct ggml_tensor * inp_out_ids_mtp = (lctx.cparams.mtp && n_tokens > 1 && n_outputs < n_tokens) ? build_inp_out_ids() : nullptr;
 
         float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
@@ -139,7 +142,7 @@ ggml_cgraph * llm_build_context::build_glm4_moe() {
         cur = inpL;
 
         // lm head
-        cur = build_output(lctx, ctx0, cur, model.output, model.output_norm, cb);
+        cur = build_output(lctx, ctx0, cur, model.output, model.output_norm, cb, true, inp_out_ids_mtp);
         cb(cur, "result_output", -1);
     }
 

@@ -2521,7 +2521,8 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
 }
 
 ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur,
-        ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name) {
+        ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name,
+        ggml_tensor * inp_out_ids) {
     // lm_head
     if (output->extra) {
         auto split_output = (ggml_split_tensor_t *)output->extra;
@@ -2537,8 +2538,17 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
                 auto cur_normed = llm_build_context::llm_build_norm(ctx, cur, lctx.model.hparams, the_norm, NULL, LLM_NORM_RMS, cb, -1);
                 last_norm = cur_normed;
                 cb(cur_normed, "result_norm", 1000*(id+1));
+                // the normed states stay full-row (the MTP head reads them), only the
+                // lm_head multiply is cropped to the requested logit rows
+                if (inp_out_ids) {
+                    cur_normed = ggml_get_rows(ctx, cur_normed, inp_out_ids);
+                }
                 o.push_back(llm_build_context::llm_build_lora_mm(lctx, ctx, split, cur_normed));
             } else {
+                if (inp_out_ids) {
+                    cur = ggml_get_rows(ctx, cur, inp_out_ids);
+                    inp_out_ids = nullptr; // crop once, not per shard
+                }
                 o.push_back(llm_build_context::llm_build_lora_mm(lctx, ctx, split, cur));
             }
             cb(o.back(), "output", id);
@@ -2572,6 +2582,11 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
             if (add_normed_name) {
                 cb(cur, "result_norm", -1);
             }
+        }
+        // the normed states stay full-row (the MTP head reads them via the "result_norm"
+        // embedding output); only the lm_head multiply is cropped to the logit rows
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx, cur, inp_out_ids);
         }
         cur = llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur);
     }

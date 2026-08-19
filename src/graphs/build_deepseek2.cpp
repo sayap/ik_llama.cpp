@@ -1426,7 +1426,11 @@ ggml_cgraph * llm_build_context::build_deepseek2() {
         inpL = cur;
     }
 
-    cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
+    // with MTP the NextN head needs every token's normed state (result_norm), but the
+    // lm_head only needs the n_outputs logit rows: crop them at the output instead of
+    // multiplying the whole ubatch against the vocab
+    struct ggml_tensor * inp_out_ids_mtp = (lctx.cparams.mtp && n_tokens > 1 && n_outputs < n_tokens) ? build_inp_out_ids() : nullptr;
+    cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb, true, inp_out_ids_mtp);
     cb(cur, "result_output", -1);
 
     ggml_build_forward_expand(gf, cur);
