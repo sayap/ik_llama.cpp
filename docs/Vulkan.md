@@ -226,6 +226,49 @@ decode ~5% on Qwen3.6-27B (the output projection reaches ~870 GB/s, near the 309
 memory peak). CUDA instead has a native int8 mmq for `Q6_0` (decode to int8 + INT8
 tensor cores), which Vulkan does not yet do.
 
+### 9a. Q6_0 KV cache
+
+`-ctk q6_0 -ctv q6_0` (a `Q6_0` KV cache) now runs end-to-end on Vulkan. The pieces
+that were missing (and made Q6_0 KV either crash or fall back to the CPU) are now in:
+
+- **Cache write** (`ggml_cpy` F32→`Q6_0` / `GGML_OP_SET_ROWS` → `Q6_0`): the
+  `copy_to_quant.comp` shader gained a `DATA_A_Q6_0` `quantize()` that mirrors
+  `quantize_row_q6_0_ref` (the function the CPU `dup`/`cpy` path calls via
+  `from_float`), including the weighted scale refinement `sumqx/sumq2`, plus the
+  `cpy_f32_q6_0`/`cpy_q6_0_f32`/`set_rows_q6_0{,_i32}` shaders and their pipelines.
+  The dequantizing read-back (`cpy_q6_0_f32`) uses the existing `dequantize4`/
+  `get_dm` in `dequant_funcs.comp` and the generic `copy_from_quant.comp`. The
+  Vulkan quantizer is **bit-identical** to the CPU reference (`tests/test-dsa.cpp`
+  reports "bytes exact" for the `cpy_kv_write` and `set_rows q6_0` cases on both
+  `Vulkan0` and `Vulkan1`).
+- **Flash attention read** (`GGML_OP_FLASH_ATTN_EXT`): the dense FA shaders now
+  cover `Q6_0` KV in the **scalar**, **coopmat1** and **coopmat2** paths. The
+  scalar/cm1 paths use a new `DATA_A_Q6_0` `dequantize4` in `flash_attn_base.comp`
+  (4-consecutive-element decode through the `kv_packed16` view; verified exhaustively
+  against the format definition); cm2 already had `dequantFuncQ6_0`. `supports_op`
+  moves `Q6_0` out of the coopmat2-only group (it used to be accepted there but no
+  `CREATE_FA` pipeline existed for it, so prompt processing on coopmat2 hit a null
+  pipeline and single-token decode — which switches to the scalar path — crashed).
+  A defensive guard was added so the `N == 1` coopmat2→scalar switch only happens
+  when the type actually has a scalar pipeline (fixes the same latent null-pipeline
+  crash for the other coopmat2-only types `Q4_1`/`Q5_0`/`Q5_1`/`IQ4_NL`).
+- **`GET_ROWS`** accepts `Q6_0` (the `get_rows_q6_0` pipeline already existed; it
+  was just missing from the `supports_op` switch).
+
+A CPU bug found while validating the FA path: `ggml_vec_dot_q6_0_q8_0` passed the
+wrong y-type to `iqk_mul_mat` (`Q8_1`/`Q8_0` instead of the `Q8_2_X4`/`Q8_0_X4`
+declared in the type traits table and produced by the FA activation quantizer), so
+`iqk_mul_mat` rejected the packed y and the stub silently returned `*s = 0` — i.e.
+**CPU flash attention with a `Q6_0` KV cache computed all-zero scores** (uniform
+attention). It now passes the traits-table type, matching the neighbouring
+`ggml_vec_dot_q8_0_q8_0` stub; with that fix the CPU integer dot matches the format
+dequant to ~6e-5 relative (the `iqk` legacy-quant kernels are exact for `Q6_0`).
+`tests/test-dsa.cpp` validates dense FA with `Q6_0`/`Q8_0` KV against the CPU
+reference on both `Vulkan0` (RTX 3090) and `Vulkan1` (Strix Halo) at ~1e-4..3e-4
+max abs diff (the test forces `q` onto an exact per-block Q8 grid so the CPU
+integer dot and the GPU f32 dot are comparable), plus the quantized cache write /
+`SET_ROWS` / read-back round trip.
+
 ### 9b. MXFP4 quant
 
 `MXFP4` (OCP microscaling 4-bit: 32 4-bit e2m1 values per block plus one shared E8M0

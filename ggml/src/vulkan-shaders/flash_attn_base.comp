@@ -87,6 +87,39 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 }
 #endif
 
+#if defined(DATA_A_Q6_0)
+#define BLOCK_BYTE_SIZE 26
+
+// iqs is 4-aligned; dequantize the 4 consecutive elements iqs..iqs+3.
+// qs byte j (j = element % 16) packs the low 4 bits of element j and the high
+// 4 bits of element j + 16; qh byte (j % 8) holds the top 2 bits of element j
+// in its low nibble (j < 8) and the top 2 bits of element j + 16 in its high
+// nibble. Both nibble selections are uniform across the 4 elements because
+// iqs is 4-aligned.
+vec4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    // 4 consecutive qs bytes, starting at byte (iqs % 16).
+    const uint qs = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[(iqs & 0xFu) / 2u]) |
+                    uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qs[(iqs & 0xFu) / 2u + 1u]) << 16;
+    // 4 consecutive qh bytes, starting at byte (iqs % 8).
+    const uint qh = uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qh[(iqs & 4u) / 2u]) |
+                    uint(kv_packed[binding_idx].data_packed16[a_offset + ib].qh[(iqs & 4u) / 2u + 1u]) << 16;
+
+    const uint qs_shift = (iqs < 16u) ? 0u : 4u;                // low/high nibble of the qs byte
+    const uint qh_shift = ((iqs & 8u) == 0u) ? 0u : 4u;         // low/high nibble of the qh byte
+    const uint h_shift  = (iqs < 16u) ? 0u : 2u;                // 2-bit field of element j vs j + 16
+
+    uvec4 q;
+    [[unroll]] for (uint t = 0; t < 4; ++t) {
+        const uint qs_t = (qs >> (8u * t)) & 0xFFu;
+        const uint qh_t = (qh >> (8u * t)) & 0xFFu;
+        const uint h    = (qh_t >> qh_shift) & 0xFu;
+        q[t] = ((qs_t >> qs_shift) & 0xFu) | (((h >> h_shift) & 0x3u) << 4u);
+    }
+
+    return float(kv_packed[binding_idx].data_packed16[a_offset + ib].d) * (vec4(q) - 32.0f);
+}
+#endif
+
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
 

@@ -5619,9 +5619,12 @@ void ggml_vec_dot_q5_1_q8_1(int n, float * restrict s, size_t bs, const void * r
 void ggml_vec_dot_q6_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT
 #ifdef __AVX2__
-    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_1;
+    // must match the vec_dot_type declared in the type traits table (Q8_2_X4);
+    // passing Q8_1 here made iqk_mul_mat reject the packed y and the stub
+    // silently returned *s = 0 (broken CPU flash attention for Q6_0 KV)
+    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_2_X4;
 #else
-    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_0;
+    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_0_X4;
 #endif
     if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q6_0, vx, bx, vec_dot_type, vy, by, s, bs, 0, 1)) {
         return;
