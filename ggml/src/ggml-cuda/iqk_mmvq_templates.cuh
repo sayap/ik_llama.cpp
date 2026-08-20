@@ -57,8 +57,11 @@ static __device__ void iqk_mul_mat_vec_q_kernel(
             if constexpr (n_interleaved == 1) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    vec_dot_q_cuda((const void *)((const char *)vx + (row0 + i)*row_size),
-                            &y[j*blocks_per_col_y + kby], kbx, kqs, &tmp[j][i]);
+                    // guard the phantom row of an odd-nrows_x matrix (see k_mul_mat_vec_q)
+                    if (row0 + i < nrows_x) {
+                        vec_dot_q_cuda((const void *)((const char *)vx + (row0 + i)*row_size),
+                                &y[j*blocks_per_col_y + kby], kbx, kqs, &tmp[j][i]);
+                    }
                 }
             } else {
                 vec_dot_q_cuda((const void *)((const char *)vx + row0*row_size),
@@ -141,10 +144,13 @@ static __device__ void iqk_fused_mul_mat_vec_q_kernel(
             if constexpr (n_interleaved == 1) {
 #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    vec_dot_q_cuda((const void *)((const char *)vup + (row0 + i)*row_size),
-                            &y[j*blocks_per_col_y + kby], kbx, kqs, &tmp_u[j][i]);
-                    vec_dot_q_cuda((const void *)((const char *)vgate + (row0 + i)*row_size),
-                            &y[j*blocks_per_col_y + kby], kbx, kqs, &tmp_g[j][i]);
+                    // guard the phantom row of an odd-nrows_x matrix (see k_mul_mat_vec_q)
+                    if (row0 + i < nrows_x) {
+                        vec_dot_q_cuda((const void *)((const char *)vup + (row0 + i)*row_size),
+                                &y[j*blocks_per_col_y + kby], kbx, kqs, &tmp_u[j][i]);
+                        vec_dot_q_cuda((const void *)((const char *)vgate + (row0 + i)*row_size),
+                                &y[j*blocks_per_col_y + kby], kbx, kqs, &tmp_g[j][i]);
+                    }
                 }
             } else {
                 vec_dot_q_cuda((const void *)((const char *)vup + row0*row_size),

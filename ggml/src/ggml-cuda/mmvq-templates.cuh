@@ -107,7 +107,13 @@ static __device__ void k_mul_mat_vec_q(
         for (int j = 0; j < ncols_y; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(vx, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+                // nblocks covers rows_per_cuda_block-aligned row pairs, so the last block
+                // of an odd-nrows_x matrix has a phantom second row: reading it would run
+                // past the end of the weight tensor (a weight slice gets its own
+                // allocation under -sm graph, so this is a real out-of-bounds access)
+                if (row0 + i < nrows_x) {
+                    tmp[j][i] += vec_dot_q_cuda(vx, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+                }
             }
         }
     }
@@ -201,8 +207,11 @@ static __device__ void k_fused_mul_mat_vec_q(
         for (int j = 0; j < ncols_y; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp_u[j][i] += vec_dot_q_cuda(vup  , &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
-                tmp_g[j][i] += vec_dot_q_cuda(vgate, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+                // see k_mul_mat_vec_q: guard the phantom row of an odd-nrows_x matrix
+                if (row0 + i < nrows_x) {
+                    tmp_u[j][i] += vec_dot_q_cuda(vup  , &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+                    tmp_g[j][i] += vec_dot_q_cuda(vgate, &y[j*blocks_per_col_y + kby], (row0 + i)*blocks_per_row_x + kbx, kqs);
+                }
             }
         }
     }
