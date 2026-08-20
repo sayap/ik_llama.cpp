@@ -227,6 +227,19 @@ if (GGML_VULKAN AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-vk-split.cpp LABEL "main")
 endif()
 
+# Generic split buffer ("GGML_SPLIT", the -sm graph/attn weight path in GGML_BACKEND_DL
+# and mixed-backend builds) must honor per-backend quantized-row padding: the CUDA MMQ
+# kernels over-read each weight row to the MATRIX_ROW_PADDING boundary, so unpadded
+# slices caused illegal memory accesses / garbage tails. Skips itself without CUDA.
+llama_build_and_test(test-split-mmq-padding.cpp LABEL "main")
+
+# Same test under compute-sanitizer memcheck (catches the out-of-bounds reads even
+# when they stay inside mapped VRAM). Skips when compute-sanitizer is not installed.
+add_test(
+    NAME test-split-mmq-padding-sanitizer
+    COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/test-split-mmq-padding.sh $<TARGET_FILE:test-split-mmq-padding>)
+set_property(TEST test-split-mmq-padding-sanitizer PROPERTY LABELS sanitizer)
+
 
 # dummy executable - not installed
 get_filename_component(TEST_TARGET test-c.c NAME_WE)

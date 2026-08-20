@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <algorithm>
 #include <vector>
 #include <set>
 #include <array>
@@ -691,12 +692,31 @@ static void ggml_backend_split_buffer_init_tensor([[maybe_unused]] ggml_backend_
         }
         auto split = extra->splits[i];
         GGML_ASSERT(buft_ctx->bufts[i] != nullptr);
-        ggml_backend_buffer_t sub_buffer = ggml_backend_buft_alloc_buffer(buft_ctx->bufts[i], ggml_nbytes(split));
+
+        // Backends may require padding past the logical size of quantized tensors
+        // (e.g. CUDA pads the tail of quantized weight matrices to MATRIX_ROW_PADDING
+        // elements because the MMQ kernels over-read each row up to that boundary).
+        // Allocate each slice with the per-backend allocation size, which includes
+        // that padding, and zero the tail so kernels that read it do not consume
+        // garbage. Allocating the bare ggml_nbytes() left the MMQ over-read past the
+        // end of the slice allocation (illegal memory accesses under -sm graph with
+        // K-split quantized weights).
+        const size_t size   = ggml_nbytes(split);
+        const size_t padded = std::max(ggml_backend_buft_get_alloc_size(buft_ctx->bufts[i], split), size);
+
+        ggml_backend_buffer_t sub_buffer = ggml_backend_buft_alloc_buffer(buft_ctx->bufts[i], padded);
         GGML_ASSERT(sub_buffer != nullptr);
 
         split->data = ggml_backend_buffer_get_base(sub_buffer);
         split->buffer = sub_buffer;
         ggml_backend_buffer_set_usage(split->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        if (padded > size) {
+            // write directly through the buffer interface: ggml_backend_tensor_set()
+            // rejects writes past ggml_nbytes(tensor), which is exactly the padding
+            const std::vector<char> zeros(padded - size);
+            sub_buffer->iface.set_tensor(sub_buffer, split, zeros.data(), size, padded - size);
+        }
     }
 }
 
@@ -996,12 +1016,15 @@ static size_t ggml_backend_split_buffer_type_get_alloc_size([[maybe_unused]] ggm
         return 0;
     }
     auto extra = (ggml_split_tensor_t *) tensor->extra;
+    auto * buft_ctx = (ggml_backend_split_buffer_type_context *) buft->context;
 
+    // must match ggml_backend_split_buffer_init_tensor: sum of the per-backend
+    // (padded) allocation sizes of the slices
     size_t total_size = 0;
     for (int i = 0; i < extra->n_device; ++i) {
         auto split = extra->splits[i];
         if (!split) continue;
-        total_size += ggml_nbytes(split);
+        total_size += std::max(ggml_backend_buft_get_alloc_size(buft_ctx->bufts[i], split), ggml_nbytes(split));
     }
     return total_size;
 }
