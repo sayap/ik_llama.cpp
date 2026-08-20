@@ -889,7 +889,7 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_graph * cur_graph = nullptr;
 
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
 #endif
 

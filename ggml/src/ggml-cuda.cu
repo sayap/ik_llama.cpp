@@ -4489,16 +4489,60 @@ GGML_CALL static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 
 #ifdef USE_CUDA_GRAPH
 
-static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+// Fingerprint of everything about a compute graph that selects the captured CUDA graph's
+// topology and kernel functions: the node count and, per node, the op, the tensor type,
+// the shape (ne) and layout (nb) of the node and its first two sources' types. Data
+// pointers are deliberately NOT part of the key - they may change between replays and
+// are handled by cudaGraphExecUpdate (which requires identical topology and kernel
+// functions, exactly what this hash approximates; a 64-bit collision merely degrades to
+// a failed update + re-instantiation, which is safe).
+//
+// Keying by this fingerprint instead of the previous key (the raw pointer of
+// cgraph->nodes[0]) keeps one stable cache entry per distinct graph *shape*: workloads
+// that alternate between a small set of shapes (speculative/MTP decoding: 1-token draft
+// graphs, 2..n-token verify batches, per-step-checkpoint on/off) previously thrashed a
+// single entry - re-capturing on every compute, failing cudaGraphExecUpdate whenever the
+// kernel set differed, and eventually disabling graphs for that entry entirely.
+static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    uint64_t h = 1469598103934665603ull; // FNV-1a 64
+    auto mix = [&h](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+    mix((uint64_t) cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        mix((uint64_t) node->op);
+        mix((uint64_t) node->type);
+        for (int j = 0; j < GGML_MAX_DIMS; ++j) {
+            mix((uint64_t) node->ne[j]);
+            mix((uint64_t) node->nb[j]);
+        }
+        for (int j = 0; j < 2; ++j) {
+            mix(node->src[j] ? (uint64_t) node->src[j]->type : 0);
+        }
+    }
+    return h;
 }
 
-static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & ctx, const void * key) {
-    auto & graph = ctx.cuda_graphs[key];
-    if (!graph) {
-        graph = std::make_unique<ggml_cuda_graph>();
+// upper bound on cached graphs per backend; each entry holds a captured cudaGraph +
+// instantiated exec, so a pathological shape-zoo must not grow this unboundedly
+static constexpr size_t GGML_CUDA_MAX_CACHED_GRAPHS = 64;
+
+static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & ctx, uint64_t key) {
+    auto it = ctx.cuda_graphs.find(key);
+    if (it == ctx.cuda_graphs.end()) {
+        if (ctx.cuda_graphs.size() >= GGML_CUDA_MAX_CACHED_GRAPHS) {
+            // drop the whole cache: entries are only reachable through their shape key,
+            // and re-capturing the live shapes is cheaper than tracking true LRU order
+#ifndef NDEBUG
+            GGML_CUDA_LOG_DEBUG("%s: evicting %zu cached CUDA graphs\n", __func__, ctx.cuda_graphs.size());
+#endif
+            ctx.cuda_graphs.clear();
+        }
+        it = ctx.cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
     }
-    return graph.get();
+    return it->second.get();
 }
 
 static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph * graph, ggml_cgraph * cgraph,
