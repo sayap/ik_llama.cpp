@@ -1475,7 +1475,9 @@ Remaining performance notes:
   quants, i.e. within the docs' ~1.1x-of-CUDA figure). `-nocb` matters: without it IQ2_KS
   showed a spurious ~872 tok/s and IQ3_KT hit a `vk::DeviceLostError`. IQ6_K is the only
   laggard, limited by the multi-GPU split (17% of tensors on the ~3.7x-slower AMD iGPU plus
-  per-split cross-device sync) rather than the IQ6_K decode.
+  per-split cross-device sync) rather than the IQ6_K decode. (The IQ5_K/IQ5_KS/IQ6_K rows
+  predate the table-lookup dequant fix — see follow-up #2 under "vs CUDA"; on the 27B
+  Qwen3.8 model the same fix lifted an all-IQ5_K model from 654 to ~976 tok/s pp512.)
   **PP optimization candidates** (see also "vs CUDA" below): (1) the F16 tensor-core matmul
   runs at ~75% of FP16 peak — tile-size / split-k tuning of the generic coopmat2 matmul lifts
   every quant uniformly; (2) for >24 GB models, tune the tensor-split heuristic to keep the
@@ -1648,6 +1650,49 @@ remaining gaps are dominated by the FFN:
     back to dequant+F16 (segfault on the Strix Halo iGPU). The matmul-pipeline lookup
     now returns nullptr when the selected struct has no compiled l/m/s/a_* variants,
     which takes the intended dequant+F16 fallback.
+
+    **Follow-up #2 (2026-08-20, evening): the table-lookup types were the remaining
+    dequant laggards; iq5_k/iq5_ks/iq6_k were fixed (~2x dequant, +49% PP for an
+    all-IQ5_K model at ub 512).** At the same FFN shape the 2026-08-20 restructure
+    above had left three types well behind the pack (min-of-N, total dequant+GEMM):
+    iq5_k 2.23 ms, iq6_k 1.59-2.4, iq5_ks 1.34-1.92 (vs ~1.27-1.30 for the rest; the
+    F16 GEMM alone is 0.97). Two root causes, both in the value-table lookup that
+    every element of these 5/6-bit formats performs:
+
+    - **iq5_k read its 64-entry `iq5nl_values` table through a dynamically indexed
+      *const array*** — glslc lowers that to thread-local (scratch) memory, one slow
+      local load per element, ~212 GB/s effective. iq5_k now stages the table in
+      shared memory (as does iq6_k, which already did but as int8).
+    - **iq5_ks/iq6_k staged their tables as `shared int8_t`**: a 64/128-byte int8
+      table only spans 16/32 shared-memory bank-words, so the per-element lookups
+      conflict heavily. The tables are now `shared int` (4-byte entries spread over
+      all 32 banks; this is also what the mmq path's `iq5nl_shmem` uses).
+    - **The one-vec4-per-thread mapping (64 threads/block) re-read the qs/qh/scale
+      dwords for every 4 elements.** All three now use 16 threads per block
+      (`wg_denoms` 256*16): thread (ib64, k) decodes the low- and high-nibble vec4
+      pairs of qs dwords 2k and 2k+1 — 16 elements per thread, one shared qs/qh/
+      scale/head load set, and both stores stay warp-coalesced (a naive 2-vec4
+      variant that splits the two stores 64 B apart measured *slower* for iq5_ks,
+      so the dword-pair form is the one to copy for future types). Removing the
+      table lookup entirely (throwaway experiment) only saved ~0.17 ms of iq6_k's
+      0.6 ms overhead, i.e. the load amortization matters as much as the lookup.
+
+    Measured (RTX 3090, `[17408,5120] x n=512`, min-of-N): iq5_k 2.23 → **1.29 ms**,
+    iq6_k 1.59 → **1.31**, iq5_ks 1.34-1.92 → **1.28** — the whole family is now
+    1.26-1.36, i.e. the dequant overhead over the F16 GEMM is ~0.3-0.4 ms uniformly
+    (~780-830 GB/s effective, vs ~870 GB/s for `dequant_q8_0`'s trivial decode; the
+    residual gap to the ~0.25 ms traffic floor is the per-element LDS + index ALU
+    and the F16 GEMM's own B-tile re-reads). An arithmetic replacement for the
+    iq6nl table was considered and rejected: `round(A + q*(B + q*(-C + q*D)))`
+    reproduces every table entry (max deviation 0.49), but the polynomial would
+    deviate from the CUDA table decode by up to ~0.4% per weight and break
+    bit-identity with CUDA; the table stays. End-to-end, Qwen3.8-27B-IQ5_K
+    (all tensors IQ5_K) on Vulkan0: pp512 654 → **~976 tok/s** (+49%), pp2048
+    660 → **~918** (+39%), tg128 unchanged (~25.9); IQ5_KS pp512 879 → ~908,
+    pp2048 884 → ~921, tg128 unchanged (~29.5). A 48-token greedy completion is
+    byte-identical to CUDA0. `iq2_ks`/`iq3_ks`/`iq2_kl` (1.33-1.35) keep their
+    one-vec4 mappings — their decodes are cheap enough that the same treatment
+    would gain little.
 - The base IQK types (IQ2_K..IQ6_K) have per-16-element dequant scales. The coopmat1
   SIMT mmq now handles them (two scales per BK=32 tile); the coopmat2 cm2 inline-dequant
   path still lacks per-16 handling, so those types keep the dequant+F16 fallback there.

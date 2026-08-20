@@ -9,8 +9,9 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define QUANT_K 256
 #define BLOCK_BYTES 212
 
-// Value table staged in shared memory: entry i = iq6nl_values[i].
-shared int8_t iq6k_tbl[128];
+// Value table staged in shared memory as int entries (int8 entries crowd the
+// shared-memory banks and conflict).
+shared int iq6k_tbl[128];
 
 // part 0: 4-bit low nibbles, 2 high bits from h
 vec4 iq6k_lo(uint qw, uint hw, uint shift, uint vo) {
@@ -33,17 +34,16 @@ vec4 iq6k_hi(uint qw, uint hw, uint shift, uint vo) {
 void main() {
     const uint tid = gl_LocalInvocationID.x;
     [[unroll]] for (uint idx = tid; idx < 128; idx += 256) {
-        iq6k_tbl[idx] = iq6nl_values[idx];
+        iq6k_tbl[idx] = int(iq6nl_values[idx]);
     }
     barrier();
 
-    // 64 threads per block: thread (ib64, part, t) decodes one vec4;
-    // t < 4 is the low 16 elements (qs dwords j = t), t >= 4 the high 16
-    // (qs dwords 4 + j).
-    const uint ib = gl_WorkGroupID.x * 4 + tid / 64;
-    const uint ib64 = (tid % 64) / 16;
-    const uint part = (tid % 16) / 8;
-    const uint t = tid % 8;
+    // 16 threads per block: thread (ib64, k) decodes the low- and high-nibble
+    // vec4 pairs of sub-block ib64 (of 4), qs dwords 2k and 2k+1 (of 8) --
+    // 16 elements per thread, contiguous stores.
+    const uint ib = gl_WorkGroupID.x * 16 + tid / 16;
+    const uint ib64 = (tid % 16) / 4;
+    const uint k = tid % 4;
 
     if (ib >= p.nel / QUANT_K) {
         return;
@@ -59,33 +59,28 @@ void main() {
     const float d = iqk_f16_to_f32(head & 0xffffu);
     const uint extra = head >> 16;
     const uint sc = data_a32[dw + 1 + ib64];
-    const uint b_idx = QUANT_K * ib + 64 * ib64 + 32 * part + 4 * t;
 
     const uint shift = 4 * (ib64 % 2);
     const uint e = extra >> (4 * ib64);
     const uint qs_dw = (block_byte + 20 + 32 * ib64) / 4;
     const uint qh_dw = (block_byte + 148 + 32 * (ib64 / 2)) / 4;
-    const uint j = t & 3;
 
-    if (part == 0) {
-        const float dl1 = d * float(int8_t(sc & 0xffu));
-        const float dl2 = d * float(int8_t((sc >> 8) & 0xffu));
-        const uint v1_off = (e & 1u) != 0 ? 64u : 0u;
-        const uint v2_off = (e & 2u) != 0 ? 64u : 0u;
-        if (t < 4) {
-            iqk_store4(b_idx, dl1 * iq6k_lo(data_a32[qs_dw + j], data_a32[qh_dw + j], shift, v1_off));
-        } else {
-            iqk_store4(b_idx, dl2 * iq6k_lo(data_a32[qs_dw + 4 + j], data_a32[qh_dw + 4 + j], shift, v2_off));
-        }
-    } else {
-        const float dl1 = d * float(int8_t((sc >> 16) & 0xffu));
-        const float dl2 = d * float(int8_t((sc >> 24) & 0xffu));
-        const uint v1_off = (e & 4u) != 0 ? 64u : 0u;
-        const uint v2_off = (e & 8u) != 0 ? 64u : 0u;
-        if (t < 4) {
-            iqk_store4(b_idx, dl1 * iq6k_hi(data_a32[qs_dw + j], data_a32[qh_dw + j], shift, v1_off));
-        } else {
-            iqk_store4(b_idx, dl2 * iq6k_hi(data_a32[qs_dw + 4 + j], data_a32[qh_dw + 4 + j], shift, v2_off));
-        }
-    }
+    const uint qw0 = data_a32[qs_dw + 2 * k];
+    const uint hw0 = data_a32[qh_dw + 2 * k];
+    const uint qw1 = data_a32[qs_dw + 2 * k + 1];
+    const uint hw1 = data_a32[qh_dw + 2 * k + 1];
+
+    // scale index over the 64 elements: low-nibble elements 8k..8k+7 use scale
+    // k/2, high-nibble elements (32+8k..) use scale 2 + k/2; the extra bit
+    // selects the +1 table half for that scale
+    const float dl_lo = d * float(int8_t((sc >> (8 * (k / 2))) & 0xffu));
+    const float dl_hi = d * float(int8_t((sc >> (8 * (2 + k / 2))) & 0xffu));
+    const uint v_lo = ((e >> (k / 2)) & 1u) != 0 ? 64u : 0u;
+    const uint v_hi = ((e >> (2 + k / 2)) & 1u) != 0 ? 64u : 0u;
+
+    const uint b_idx = QUANT_K * ib + 64 * ib64 + 8 * k;
+    iqk_store4(b_idx,      dl_lo * iq6k_lo(qw0, hw0, shift, v_lo));
+    iqk_store4(b_idx + 4,  dl_lo * iq6k_lo(qw1, hw1, shift, v_lo));
+    iqk_store4(b_idx + 32, dl_hi * iq6k_hi(qw0, hw0, shift, v_hi));
+    iqk_store4(b_idx + 36, dl_hi * iq6k_hi(qw1, hw1, shift, v_hi));
 }
