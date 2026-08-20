@@ -1007,6 +1007,17 @@ set(CUDA_CXX_FLAGS "")
 
 if (GGML_CUDA)
     set(CUDA_FLAGS -use_fast_math -extended-lambda -lineinfo)
+    # On Linux CMake provides no default per-config flags for the CUDA language (no
+    # Linux platform module, unlike the C/C++ -O3 -DNDEBUG Release default), so the
+    # CUDA backend would otherwise compile its host code unoptimized and with the
+    # #ifndef NDEBUG debug logging in ggml-cuda.cu enabled even in Release builds.
+    # Match the C/C++ per-config defaults.
+    if (NOT MSVC)
+        list(APPEND CUDA_FLAGS
+            "$<$<CONFIG:Release>:-O3;-DNDEBUG>"
+            "$<$<CONFIG:MinSizeRel>:-Os;-DNDEBUG>"
+            "$<$<CONFIG:RelWithDebInfo>:-O2;-g;-DNDEBUG>")
+    endif()
 	message("-- CUDA Toolkit: ${CUDAToolkit_VERSION}")
     if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
         # Options are:
