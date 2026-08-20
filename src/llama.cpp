@@ -8649,7 +8649,12 @@ struct llama_context * llama_init_from_model(
                 if (ctx->ggml_backend_by_name(name)) {
                     continue; // already initialized
                 }
-                ggml_backend_t backend = ggml_backend_reg_init_backend(dev, nullptr);
+                ggml_backend_t backend = ggml_backend_reg_init_backend(dev,
+                        // pass the -cuda parameter string through to CUDA backends (they
+                        // are usually created through the #ifdef'd paths above; this
+                        // registry fallback is what runs in GGML_BACKEND_DL builds)
+                        cparams.cuda_params && strncmp(name, "CUDA", 4) == 0
+                            ? (const char *) cparams.cuda_params : nullptr);
                 if (backend == nullptr) {
                     LLAMA_LOG_ERROR("%s: failed to initialize %s backend\n", __func__, name);
                     llama_free(ctx);

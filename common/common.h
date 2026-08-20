@@ -253,6 +253,11 @@ struct common_params_speculative {
 
     llama_context_params cparams_dft; // these are the parameters for the draft llama_context
 
+    // Stable storage for the draft/companion context's -cuda parameters: cparams_dft.cuda_params
+    // is a raw pointer and common_context_params_to_llama() would point it into a local
+    // gpt_params copy that dies before the context is created
+    std::string cuda_params_str;
+
     int32_t n_ctx = 0;  // draft context size
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 

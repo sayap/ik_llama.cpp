@@ -5561,7 +5561,10 @@ GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
 
 // backend registry
 GGML_CALL static ggml_backend_t ggml_backend_reg_cuda_init(const char * params, void * user_data) {
-    ggml_backend_t cuda_backend = ggml_backend_cuda_init((int) (intptr_t) user_data, nullptr, nullptr);
+    // forward the -cuda parameter string: in GGML_BACKEND_DL builds llama.cpp creates the
+    // backends through ggml_backend_reg_init_backend(), and dropping the string here made
+    // every -cuda key=value (graphs, fusion, ...) a no-op in those builds
+    ggml_backend_t cuda_backend = ggml_backend_cuda_init((int) (intptr_t) user_data, params, nullptr);
     return cuda_backend;
 
     GGML_UNUSED(params);

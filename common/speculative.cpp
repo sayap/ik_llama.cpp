@@ -2040,6 +2040,11 @@ bool common_speculative_load_draft_model(
 
     params.model_dft = loaded_model;
     params.cparams_dft = common_context_params_to_llama(params_dft);
+    // common_context_params_to_llama() points cuda_params into the local params_dft's
+    // string; keep a copy that outlives the draft context creation and repoint
+    params.cuda_params_str = params_dft.cuda_params;
+    params.cparams_dft.cuda_params = params.cuda_params_str.empty()
+        ? nullptr : (void *) params.cuda_params_str.data();
     return true;
 }
 
@@ -2081,6 +2086,13 @@ bool common_speculative_prepare_mtp_runtime(
         gpt_params params_mtp = params_base;
         params_mtp.pooling_type = LLAMA_POOLING_TYPE_NONE;
         params.cparams_dft = common_context_params_to_llama(params_mtp);
+        // common_context_params_to_llama() points cuda_params into the local params_mtp's
+        // string; keep a copy that outlives the companion context creation and repoint,
+        // otherwise the MTP context reads freed memory and silently drops -cuda parameters
+        // (e.g. -cuda graphs=0 did not disable CUDA graphs for the MTP context)
+        params.cuda_params_str = params_mtp.cuda_params;
+        params.cparams_dft.cuda_params = params.cuda_params_str.empty()
+            ? nullptr : (void *) params.cuda_params_str.data();
     }
 
     params.cparams_dft.mtp         = true;
