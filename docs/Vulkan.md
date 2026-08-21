@@ -742,6 +742,20 @@ Note that the same whole-matrix dequant still applies whenever a quantized lm_he
 multiplied with the full ubatch width (`--all-logits`/`-ppl` runs), and to MoE
 `MUL_MAT_ID` — see "Remaining gaps".
 
+**Follow-up bug (fixed):** the server half of that commit silently corrupted the MTP
+warmup for multi-ubatch prompts. With logits flagged only on the last prompt token,
+the intermediate ubatches decode with `n_outputs == 0`, and `llama_decode_internal`
+then skipped the *embedding* discovery/extraction too (it was nested inside the
+`n_outputs != 0` branch) — so `ctx->embd` only received the final ubatch's rows while
+`llama_spec_get_hidden_feature_view` still maps **every** batch row into it. The MTP
+companion warmed up on stale/garbage hidden states, which for recurrent models
+(qwen35 delta-net) poisons the draft conditioning for the whole generation: draft
+acceptance dropped from ~100% to ~80% on a 1145-token prompt with `-ub 512` (3
+ubatches), backend-independent (CUDA and Vulkan alike). The commit's own validation
+used a 301-token prompt — a single ubatch — which is why it slipped through. Fixed by
+keeping the `embd` discovery alive when `n_outputs == 0 && has_mtp` (the logits side
+still runs `res = nullptr` as before; only hidden-state rows are extracted).
+
 ## Benchmarks (RTX 3090, Vulkan0)
 
 Qwen2.5-Coder-0.5B-Instruct-Q8_0 (dense, `-c 2048`, single token batch):

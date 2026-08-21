@@ -6583,12 +6583,16 @@ static int llama_decode_internal(
             }
         }
 
-        if (lctx.n_outputs == 0) {
+        // Note: with MTP the per-token hidden states must be extracted for every
+        // ubatch, including the intermediate prompt ubatches that have no logit rows
+        // (n_outputs == 0) - the draft companion's warmup consumes the full-row
+        // ctx->embd afterwards. Skipping the discovery here would leave ctx->embd
+        // partially stale and corrupt the MTP conditioning (draft acceptance drop).
+        if (lctx.n_outputs == 0 && !has_mtp) {
             // no output
             res = nullptr;
         }
         else {
-            const bool has_mtp = llama_context_has_mtp_outputs(lctx);
             if (cparams.embeddings || has_mtp) {
                 if (has_mtp) {
                     for (int i = gf->n_nodes - 1; i >= 0; --i) {
