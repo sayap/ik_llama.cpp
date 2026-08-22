@@ -26,7 +26,11 @@ layout(binding = 0) readonly buffer K { float k[]; };
 #endif
 layout(binding = 1) readonly buffer Q { float q[]; };
 layout(binding = 2) readonly buffer W { float w[]; };
+#if defined(MASK_F16)
+layout(binding = 3) readonly buffer M { uint16_t mask[]; };
+#else
 layout(binding = 3) readonly buffer M { float mask[]; };
+#endif
 layout(binding = 4) buffer SCORE { float score[]; };
 
 #if defined(DATA_A_F16)
@@ -36,6 +40,16 @@ float k_val(uint idx) {
 #else
 float k_val(uint idx) {
     return k[idx];
+}
+#endif
+
+#if defined(MASK_F16)
+float m_val(uint idx) {
+    return unpackHalf2x16(uint(mask[idx])).x;
+}
+#else
+float m_val(uint idx) {
+    return mask[idx];
 }
 #endif
 
@@ -49,7 +63,7 @@ void main() {
     const uint iq_local = id / p.n_kv;
     const uint iq = p.first_row + iq_local;
 
-    float s = mask[iq*p.m_nb1 + kv];
+    float s = m_val(iq*p.m_nb1 + kv);
     for (uint h = 0u; h < p.n_head; ++h) {
         float dot = 0.0f;
         for (uint d = 0u; d < p.Dk; ++d) {

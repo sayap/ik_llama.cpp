@@ -1,0 +1,52 @@
+#version 450
+
+#include "types.comp"
+
+#extension GL_EXT_control_flow_attributes : require
+
+// GGML_OP_MUL_MULTI_ADD (hyper-connection mixing / fused MoE weighted sum):
+//   dst[k, ir] = sum_j src0[k, j, ir] * c(j, ir)
+//   c(j, ir)   = src1[0, j, ir] * (src2 != NULL ? src2[src3[j, ir]] : 1)
+// src0: [ne00, ne01, nrows] f32, src1: [1, ne01, nrows] f32,
+// src2: f32 scales (optional), src3: i32 expert ids (optional), dst: [ne00, nrows] f32.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint ne00;        // elements per output row
+    uint ne01;        // summands (streams / selected experts)
+    uint nrows;       // output rows (src0->ne[2])
+    uint src0_nb1;    // src0 strides in floats
+    uint src0_nb2;
+    uint src1_nb1;    // src1 strides in floats
+    uint src1_nb2;
+    uint src3_nb1;    // src3 (ids) row stride in int32
+    uint dst_nb1;     // dst row stride in floats
+    uint has_scales;  // src2/src3 present
+} p;
+
+layout(binding = 0) readonly buffer X0 { float x0[]; };
+layout(binding = 1) readonly buffer X1 { float x1[]; };
+layout(binding = 2) readonly buffer S  { float scales[]; };
+layout(binding = 3) readonly buffer ID { int   ids[]; };
+layout(binding = 4) writeonly buffer D { float dst[]; };
+
+void main() {
+    const uint id = gl_GlobalInvocationID.x;
+    const uint total = p.ne00 * p.nrows;
+    if (id >= total) {
+        return;
+    }
+    const uint k  = id % p.ne00;
+    const uint ir = id / p.ne00;
+
+    float acc = 0.0f;
+    for (uint j = 0u; j < p.ne01; ++j) {
+        float c = x1[j*p.src1_nb1 + ir*p.src1_nb2];
+        if (p.has_scales != 0u) {
+            c *= scales[uint(ids[j + ir*p.src3_nb1])];
+        }
+        acc += x0[k + j*p.src0_nb1 + ir*p.src0_nb2] * c;
+    }
+    dst[k + ir*p.dst_nb1] = acc;
+}

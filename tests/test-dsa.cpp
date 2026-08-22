@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -305,7 +306,8 @@ static void test_cpy_kv_write(ggml_backend_t backend_cpu, ggml_backend_t backend
 // INDEXER_TOPK only defines the *set* of selected rows (the CPU bucket top-k
 // deliberately returns most buckets in original order); compare sorted rows.
 static void check_i32_set(const char * name, ggml_backend_t backend_cpu, ggml_backend_t backend_tgt,
-        ggml_context * ctx_cpu, ggml_context * ctx_tgt, ggml_tensor * out_cpu, ggml_tensor * out_tgt) {
+        ggml_context * ctx_cpu, ggml_context * ctx_tgt, ggml_tensor * out_cpu, ggml_tensor * out_tgt,
+        int64_t max_misses = 0) {
     ggml_cgraph * gf_cpu = ggml_new_graph(ctx_cpu);
     ggml_build_forward_expand(gf_cpu, out_cpu);
     ggml_cplan plan = ggml_graph_plan(gf_cpu, 4);
@@ -337,8 +339,20 @@ static void check_i32_set(const char * name, ggml_backend_t backend_cpu, ggml_ba
         std::vector<int32_t> br(b.begin() + r, b.begin() + r + ne0);
         std::sort(ar.begin(), ar.end());
         std::sort(br.begin(), br.end());
-        for (int64_t i = 0; i < ne0; i++) {
-            err = std::max(err, (int64_t)std::llabs((int64_t)ar[i] - (int64_t)br[i]));
+        if (max_misses == 0) {
+            for (int64_t i = 0; i < ne0; i++) {
+                err = std::max(err, (int64_t)std::llabs((int64_t)ar[i] - (int64_t)br[i]));
+            }
+        } else {
+            // Set comparison with boundary slack: the two backends accumulate the
+            // k-dot scores in different orders, so entries whose scores sit within
+            // f32 noise of the selection boundary can legitimately swap.
+            std::set<int32_t> bs(br.begin(), br.end());
+            int64_t n_miss = 0;
+            for (auto v : ar) {
+                if (!bs.count(v)) ++n_miss;
+            }
+            err = std::max(err, n_miss > max_misses ? n_miss : 0);
         }
     }
     if (err != 0) {
@@ -348,7 +362,7 @@ static void check_i32_set(const char * name, ggml_backend_t backend_cpu, ggml_ba
         }
         n_failures++;
     } else {
-        printf("OK   %s (set exact)\n", name);
+        printf("OK   %s (set%s)\n", name, max_misses == 0 ? " exact" : " w/ boundary slack");
     }
 }
 
@@ -586,10 +600,10 @@ static void test_mask_topk(ggml_backend_t backend_cpu, ggml_backend_t backend_tg
     ggml_free(ctx_tgt);
 }
 
-static void test_indexer_topk(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt, ggml_type ktype, int Dk, int n_kv, int n_head, int n_rows, int n_top_k) {
+static void test_indexer_topk(ggml_backend_t backend_cpu, ggml_backend_t backend_tgt, ggml_type ktype, ggml_type mtype, int Dk, int n_kv, int n_head, int n_rows, int n_top_k, int64_t max_misses = 0) {
     char name[256];
-    snprintf(name, sizeof(name), "indexer_topk k=%s Dk=%d n_kv=%d n_head=%d n_rows=%d topk=%d",
-            ggml_type_name(ktype), Dk, n_kv, n_head, n_rows, n_top_k);
+    snprintf(name, sizeof(name), "indexer_topk k=%s m=%s Dk=%d n_kv=%d n_head=%d n_rows=%d topk=%d",
+            ggml_type_name(ktype), ggml_type_name(mtype), Dk, n_kv, n_head, n_rows, n_top_k);
 
     ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
     ggml_context * ctx_cpu = ggml_init(params);
@@ -601,7 +615,7 @@ static void test_indexer_topk(ggml_backend_t backend_cpu, ggml_backend_t backend
     ggml_set_name(q_c, "q");
     ggml_tensor * w_c = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_F32, n_head, n_rows);
     ggml_set_name(w_c, "w");
-    ggml_tensor * m_c = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_F32, n_kv, n_rows);
+    ggml_tensor * m_c = ggml_new_tensor_2d(ctx_cpu, mtype, n_kv, n_rows);
     ggml_set_name(m_c, "m");
     ggml_tensor * out_c = ggml_indexer_topk(ctx_cpu, k_c, q_c, w_c, m_c, GGML_UNARY_OP_RELU, n_top_k);
 
@@ -611,7 +625,7 @@ static void test_indexer_topk(ggml_backend_t backend_cpu, ggml_backend_t backend
     ggml_set_name(q_t, "q");
     ggml_tensor * w_t = ggml_new_tensor_2d(ctx_tgt, GGML_TYPE_F32, n_head, n_rows);
     ggml_set_name(w_t, "w");
-    ggml_tensor * m_t = ggml_new_tensor_2d(ctx_tgt, GGML_TYPE_F32, n_kv, n_rows);
+    ggml_tensor * m_t = ggml_new_tensor_2d(ctx_tgt, mtype, n_kv, n_rows);
     ggml_set_name(m_t, "m");
     ggml_tensor * out_t = ggml_indexer_topk(ctx_tgt, k_t, q_t, w_t, m_t, GGML_UNARY_OP_RELU, n_top_k);
 
@@ -622,8 +636,7 @@ static void test_indexer_topk(ggml_backend_t backend_cpu, ggml_backend_t backend
     init_tensor_uniform(w_c, -1.0f, 1.0f);
     init_tensor_uniform(m_c, -2.0f, 2.0f);
     copy_tensors_by_name(ctx_cpu, ctx_tgt);
-
-    check_i32_set(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t);
+    check_i32_set(name, backend_cpu, backend_tgt, ctx_cpu, ctx_tgt, out_c, out_t, max_misses);
     ggml_free(ctx_cpu);
     ggml_free(ctx_tgt);
 }
@@ -1053,10 +1066,21 @@ int main(int argc, char ** argv) {
     test_cpy_kv_write(backend_cpu, backend_tgt, GGML_TYPE_Q6_0, 64, 8, 512, 5, 32);
     test_cpy_kv_write(backend_cpu, backend_tgt, GGML_TYPE_Q8_0, 128, 4, 256, 3, 7);
 
-    test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F32, 32, 128, 4, 4, 8);
-    test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F32, 16, 64, 3, 2, 6);
-    test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F16, 32, 128, 4, 4, 8);
-    test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F16, 16, 64, 3, 2, 6);
+    test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F32, GGML_TYPE_F32, 32, 128, 4, 4, 8);
+    test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F32, GGML_TYPE_F32, 16, 64, 3, 2, 6);
+    test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F16, GGML_TYPE_F32, 32, 128, 4, 4, 8);
+    test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F16, GGML_TYPE_F32, 16, 64, 3, 2, 6);
+    // F16 mask (the flash-attention configuration real DSV4 runs use)
+    test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F16, GGML_TYPE_F16, 32, 128, 4, 4, 8);
+    test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F32, GGML_TYPE_F16, 32, 128, 4, 2, 8);
+    // Real DSV4 shapes: big-k select exercising the bitonic path (n_kv <= 4096)
+    // and the tournament fallback beyond it. n_rows >= 4 keeps the CPU reference
+    // on its exact partial_sort path (the n_rows < n_threads bucket top-k is an
+    // approximate selection, not comparable as a set). The large selections allow
+    // a few boundary swaps (f32 dot-order noise near the k-of-n_kv boundary).
+    test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F16, GGML_TYPE_F16, 128, 2048, 64, 4, 512, 4);
+    test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F32, GGML_TYPE_F16, 128, 1536, 8, 4, 511, 4);
+    test_indexer_topk(backend_cpu, backend_tgt, GGML_TYPE_F16, GGML_TYPE_F16, 128, 5120, 4, 4, 512, 8);
 
     test_set_rows(backend_cpu, backend_tgt, GGML_TYPE_F16, 64, 128, 5, false);
     test_set_rows(backend_cpu, backend_tgt, GGML_TYPE_F16, 128, 256, 8, true);

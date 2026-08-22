@@ -1,0 +1,24 @@
+#version 450
+
+#include "generic_head.comp"
+#include "types.comp"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// GGML_OP_FILL: set every element of the (contiguous) destination to a constant.
+// The CPU reference supports f32 and f16 destinations; src[0] is only used for
+// the shape (the value lives in op_params and is passed via p.param1).
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) writeonly buffer D {D_TYPE data_d[];};
+
+void main() {
+    const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+
+    if (i >= p.KX) {
+        return;
+    }
+
+    data_d[i] = D_TYPE(p.param1);
+}

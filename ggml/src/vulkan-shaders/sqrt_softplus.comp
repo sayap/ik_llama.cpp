@@ -1,0 +1,52 @@
+#version 450
+
+#include "generic_head.comp"
+#include "types.comp"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// sqrt(softplus(x)); softplus(x) = x for x > 20, else log(1 + exp(x)).
+// The CPU/CUDA references compute logf(1.0f + expf(x)) in f32: the addition
+// rounds exp(x) to the 2^-23 grid near 1.0 (so tiny exponents collapse the
+// result to exactly 0), and logf of that rounded sum is what we must reproduce.
+// Since (1.0f + e) - 1.0f gets reassociated to e by the compiler, recover the
+// rounded increment from the bit pattern of u = 1.0f + e instead, and evaluate
+// the log1p series on it (the log intrinsic's absolute error would dominate
+// results below ~1e-4).
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer X {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+float softplus_f(float x) {
+    if (x > 20.0f) {
+        return x;
+    }
+    const float e = exp(x);
+    const float u = 1.0f + e;
+    if (u < 2.0f) {
+        // u in [1, 2): mantissa bits are k with u = 1 + k*2^-23, so the exact
+        // increment the reference feeds to logf is t = k*2^-23.
+        const int k = int(floatBitsToUint(u) - 0x3F800000u);
+        if (k <= 0) {
+            return 0.0f;   // 1.0f + e rounded back to 1.0f -> logf(1) = 0
+        }
+        const float t = float(k) * (1.0f / 8388608.0f);  // 2^-23
+        if (t < 0.1f) {
+            return t*(1.0f - t*(0.5f - t*(0.3333333f - t*(0.25f - 0.2f*t))));
+        }
+        return log(u);
+    }
+    return log(u);
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+
+    if (i >= p.KX) {
+        return;
+    }
+
+    data_d[i] = D_TYPE(sqrt(softplus_f(float(data_a[i]))));
+}

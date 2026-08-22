@@ -742,6 +742,8 @@ void process_shaders() {
     string_to_spv("sigmoid_f32",    "sigmoid.comp",     {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("softplus_f16",   "softplus.comp",    {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("softplus_f32",   "softplus.comp",    {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
+    string_to_spv("sqrt_softplus_f16", "sqrt_softplus.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+    string_to_spv("sqrt_softplus_f32", "sqrt_softplus.comp", {{"A_TYPE", "float"},     {"D_TYPE", "float"}});
 
     string_to_spv("geglu_f16",      "geglu.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("geglu_f32",      "geglu.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
@@ -847,8 +849,11 @@ void process_shaders() {
     string_to_spv("mask_to_idx_f32", "mask_to_idx.comp", {{ "DATA_A_F32", "1" }});
     string_to_spv("mask_to_idx_f16", "mask_to_idx.comp", {{ "DATA_A_F16", "1" }});
     string_to_spv("indexer_topk_score_f32", "indexer_topk_score.comp", {{ "DATA_A_F32", "1" }});
+    string_to_spv("indexer_topk_score_f32_m16", "indexer_topk_score.comp", {{ "DATA_A_F32", "1" }, { "MASK_F16", "1" }});
     string_to_spv("indexer_topk_score_f16", "indexer_topk_score.comp", {{ "DATA_A_F16", "1" }});
+    string_to_spv("indexer_topk_score_f16_m16", "indexer_topk_score.comp", {{ "DATA_A_F16", "1" }, { "MASK_F16", "1" }});
     string_to_spv("indexer_topk_select_f32", "indexer_topk_select.comp", {});
+    string_to_spv("indexer_topk_select_bitonic_f32", "indexer_topk_select.comp", {{ "BITONIC", "1" }});
     string_to_spv("latent_attn_f32", "latent_attn.comp", {{ "DATA_A_F32", "1" }});
     string_to_spv("latent_attn_f16", "latent_attn.comp", {{ "DATA_A_F16", "1" }});
     string_to_spv("latent_attn_q8_0", "latent_attn.comp", {{ "DATA_A_Q8_0", "1" }});
@@ -856,6 +861,23 @@ void process_shaders() {
     // caches reach this path (matching the CUDA DSA reader).
     string_to_spv("flash_attn_indexed_f16", "flash_attn_indexed.comp", {{ "DATA_A_F16", "1" }});
     string_to_spv("flash_attn_indexed_q8_0", "flash_attn_indexed.comp", {{ "DATA_A_Q8_0", "1" }});
+    // Hyper-connection mixing / fused MoE weighted sum (GGML_OP_MUL_MULTI_ADD)
+    string_to_spv("mul_multi_add_f32", "mul_multi_add.comp", {});
+    // Hadamard transform (DSV4 indexer / latent-state folding), f32 and f16 sources
+    string_to_spv("hadamard_f32_64",  "hadamard.comp", {{ "DATA_A_F32", "1" }, { "NH", "64"  }});
+    string_to_spv("hadamard_f32_128", "hadamard.comp", {{ "DATA_A_F32", "1" }, { "NH", "128" }});
+    string_to_spv("hadamard_f32_256", "hadamard.comp", {{ "DATA_A_F32", "1" }, { "NH", "256" }});
+    string_to_spv("hadamard_f32_512", "hadamard.comp", {{ "DATA_A_F32", "1" }, { "NH", "512" }});
+    string_to_spv("hadamard_f16_64",  "hadamard.comp", {{ "DATA_A_F16", "1" }, { "NH", "64"  }});
+    string_to_spv("hadamard_f16_128", "hadamard.comp", {{ "DATA_A_F16", "1" }, { "NH", "128" }});
+    string_to_spv("hadamard_f16_256", "hadamard.comp", {{ "DATA_A_F16", "1" }, { "NH", "256" }});
+    string_to_spv("hadamard_f16_512", "hadamard.comp", {{ "DATA_A_F16", "1" }, { "NH", "512" }});
+    // GGML_OP_FILL (DSV4 mask padding)
+    string_to_spv("fill_f32", "fill.comp", {{ "A_TYPE", "float" }, { "D_TYPE", "float" }});
+    string_to_spv("fill_f16", "fill.comp", {{ "A_TYPE", "float16_t" }, { "D_TYPE", "float16_t" }});
+    // "dim0" GET_ROWS gather (DSV4 single-token CSA mask)
+    string_to_spv("get_rows_dim0_f32", "get_rows_dim0.comp", {{ "DATA_A_F32", "1" }});
+    string_to_spv("get_rows_dim0_f16", "get_rows_dim0.comp", {{ "DATA_A_F16", "1" }});
     //
     // ============================== end ik_llama.cpp
 

@@ -593,10 +593,17 @@ struct vk_device_struct {
     vk_pipeline pipeline_ds4_comp_f32;
     vk_pipeline pipeline_mask_topk[2];
     vk_pipeline pipeline_mask_to_idx[2];
-    vk_pipeline pipeline_indexer_topk_score[2];
+    vk_pipeline pipeline_indexer_topk_score[2][2];   // [k f32/f16][mask f32/f16]
     vk_pipeline pipeline_indexer_topk_select;
+    vk_pipeline pipeline_indexer_topk_select_bitonic;   // shared-memory bitonic path, big-k fast path
     vk_pipeline pipeline_latent_attn[3];
     vk_pipeline pipeline_flash_attn_indexed[2];
+    vk_pipeline pipeline_mul_multi_add_f32;
+    // [log2(nh) - 6][0=f32, 1=f16] for nh in {64,128,256,512}
+    vk_pipeline pipeline_hadamard[4][2];
+    // [0=f32, 1=f16]
+    vk_pipeline pipeline_fill[2];
+    vk_pipeline pipeline_get_rows_dim0[2];   // [0=f32, 1=f16]
 
     // [src/dst 0=fp32,1=fp16]
     vk_pipeline pipeline_gelu[2];
@@ -607,6 +614,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_tanh[2];
     vk_pipeline pipeline_sigmoid[2];
     vk_pipeline pipeline_softplus[2];
+    vk_pipeline pipeline_sqrt_softplus[2];
 
     vk_pipeline pipeline_geglu[2];
     vk_pipeline pipeline_reglu[2];
@@ -997,6 +1005,45 @@ struct vk_op_indexer_topk_select_push_constants {
     uint32_t n_top_k;
     uint32_t first_row;
     uint32_t dst_nb1;
+};
+
+struct vk_op_mul_multi_add_push_constants {
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t nrows;
+    uint32_t src0_nb1;
+    uint32_t src0_nb2;
+    uint32_t src1_nb1;
+    uint32_t src1_nb2;
+    uint32_t src3_nb1;
+    uint32_t dst_nb1;
+    uint32_t has_scales;
+};
+
+struct vk_op_hadamard_push_constants {
+    uint32_t nc;
+    uint32_t src_nb1;
+    uint32_t src_nb2;
+    uint32_t src_nb3;
+    uint32_t dst_nb1;
+    uint32_t dst_nb2;
+    uint32_t dst_nb3;
+};
+
+struct vk_op_get_rows_dim0_push_constants {
+    uint32_t ne0;
+    uint32_t ne1;
+    uint32_t ne2;
+    uint32_t ne3;
+    uint32_t src_nb1;
+    uint32_t src_nb2;
+    uint32_t src_nb3;
+    uint32_t ids_nb1;
+    uint32_t ids_nb2;
+    uint32_t ids_nb3;
+    uint32_t dst_nb1;
+    uint32_t dst_nb2;
+    uint32_t dst_nb3;
 };
 
 struct vk_op_latent_attn_push_constants {
@@ -3799,14 +3846,46 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_mask_topk[1], "mask_topk_f16", mask_topk_f16_len, mask_topk_f16_data, "main", 3, sizeof(vk_op_mask_topk_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_mask_to_idx[0], "mask_to_idx_f32", mask_to_idx_f32_len, mask_to_idx_f32_data, "main", 2, sizeof(vk_op_mask_to_idx_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_mask_to_idx[1], "mask_to_idx_f16", mask_to_idx_f16_len, mask_to_idx_f16_data, "main", 2, sizeof(vk_op_mask_to_idx_push_constants), {256, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_indexer_topk_score[0], "indexer_topk_score_f32", indexer_topk_score_f32_len, indexer_topk_score_f32_data, "main", 5, sizeof(vk_op_indexer_topk_score_push_constants), {256, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_indexer_topk_score[1], "indexer_topk_score_f16", indexer_topk_score_f16_len, indexer_topk_score_f16_data, "main", 5, sizeof(vk_op_indexer_topk_score_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_indexer_topk_score[0][0], "indexer_topk_score_f32", indexer_topk_score_f32_len, indexer_topk_score_f32_data, "main", 5, sizeof(vk_op_indexer_topk_score_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_indexer_topk_score[0][1], "indexer_topk_score_f32_m16", indexer_topk_score_f32_m16_len, indexer_topk_score_f32_m16_data, "main", 5, sizeof(vk_op_indexer_topk_score_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_indexer_topk_score[1][0], "indexer_topk_score_f16", indexer_topk_score_f16_len, indexer_topk_score_f16_data, "main", 5, sizeof(vk_op_indexer_topk_score_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_indexer_topk_score[1][1], "indexer_topk_score_f16_m16", indexer_topk_score_f16_m16_len, indexer_topk_score_f16_m16_data, "main", 5, sizeof(vk_op_indexer_topk_score_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_indexer_topk_select, "indexer_topk_select_f32", indexer_topk_select_f32_len, indexer_topk_select_f32_data, "main", 2, sizeof(vk_op_indexer_topk_select_push_constants), {256, 1, 1}, {}, 1);
+    if (device->properties.limits.maxComputeSharedMemorySize >= 36u*1024u) {
+        ggml_vk_create_pipeline(device, device->pipeline_indexer_topk_select_bitonic, "indexer_topk_select_bitonic_f32", indexer_topk_select_bitonic_f32_len, indexer_topk_select_bitonic_f32_data, "main", 2, sizeof(vk_op_indexer_topk_select_push_constants), {256, 1, 1}, {}, 1);
+    }
     ggml_vk_create_pipeline(device, device->pipeline_latent_attn[0], "latent_attn_f32", latent_attn_f32_len, latent_attn_f32_data, "main", 7, sizeof(vk_op_latent_attn_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_latent_attn[1], "latent_attn_f16", latent_attn_f16_len, latent_attn_f16_data, "main", 7, sizeof(vk_op_latent_attn_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_latent_attn[2], "latent_attn_q8_0", latent_attn_q8_0_len, latent_attn_q8_0_data, "main", 7, sizeof(vk_op_latent_attn_push_constants), {256, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_indexed[0], "flash_attn_indexed_f16", flash_attn_indexed_f16_len, flash_attn_indexed_f16_data, "main", 7, sizeof(vk_op_flash_attn_indexed_push_constants), {256, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_indexed[1], "flash_attn_indexed_q8_0", flash_attn_indexed_q8_0_len, flash_attn_indexed_q8_0_data, "main", 7, sizeof(vk_op_flash_attn_indexed_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_indexed[0], "flash_attn_indexed_f16", flash_attn_indexed_f16_len, flash_attn_indexed_f16_data, "main", 7, sizeof(vk_op_flash_attn_indexed_push_constants), {128, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_flash_attn_indexed[1], "flash_attn_indexed_q8_0", flash_attn_indexed_q8_0_len, flash_attn_indexed_q8_0_data, "main", 7, sizeof(vk_op_flash_attn_indexed_push_constants), {128, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_mul_multi_add_f32, "mul_multi_add_f32", mul_multi_add_f32_len, mul_multi_add_f32_data, "main", 5, sizeof(vk_op_mul_multi_add_push_constants), {256, 1, 1}, {}, 1);
+    {
+        const struct { size_t len; const void* data; uint32_t denom; } hadamard_f32_pipelines[] = {
+            { hadamard_f32_64_len,  hadamard_f32_64_data,  32 },
+            { hadamard_f32_128_len, hadamard_f32_128_data, 64 },
+            { hadamard_f32_256_len, hadamard_f32_256_data, 128 },
+            { hadamard_f32_512_len, hadamard_f32_512_data, 256 },
+        };
+        const struct { size_t len; const void* data; uint32_t denom; } hadamard_f16_pipelines[] = {
+            { hadamard_f16_64_len,  hadamard_f16_64_data,  32 },
+            { hadamard_f16_128_len, hadamard_f16_128_data, 64 },
+            { hadamard_f16_256_len, hadamard_f16_256_data, 128 },
+            { hadamard_f16_512_len, hadamard_f16_512_data, 256 },
+        };
+        const char* hadamard_names[] = { "hadamard_f32_64", "hadamard_f32_128", "hadamard_f32_256", "hadamard_f32_512" };
+        const char* hadamard_names_f16[] = { "hadamard_f16_64", "hadamard_f16_128", "hadamard_f16_256", "hadamard_f16_512" };
+        for (uint32_t i = 0; i < 4; ++i) {
+            // NH/2 threads per block; the dispatch size must be a multiple of the denom
+            ggml_vk_create_pipeline(device, device->pipeline_hadamard[i][0], hadamard_names[i], hadamard_f32_pipelines[i].len, hadamard_f32_pipelines[i].data, "main", 2, sizeof(vk_op_hadamard_push_constants), {hadamard_f32_pipelines[i].denom, 1, 1}, {}, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_hadamard[i][1], hadamard_names_f16[i], hadamard_f16_pipelines[i].len, hadamard_f16_pipelines[i].data, "main", 2, sizeof(vk_op_hadamard_push_constants), {hadamard_f16_pipelines[i].denom, 1, 1}, {}, 1);
+        }
+    }
+    ggml_vk_create_pipeline(device, device->pipeline_fill[0], "fill_f32", fill_f32_len, fill_f32_data, "main", 1, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fill[1], "fill_f16", fill_f16_len, fill_f16_data, "main", 1, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_dim0[0], "get_rows_dim0_f32", get_rows_dim0_f32_len, get_rows_dim0_f32_data, "main", 3, sizeof(vk_op_get_rows_dim0_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_get_rows_dim0[1], "get_rows_dim0_f16", get_rows_dim0_f16_len, get_rows_dim0_f16_data, "main", 3, sizeof(vk_op_get_rows_dim0_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f32, "cpy_f32_f32", cpy_f32_f32_len, cpy_f32_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f16, "cpy_f32_f16", cpy_f32_f16_len, cpy_f32_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -3947,6 +4026,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     CREATE_UNARY(tanh)
     CREATE_UNARY(sigmoid)
     CREATE_UNARY(softplus)
+    CREATE_UNARY(sqrt_softplus)
 #undef CREATE_UNARY
 
 #define CREATE_GLU(name)  \
@@ -8012,6 +8092,8 @@ static void ggml_vk_flash_attn_indexed(ggml_backend_vk_context * ctx, vk_context
 
     vk_buffer dummy = q_ctx->dev_buffer;
     ggml_vk_sync_buffers(subctx);
+    // One workgroup of 128 threads per (token, head): the threads cooperate over
+    // the gathered keys (subgroup split) and the head dimension.
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
         vk_subbuffer{ q_ctx->dev_buffer,       vk_tensor_offset(q) + q->view_offs,       VK_WHOLE_SIZE },
         vk_subbuffer{ k_ctx->dev_buffer,       vk_tensor_offset(k) + k->view_offs,       VK_WHOLE_SIZE },
@@ -8020,7 +8102,7 @@ static void ggml_vk_flash_attn_indexed(ggml_backend_vk_context * ctx, vk_context
         vk_subbuffer{ indices_ctx->dev_buffer, vk_tensor_offset(indices) + indices->view_offs, VK_WHOLE_SIZE },
         vk_subbuffer{ sinks_ctx ? sinks_ctx->dev_buffer : dummy, sinks ? vk_tensor_offset(sinks) + sinks->view_offs : 0, VK_WHOLE_SIZE },
         vk_subbuffer{ dst_ctx->dev_buffer,     vk_tensor_offset(dst) + dst->view_offs,   VK_WHOLE_SIZE },
-    }, pc, { T * H, 1, 1 });
+    }, pc, { T * H * 128u, 1, 1 });
 }
 
 #define GGML_ROPE_TYPE_NEOX   2
@@ -8196,6 +8278,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 return ctx->device->pipeline_sigmoid[dst->type == GGML_TYPE_F16];
             case GGML_UNARY_OP_SOFTPLUS:
                 return ctx->device->pipeline_softplus[dst->type == GGML_TYPE_F16];
+            case GGML_UNARY_OP_SQRT_SOFTPLUS:
+                return ctx->device->pipeline_sqrt_softplus[dst->type == GGML_TYPE_F16];
             default:
                 break;
         }
@@ -9985,6 +10069,164 @@ static void ggml_vk_mask_topk(ggml_backend_vk_context * ctx, vk_context& subctx,
     }, pc, { nrows * 256u, 1, 1 });
 }
 
+static void ggml_vk_mul_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * src2 = dst->src[2];  // optional f32 scales
+    const ggml_tensor * src3 = dst->src[3];  // optional i32 expert ids
+
+    vk_pipeline pipeline = ctx->device->pipeline_mul_multi_add_f32;
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        return;
+    }
+
+    ggml_backend_vk_buffer_context * src0_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
+    ggml_backend_vk_buffer_context * src1_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
+    ggml_backend_vk_buffer_context * src2_ctx = src2 ? (ggml_backend_vk_buffer_context *)src2->buffer->context : nullptr;
+    ggml_backend_vk_buffer_context * src3_ctx = src3 ? (ggml_backend_vk_buffer_context *)src3->buffer->context : nullptr;
+    ggml_backend_vk_buffer_context * dst_ctx  = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+
+    const vk_op_mul_multi_add_push_constants pc = {
+        (uint32_t)src0->ne[0],
+        (uint32_t)src0->ne[1],
+        (uint32_t)src0->ne[2],
+        (uint32_t)(src0->nb[1] / sizeof(float)),
+        (uint32_t)(src0->nb[2] / sizeof(float)),
+        (uint32_t)(src1->nb[1] / sizeof(float)),
+        (uint32_t)(src1->nb[2] / sizeof(float)),
+        src3 ? (uint32_t)(src3->nb[1] / sizeof(int32_t)) : 0u,
+        (uint32_t)(dst->nb[1] / sizeof(float)),
+        src2 && src3 ? 1u : 0u,
+    };
+
+    // Bind every optional slot to a valid buffer (never read when the operand is null).
+    vk_buffer dummy = src0_ctx->dev_buffer;
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        vk_subbuffer{ src0_ctx->dev_buffer, vk_tensor_offset(src0) + src0->view_offs, VK_WHOLE_SIZE },
+        vk_subbuffer{ src1_ctx->dev_buffer, vk_tensor_offset(src1) + src1->view_offs, VK_WHOLE_SIZE },
+        vk_subbuffer{ src2_ctx ? src2_ctx->dev_buffer : dummy, src2 ? vk_tensor_offset(src2) + src2->view_offs : 0, VK_WHOLE_SIZE },
+        vk_subbuffer{ src3_ctx ? src3_ctx->dev_buffer : dummy, src3 ? vk_tensor_offset(src3) + src3->view_offs : 0, VK_WHOLE_SIZE },
+        vk_subbuffer{ dst_ctx->dev_buffer,  vk_tensor_offset(dst) + dst->view_offs,  VK_WHOLE_SIZE },
+    }, pc, { (uint32_t)(src0->ne[0] * src0->ne[2]), 1, 1 });
+}
+
+static void ggml_vk_hadamard(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
+    const ggml_tensor * src = dst->src[0];
+
+    const uint32_t nh = (uint32_t)dst->op_params[0];
+    uint32_t idx;
+    switch (nh) {
+        case 64:  idx = 0; break;
+        case 128: idx = 1; break;
+        case 256: idx = 2; break;
+        case 512: idx = 3; break;
+        default: GGML_ABORT("hadamard: unsupported block size %u", nh);
+    }
+    const bool f16 = src->type == GGML_TYPE_F16;
+    vk_pipeline pipeline = ctx->device->pipeline_hadamard[idx][f16 ? 1 : 0];
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        return;
+    }
+
+    const size_t src_ts = ggml_type_size(src->type);
+    const uint32_t nc = (uint32_t)(src->ne[0] / nh);
+
+    ggml_backend_vk_buffer_context * src_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
+    ggml_backend_vk_buffer_context * dst_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+
+    const vk_op_hadamard_push_constants pc = {
+        nc,
+        (uint32_t)(src->nb[1] / src_ts),
+        (uint32_t)(src->nb[2] / src_ts),
+        (uint32_t)(src->nb[3] / src_ts),
+        (uint32_t)(dst->nb[1] / sizeof(float)),
+        (uint32_t)(dst->nb[2] / sizeof(float)),
+        (uint32_t)(dst->nb[3] / sizeof(float)),
+    };
+
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        vk_subbuffer{ src_ctx->dev_buffer, vk_tensor_offset(src) + src->view_offs, VK_WHOLE_SIZE },
+        vk_subbuffer{ dst_ctx->dev_buffer, vk_tensor_offset(dst) + dst->view_offs, VK_WHOLE_SIZE },
+    }, pc, { nc * (uint32_t)src->ne[1] * (nh/2u), (uint32_t)src->ne[2], (uint32_t)src->ne[3] });
+}
+
+static void ggml_vk_fill(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
+    vk_pipeline pipeline = ctx->device->pipeline_fill[dst->type == GGML_TYPE_F16 ? 1 : 0];
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        return;
+    }
+
+    float value;
+    memcpy(&value, &dst->op_params[0], sizeof(float));
+
+    ggml_backend_vk_buffer_context * dst_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+
+    // Same dispatch shape as the generic elementwise ops in ggml_vk_op_f32
+    // (512 x 512 x z grid addressing).
+    const uint32_t n = (uint32_t)ggml_nelements(dst);
+    std::array<uint32_t, 3> elements;
+    if (n > 262144u) {
+        elements = { 512u, 512u, CEIL_DIV(n, 262144u) };
+    } else if (n > 512u) {
+        elements = { 512u, CEIL_DIV(n, 512u), 1u };
+    } else {
+        elements = { n, 1u, 1u };
+    }
+
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        vk_subbuffer{ dst_ctx->dev_buffer, vk_tensor_offset(dst) + dst->view_offs, VK_WHOLE_SIZE },
+    }, vk_op_push_constants{ n, 0, value, 0.0f }, elements);
+}
+
+static void ggml_vk_get_rows_dim0(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
+    const ggml_tensor * src = dst->src[0];
+    const ggml_tensor * ids = dst->src[1];
+
+    const bool f16 = src->type != GGML_TYPE_F32;
+    vk_pipeline pipeline = ctx->device->pipeline_get_rows_dim0[f16 ? 1 : 0];
+    if (dryrun) {
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        return;
+    }
+
+    const size_t src_ts = ggml_type_size(src->type);
+    const size_t dst_ts = ggml_type_size(dst->type);
+
+    ggml_backend_vk_buffer_context * src_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
+    ggml_backend_vk_buffer_context * ids_ctx = (ggml_backend_vk_buffer_context *)ids->buffer->context;
+    ggml_backend_vk_buffer_context * dst_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+
+    const vk_op_get_rows_dim0_push_constants pc = {
+        (uint32_t)dst->ne[0],
+        (uint32_t)dst->ne[1],
+        (uint32_t)dst->ne[2],
+        (uint32_t)dst->ne[3],
+        (uint32_t)(src->nb[1] / src_ts),
+        (uint32_t)(src->nb[2] / src_ts),
+        (uint32_t)(src->nb[3] / src_ts),
+        (uint32_t)(ids->nb[1] / sizeof(int32_t)),
+        (uint32_t)(ids->nb[2] / sizeof(int32_t)),
+        (uint32_t)(ids->nb[3] / sizeof(int32_t)),
+        (uint32_t)(dst->nb[1] / dst_ts),
+        (uint32_t)(dst->nb[2] / dst_ts),
+        (uint32_t)(dst->nb[3] / dst_ts),
+    };
+
+    const uint32_t total = (uint32_t)(ggml_nelements(dst));
+    ggml_vk_sync_buffers(subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {
+        vk_subbuffer{ src_ctx->dev_buffer, vk_tensor_offset(src) + src->view_offs, VK_WHOLE_SIZE },
+        vk_subbuffer{ ids_ctx->dev_buffer, vk_tensor_offset(ids) + ids->view_offs, VK_WHOLE_SIZE },
+        vk_subbuffer{ dst_ctx->dev_buffer, vk_tensor_offset(dst) + dst->view_offs, VK_WHOLE_SIZE },
+    }, pc, { total, 1, 1 });
+}
+
 static void ggml_vk_mask_to_idx(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, bool dryrun = false) {
     const ggml_tensor * src = dst->src[0];
 
@@ -10029,17 +10271,23 @@ static void ggml_vk_indexer_topk(ggml_backend_vk_context * ctx, vk_context& subc
     const ggml_tensor * mask = dst->src[3];
 
     const bool f16 = k->type == GGML_TYPE_F16;
-    vk_pipeline score_pipeline   = ctx->device->pipeline_indexer_topk_score[f16 ? 1 : 0];
+    const uint32_t n_kv    = (uint32_t)k->ne[1];
+    const uint32_t n_rows  = (uint32_t)q->ne[2];
+    const uint32_t n_top_k = (uint32_t)dst->ne[0];
+
+    vk_pipeline score_pipeline   = ctx->device->pipeline_indexer_topk_score[f16 ? 1 : 0][mask->type == GGML_TYPE_F16 ? 1 : 0];
+    // Prefer the shared-memory bitonic select (big-k fast path) when the row fits
+    // and the pipeline exists (created only on devices with >= 36 KiB shmem).
     vk_pipeline select_pipeline  = ctx->device->pipeline_indexer_topk_select;
+    if (n_kv <= 4096u && ctx->device->pipeline_indexer_topk_select_bitonic &&
+        ctx->device->pipeline_indexer_topk_select_bitonic->compiled) {
+        select_pipeline = ctx->device->pipeline_indexer_topk_select_bitonic;
+    }
     if (dryrun) {
         ggml_pipeline_request_descriptor_sets(ctx, score_pipeline, 1);
         ggml_pipeline_request_descriptor_sets(ctx, select_pipeline, 1);
         return;
     }
-
-    const uint32_t n_kv    = (uint32_t)k->ne[1];
-    const uint32_t n_rows  = (uint32_t)q->ne[2];
-    const uint32_t n_top_k = (uint32_t)dst->ne[0];
 
     // Bound the score scratch buffer: tile query rows so n_kv * tile_rows stays small.
     const uint32_t max_score_elems = 1u << 22; // 16 MiB of floats
@@ -10065,7 +10313,7 @@ static void ggml_vk_indexer_topk(ggml_backend_vk_context * ctx, vk_context& subc
     const uint32_t q_nb1    = (uint32_t)(q->nb[1] / sizeof(float));
     const uint32_t q_nb2    = (uint32_t)(q->nb[2] / sizeof(float));
     const uint32_t w_nb1    = (uint32_t)(w->nb[1] / sizeof(float));
-    const uint32_t m_nb1    = (uint32_t)(mask->nb[1] / sizeof(float));
+    const uint32_t m_nb1    = (uint32_t)(mask->nb[1] / ggml_type_size(mask->type));
     const uint32_t dst_nb1  = (uint32_t)(dst->nb[1] / sizeof(int32_t));
 
     for (uint32_t first = 0; first < n_rows; first += max_rows) {
@@ -12142,6 +12390,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         case GGML_UNARY_OP_TANH:
         case GGML_UNARY_OP_SIGMOID:
         case GGML_UNARY_OP_SOFTPLUS:
+        case GGML_UNARY_OP_SQRT_SOFTPLUS:
             break;
         default:
             return false;
@@ -12223,6 +12472,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_MASK_TO_IDX:
     case GGML_OP_INDEXER_TOPK:
     case GGML_OP_LATENT_ATTN:
+    case GGML_OP_MUL_MULTI_ADD:
+    case GGML_OP_HADAMARD:
+    case GGML_OP_FILL:
     //case GGML_OP_OPT_STEP_ADAMW:
         break;
     default:
@@ -12261,10 +12513,26 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         }
     } else {
         switch (node->op) {
+        case GGML_OP_GET_ROWS:
+            {
+                // row gather (generic pipeline) or the "dim0" per-element gather
+                vk_pipeline pipeline = node->op_params[0] == 1
+                    ? ctx->device->pipeline_get_rows_dim0[node->src[0]->type != GGML_TYPE_F32 ? 1 : 0]
+                    : ggml_vk_op_get_pipeline(ctx, src0, src1, src2, node, node->op);
+                if (!pipeline) {
+                    fprintf(stderr, "ggml_vulkan: null pipeline for op %s (src0=%s, src1=%s, dst=%s)\n",
+                            ggml_op_name(node->op),
+                            src0 ? ggml_type_name(src0->type) : "-",
+                            src1 ? ggml_type_name(src1->type) : "-",
+                            ggml_type_name(node->type));
+                    GGML_ABORT("fatal error");
+                }
+                ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+                return false;
+            }
         case GGML_OP_REPEAT:
         case GGML_OP_REPEAT_BACK:
         case GGML_OP_ACC:
-        case GGML_OP_GET_ROWS:
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
@@ -12342,7 +12610,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_GET_ROWS:
-        ggml_vk_get_rows(ctx, compute_ctx, src0, src1, node, dryrun);
+        if (node->op_params[0] == 1) {
+            // "dim0" per-element gather (ggml_get_rows_ext dim0=true)
+            ggml_vk_get_rows_dim0(ctx, compute_ctx, node, dryrun);
+        } else {
+            ggml_vk_get_rows(ctx, compute_ctx, src0, src1, node, dryrun);
+        }
 
         break;
     case GGML_OP_ADD:
@@ -12456,6 +12729,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         case GGML_UNARY_OP_TANH:
         case GGML_UNARY_OP_SIGMOID:
         case GGML_UNARY_OP_SOFTPLUS:
+        case GGML_UNARY_OP_SQRT_SOFTPLUS:
             ggml_vk_unary(ctx, compute_ctx, src0, node, dryrun);
             break;
         default:
@@ -12603,6 +12877,18 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_indexer_topk(ctx, compute_ctx, node, dryrun);
         break;
 
+    case GGML_OP_MUL_MULTI_ADD:
+        ggml_vk_mul_multi_add(ctx, compute_ctx, node, dryrun);
+        break;
+
+    case GGML_OP_HADAMARD:
+        ggml_vk_hadamard(ctx, compute_ctx, node, dryrun);
+        break;
+
+    case GGML_OP_FILL:
+        ggml_vk_fill(ctx, compute_ctx, node, dryrun);
+        break;
+
     case GGML_OP_LATENT_ATTN:
         ggml_vk_latent_attn(ctx, compute_ctx, node, dryrun);
         break;
@@ -12737,6 +13023,7 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
         case GGML_UNARY_OP_TANH:
         case GGML_UNARY_OP_SIGMOID:
         case GGML_UNARY_OP_SOFTPLUS:
+        case GGML_UNARY_OP_SQRT_SOFTPLUS:
             buf = tensor->buffer;
             break;
         default:
@@ -12771,6 +13058,9 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     case GGML_OP_MASK_TO_IDX:
     case GGML_OP_INDEXER_TOPK:
     case GGML_OP_LATENT_ATTN:
+    case GGML_OP_MUL_MULTI_ADD:
+    case GGML_OP_HADAMARD:
+    case GGML_OP_FILL:
         buf = tensor->buffer;
 
         break;
@@ -12978,6 +13268,7 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
 
     ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
+
 
 GGML_CALL static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_get_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")"); 
@@ -13468,7 +13759,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         ctx->device->device.resetQueryPool(ctx->device->query_pool, 0, cgraph->n_nodes+1);
 
-        GGML_ASSERT(ctx->compute_ctx.expired());
+        if (!ctx->compute_ctx.expired()) {
+            // Flush any pending compute so the timestamp queries are ordered.
+            vk_context pending = ctx->compute_ctx.lock();
+            ggml_vk_ctx_end(pending);
+            ggml_vk_submit(pending, ctx->device->fence);
+            VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX), "perf_logger waitForFences");
+            ctx->device->device.resetFences({ ctx->device->fence });
+            ctx->compute_ctx.reset();
+        }
         compute_ctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
         ctx->compute_ctx = compute_ctx;
         ggml_vk_ctx_begin(ctx->device, compute_ctx);
@@ -13589,6 +13888,7 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_SOFTPLUS:
+                case GGML_UNARY_OP_SQRT_SOFTPLUS:
                     return ggml_is_contiguous(op->src[0]) &&
                            (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                            (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
@@ -13850,6 +14150,18 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                         op->src[0]->ne[3] != 1) {
                         return false;
                     }
+                    // The cooperative (subgroup-split) kernel keeps the per-subgroup
+                    // value accumulators in shared memory (8 subgroups x Dv floats,
+                    // Dv <= 512) and assumes >= 16 lanes per subgroup.
+                    if (op->src[2]->ne[0] > 512) {
+                        return false;
+                    }
+                    if (device->subgroup_size < 16) {
+                        return false;
+                    }
+                    if (device->properties.limits.maxComputeSharedMemorySize < 17u*1024u) {
+                        return false;
+                    }
                     switch (op->src[1]->type) {
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q8_0:
@@ -14024,15 +14336,76 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
                     return false;
                 }
                 const ggml_type kt = op->src[0]->type;
+                const ggml_type mt = op->src[3]->type;
                 if ((kt != GGML_TYPE_F32 && kt != GGML_TYPE_F16) || op->src[1]->type != GGML_TYPE_F32 ||
-                    op->src[2]->type != GGML_TYPE_F32 || op->src[3]->type != GGML_TYPE_F32 ||
+                    op->src[2]->type != GGML_TYPE_F32 ||
+                    (mt != GGML_TYPE_F32 && mt != GGML_TYPE_F16) ||
                     op->type != GGML_TYPE_I32) {
                     return false;
                 }
-                if (op->ne[0] > 64) {
+                // Real DSA checkpoints configure indexer top_k in the hundreds to
+                // thousands (DSV4-Flash uses 512). The select shader handles any k
+                // (bitonic sort of the row for n_kv <= 4096, threshold-rescan
+                // tournament beyond), so there is no small-k gate anymore.
+                if (op->src[0]->ne[1] <= op->ne[0]) {
                     return false;
                 }
-                if (op->src[0]->ne[1] <= op->ne[0]) {
+                return true;
+            }
+        case GGML_OP_MUL_MULTI_ADD:
+            {
+                // Hyper-connection mixing (hc_attn_pre/hc_ffn_pre) and the fused MoE
+                // weighted sum. All operands f32; src2/src3 (per-expert scales/ids)
+                // are optional.
+                if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32 ||
+                    op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                if (op->src[0]->ne[3] != 1 || op->src[1]->ne[0] != 1) {
+                    return false;
+                }
+                if (op->src[0]->ne[1] != op->src[1]->ne[1] ||
+                    op->src[0]->ne[2] != op->src[1]->ne[2] ||
+                    op->src[0]->ne[2] != op->ne[1] ||
+                    op->src[0]->ne[0] != op->ne[0]) {
+                    return false;
+                }
+                if (op->src[2] != nullptr || op->src[3] != nullptr) {
+                    if (op->src[2] == nullptr || op->src[3] == nullptr) {
+                        return false;
+                    }
+                    if (op->src[2]->type != GGML_TYPE_F32 || op->src[3]->type != GGML_TYPE_I32) {
+                        return false;
+                    }
+                    if (op->src[3]->ne[0] != op->src[0]->ne[1]) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        case GGML_OP_HADAMARD:
+            {
+                if (op->type != GGML_TYPE_F32 || !ggml_are_same_shape(op->src[0], op)) {
+                    return false;
+                }
+                if (op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                const int64_t nh = op->op_params[0];
+                if (nh != 64 && nh != 128 && nh != 256 && nh != 512) {
+                    return false;
+                }
+                if (op->ne[0] % nh != 0) {
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_FILL:
+            {
+                if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(op)) {
                     return false;
                 }
                 return true;
@@ -14066,6 +14439,28 @@ static bool ggml_backend_vk_supports_op(ggml_backend_t backend, const ggml_tenso
             }
         case GGML_OP_GET_ROWS:
             {
+                // The generic get_rows shaders implement the row-gather form. The
+                // "dim0" variant (ggml_get_rows_ext with op_params[0] == 1, used by
+                // the DSV4 single-token CSA mask gather) is a dedicated per-element
+                // gather supporting the 2- and 4-byte types.
+                if (op->op_params[0] == 1) {
+                    const ggml_type t = op->src[0]->type;
+                    if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16 && t != GGML_TYPE_BF16) {
+                        return false;
+                    }
+                    if (op->src[1]->type != GGML_TYPE_I32 || op->type != t) {
+                        return false;
+                    }
+                    // same trailing dims; gathered dim0 count must fit
+                    if (op->src[0]->ne[1] != op->src[1]->ne[1] ||
+                        op->src[0]->ne[2] != op->src[1]->ne[2] ||
+                        op->src[0]->ne[3] != op->src[1]->ne[3] ||
+                        op->src[0]->ne[0] < op->src[1]->ne[0] ||
+                        op->ne[0] != op->src[1]->ne[0]) {
+                        return false;
+                    }
+                    return true;
+                }
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -14271,8 +14666,17 @@ static bool ggml_backend_vk_supports_buft(ggml_backend_t backend, ggml_backend_b
 static bool ggml_backend_vk_offload_op(ggml_backend_t backend, const ggml_tensor * op) {
     const int min_batch_size = 32;
 
-    return (op->ne[1] >= min_batch_size && op->op != GGML_OP_GET_ROWS) ||
-           (op->ne[2] >= min_batch_size && op->op == GGML_OP_MUL_MAT_ID);
+    if (op->op == GGML_OP_MOE_FUSED_UP_GATE || op->op == GGML_OP_MUL_MAT_ID) {
+        // For the MoE ops ne[1] is the expert/row dimension (e.g. all-experts
+        // decode form dst=[N, 256, n_tokens]), not the batch size. Keying the
+        // streaming-offload decision on ne[1] would upload the multi-GB expert
+        // weight tensors to the GPU once per decode token. MOE_FUSED_UP_GATE
+        // never streams (as before); MUL_MAT_ID streams on real batches only
+        // (token count in ne[2], dst=[ne0, n_ids, n_tokens]).
+        return op->op == GGML_OP_MUL_MAT_ID && op->ne[2] >= min_batch_size;
+    }
+
+    return op->ne[1] >= min_batch_size && op->op != GGML_OP_GET_ROWS;
 
     UNUSED(backend);
 }
@@ -14851,6 +15255,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             break;
         case GGML_UNARY_OP_SOFTPLUS:
             tensor_clone = ggml_softplus(ggml_ctx, src_clone[0]);
+            break;
+        case GGML_UNARY_OP_SQRT_SOFTPLUS:
+            tensor_clone = ggml_sqrt_softplus(ggml_ctx, src_clone[0]);
             break;
         default:
             std::cerr << "Missing vk_check_results OP: " << ggml_op_name(tensor->op) << std::endl;

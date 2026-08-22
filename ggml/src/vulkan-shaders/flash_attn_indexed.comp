@@ -5,8 +5,7 @@
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 // Indexed flash attention for the DSV4 sparse-attention path:
 //   O[t,h] = softmax(scale * q[t,h] . k[ idx[t,k] ] + mask[t, idx[t,k]]
@@ -14,8 +13,23 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 //            over the top-k gathered keys, dotted against v[ idx[t,k] ].
 // idx[t,k] < 0 means "no key" (padding) and contributes -inf.
 //
+// One workgroup per (token, head). The workgroup is split into subgroups which
+// process disjoint subsets of the gathered keys with an online-softmax partial
+// state each (the value accumulator is distributed across the subgroup lanes,
+// one register float per (lane, d % subgroupSize) slot). The partials are merged
+// in shared memory at the end, including the attention sink (an extra virtual
+// logit that participates in the max/denominator only). This replaces the
+// original one-thread-per-(t,h) serial kernel, which left the GPU idle for
+// single-token decode (64 threads doing ~topk*Dk serial FMAs each).
+//
 // K and V are F16 or Q8_0 (the two KV-cache types the CUDA DSA path accepts);
 // Q, sinks and the destination are F32 and the mask is F16.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#define WG_SIZE  128u
+#define MAX_SUBG 8u      // WG_SIZE / min subgroup size (16)
+#define ACC_MAX  32u     // max value slots per lane: Dv <= 512 with sg=16, <= 1024 with sg=32
 
 layout(push_constant) uniform PC {
     uint Dk;          // key/query head size
@@ -47,6 +61,10 @@ layout(binding = 4) readonly buffer IDX { int       indices[]; };
 layout(binding = 5) readonly buffer SNK { float     sinks[]; };
 layout(binding = 6) buffer D            { float     dst[]; };
 
+shared float s_acc[MAX_SUBG][512];
+shared float s_mx[MAX_SUBG];
+shared float s_sum[MAX_SUBG];
+
 #if defined(DATA_A_Q8_0)
 float k_get(uint n, uint d) {
     const uint blk = n*p.k_nb1 + d/32u;
@@ -66,7 +84,7 @@ float v_get(uint n, uint d) {
 #endif
 
 void main() {
-    const uint r = gl_GlobalInvocationID.x;
+    const uint r = gl_WorkGroupID.x;
     const uint total = p.T * p.H;
     if (r >= total) {
         return;
@@ -74,22 +92,26 @@ void main() {
     const uint t = r % p.T;  // token (query row)
     const uint h = r / p.T;  // head
 
+    const uint tid     = gl_LocalInvocationIndex;
+    const uint sg      = gl_SubgroupID;
+    const uint sg_size = gl_SubgroupSize;
+    const uint lane    = gl_SubgroupInvocationID;
+    const uint n_sg    = WG_SIZE / sg_size;  // subgroups per workgroup
+
     const uint qbase = t*p.q_nb1 + h*p.q_nb2;
     const uint dbase = h*p.dst_nb1 + t*p.dst_nb2;
 
     const float NEG_INF = uintBitsToFloat(0xFF800000u);
 
-    for (uint d = 0u; d < p.Dv; ++d) {
-        dst[dbase + d] = 0.0f;
-    }
-
-    float mx = NEG_INF;
+    float mx  = NEG_INF;
     float sum = 0.0f;
+    float acc[ACC_MAX];
+    [[unroll]] for (uint i = 0; i < ACC_MAX; ++i) acc[i] = 0.0f;
 
     const uint idx_base = t*p.indices_nb1;
     const uint m_base = t*p.mask_nb1;
 
-    for (uint kk = 0u; kk < p.topk; ++kk) {
+    for (uint kk = sg; kk < p.topk; kk += n_sg) {
         const int idx = indices[idx_base + kk];
         if (idx < 0) {
             continue;
@@ -97,9 +119,10 @@ void main() {
         const uint n = uint(idx);
 
         float s = 0.0f;
-        for (uint d = 0u; d < p.Dk; ++d) {
+        for (uint d = lane; d < p.Dk; d += sg_size) {
             s += q[qbase + d] * k_get(n, d);
         }
+        s = subgroupAdd(s);
         s *= p.scale;
         if (p.softcap != 0.0f) {
             s = p.softcap * tanh(s);
@@ -108,43 +131,59 @@ void main() {
             s += float(mask[m_base + n]);
         }
 
-        if (mx == NEG_INF && s == NEG_INF) {
-            continue;
-        }
-
-        if (s > mx) {
-            const float rescale = exp(mx - s);
-            sum = sum*rescale + 1.0f;
-            for (uint d = 0u; d < p.Dv; ++d) {
-                dst[dbase + d] = dst[dbase + d]*rescale + v_get(n, d);
-            }
-            mx = s;
-        } else {
-            const float e = exp(s - mx);
-            sum += e;
-            for (uint d = 0u; d < p.Dv; ++d) {
-                dst[dbase + d] += e * v_get(n, d);
+        // Online softmax update (mx == -inf and s == -inf are handled by the
+        // scale factors going to 0, exactly like the scalar reference).
+        const float m_new = max(mx, s);
+        const float r_old = mx == NEG_INF ? 0.0f : exp(mx - m_new);
+        const float w     = s == NEG_INF ? 0.0f : exp(s - m_new);
+        sum = sum * r_old + w;
+        mx  = m_new;
+        [[unroll]] for (uint i = 0; i < ACC_MAX; ++i) {
+            const uint d = lane + i*sg_size;
+            if (d < p.Dv) {
+                acc[i] = acc[i]*r_old + w * v_get(n, d);
             }
         }
     }
 
-    // Attention sink: an extra virtual logit per head that has no value vector.
-    // It participates in the max/renormalization and the softmax denominator only.
+    // Stash this subgroup's partial state in shared memory.
+    [[unroll]] for (uint i = 0; i < ACC_MAX; ++i) {
+        const uint d = lane + i*sg_size;
+        if (d < 512u && d < p.Dv) {
+            s_acc[sg][d] = acc[i];
+        }
+    }
+    if (lane == 0u) {
+        s_mx[sg]  = mx;
+        s_sum[sg] = sum;
+    }
+    barrier();
+
+    // Merge the subgroup partials (split-softmax) plus the attention sink,
+    // and write the normalized output. Threads cover d = tid mod WG_SIZE.
+    float M = NEG_INF;
     if (p.has_sinks != 0u) {
-        const float s = sinks[h*p.sinks_nb0];
-        if (s > mx) {
-            const float rescale = exp(mx - s);
-            sum = sum*rescale + 1.0f;
-            for (uint d = 0u; d < p.Dv; ++d) {
-                dst[dbase + d] *= rescale;
-            }
-        } else {
-            sum += exp(s - mx);
-        }
+        M = sinks[h*p.sinks_nb0];
+    }
+    for (uint g = 0; g < n_sg; ++g) {
+        M = max(M, s_mx[g]);
     }
 
-    const float inv = sum > 0.0f ? 1.0f/sum : 0.0f;
-    for (uint d = 0u; d < p.Dv; ++d) {
-        dst[dbase + d] *= inv;
+    float total_sum = 0.0f;
+    for (uint g = 0; g < n_sg; ++g) {
+        total_sum += s_mx[g] == NEG_INF ? 0.0f : s_sum[g] * exp(s_mx[g] - M);
+    }
+    if (p.has_sinks != 0u && M > NEG_INF) {
+        const float ss = sinks[h*p.sinks_nb0];
+        total_sum += ss == NEG_INF ? 0.0f : exp(ss - M);
+    }
+
+    const float inv = total_sum > 0.0f ? 1.0f/total_sum : 0.0f;
+    for (uint d = tid; d < p.Dv; d += WG_SIZE) {
+        float a = 0.0f;
+        for (uint g = 0; g < n_sg; ++g) {
+            a += s_mx[g] == NEG_INF ? 0.0f : s_acc[g][d] * exp(s_mx[g] - M);
+        }
+        dst[dbase + d] = a * inv;
     }
 }

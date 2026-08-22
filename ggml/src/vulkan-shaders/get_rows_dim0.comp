@@ -1,0 +1,65 @@
+#version 450
+
+#include "types.comp"
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// The "dim0" GET_ROWS variant (ggml_get_rows_ext with dim0=true,
+// op_params[0] == 1): a per-element gather along dim 0.
+//   dst[j, i1, i2, i3] = src[ ids[j, i1, i2, i3], i1, i2, i3 ]
+// src and dst have the same type (f32/f16/bf16, i.e. 4- or 2-byte), ids is i32.
+// Used by the DSV4 single-token CSA mask gather.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint ne0;         // gathered elements per row (ids->ne[0])
+    uint ne1;
+    uint ne2;
+    uint ne3;
+    uint src_nb1;     // src row strides (elements)
+    uint src_nb2;
+    uint src_nb3;
+    uint ids_nb1;     // ids strides (int32; ids->nb[0] is 1)
+    uint ids_nb2;
+    uint ids_nb3;
+    uint dst_nb1;     // dst row strides (elements)
+    uint dst_nb2;
+    uint dst_nb3;
+} p;
+
+#if defined(DATA_A_F16)
+layout(binding = 0) readonly buffer X { uint16_t x[]; };
+layout(binding = 2) buffer D { uint16_t dst[]; };
+#else
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 2) buffer D { float dst[]; };
+#endif
+layout(binding = 1) readonly buffer IDX { int ids[]; };
+
+void main() {
+    const uint id = gl_GlobalInvocationID.x;
+    const uint nrows = p.ne1 * p.ne2 * p.ne3;
+    const uint total = p.ne0 * nrows;
+    if (id >= total) {
+        return;
+    }
+    const uint j  = id % p.ne0;
+    const uint ir = id / p.ne0;
+
+    const uint i3 = ir / (p.ne1 * p.ne2);
+    const uint r3 = ir - i3 * p.ne1 * p.ne2;
+    const uint i2 = r3 / p.ne1;
+    const uint i1 = r3 - i2 * p.ne1;
+
+    const int idx = ids[j + i1*p.ids_nb1 + i2*p.ids_nb2 + i3*p.ids_nb3];
+    // guard -1 padding (the CPU reference reads out of bounds for those; clamp here)
+    const uint uidx = idx > 0 ? uint(idx) : 0u;
+
+    const uint xoff = i1*p.src_nb1 + i2*p.src_nb2 + i3*p.src_nb3;
+    const uint doff = i1*p.dst_nb1 + i2*p.dst_nb2 + i3*p.dst_nb3;
+
+    dst[doff + j] = x[xoff + uidx];
+}

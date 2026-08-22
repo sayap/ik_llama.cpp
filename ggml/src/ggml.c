@@ -19812,7 +19812,11 @@ static void ggml_compute_forward_get_rows(
 
     const struct ggml_tensor * src0 = dst->src[0];
 
-    if (dst->type != GGML_TYPE_F32) {
+    // The "dim0" per-element gather (ggml_get_rows_ext with dim0=true) is only
+    // implemented by ggml_compute_forward_get_rows_any; routing it to a typed
+    // row-gather kernel would copy ne00 elements per row into a ne0-sized
+    // destination (out of bounds).
+    if (dst->op_params[0] == 1 || dst->type != GGML_TYPE_F32) {
         ggml_compute_forward_get_rows_any(params, dst);
         return;
     }

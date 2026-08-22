@@ -2,6 +2,24 @@
 
 #extension GL_EXT_control_flow_attributes : require
 
+// Per-row top-k selection for GGML_OP_INDEXER_TOPK (the DSV4 indexer). The
+// output is the n_top_k largest scores of the row, ties preferring the smaller
+// index (matching the CPU partial_sort order closely enough; the tests compare
+// sets).
+//
+// Two paths, selected at compile time / runtime:
+//  - BITONIC (created when the device has >= 36 KiB shared memory):
+//    n_kv <= MAX_BITONIC sorts the (padded) row in shared memory with a bitonic
+//    network and writes the first n_top_k indices. This is the fast path for
+//    real DSV4 checkpoints (top_k = 512, lid n_kv up to a few thousand) and
+//    replaces the O(k * n_kv) rescan below.
+//  - tournament: the original threshold-rescan, O(k * n_kv / 256) per row,
+//    exact for any k and n_kv.
+
+#ifdef BITONIC
+#define MAX_BITONIC 4096u  // 32 KiB of shared memory (values + indices)
+#endif
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
@@ -14,17 +32,16 @@ layout(push_constant) uniform PC {
 layout(binding = 0) readonly buffer SCORE { float score[]; };
 layout(binding = 1) buffer D { int dst[]; };
 
+#ifdef BITONIC
+shared float b_val[MAX_BITONIC];
+shared int   b_idx[MAX_BITONIC];
+#endif
 shared float s_val[256];
-shared int s_idx[256];
+shared int   s_idx[256];
 
-void main() {
-    const uint iq_local = gl_WorkGroupID.x;
-    const uint iq = p.first_row + iq_local;
-    const uint tid = gl_LocalInvocationID.x;
-
+void select_tournament(uint iq_local, uint tid) {
     const float NEG_INF = uintBitsToFloat(0xFF800000u);
     const float POS_INF = uintBitsToFloat(0x7F800000u);
-
     const uint base = iq_local * p.n_kv;
     float threshold = POS_INF;
 
@@ -55,9 +72,70 @@ void main() {
         }
 
         if (tid == 0u) {
-            dst[iq*p.dst_nb1 + slot] = s_idx[0];
+            dst[(p.first_row + iq_local)*p.dst_nb1 + slot] = s_idx[0];
         }
         threshold = s_val[0];
         barrier();
     }
+}
+
+#ifdef BITONIC
+void select_bitonic(uint iq_local, uint tid) {
+    const float NEG_INF = uintBitsToFloat(0xFF800000u);
+    const uint base = iq_local * p.n_kv;
+
+    uint P = 1u;
+    while (P < p.n_kv) P <<= 1u;
+
+    for (uint j = tid; j < P; j += 256u) {
+        if (j < p.n_kv) {
+            b_val[j] = score[base + j];
+            b_idx[j] = int(j);
+        } else {
+            b_val[j] = NEG_INF;
+            b_idx[j] = 0x7fffffff;
+        }
+    }
+    barrier();
+
+    // Bitonic sort, descending final order (ties: smaller index first).
+    for (uint size = 2u; size <= P; size <<= 1u) {
+        for (uint stride = size >> 1; stride > 0u; stride >>= 1u) {
+            barrier();
+            for (uint t = tid; t < P/2u; t += 256u) {
+                const uint j = (t & (stride - 1u)) | ((t & ~(stride - 1u)) << 1u);
+                const uint k = j | stride;
+                const bool desc = (j & size) == 0u;
+                const float va = b_val[j];
+                const float vb = b_val[k];
+                const int   ia = b_idx[j];
+                const int   ib = b_idx[k];
+                // "a sorts first" for the descending direction
+                const bool a_first = (va > vb) || (va == vb && ia <= ib);
+                if (desc != a_first) {
+                    b_val[j] = vb; b_val[k] = va;
+                    b_idx[j] = ib; b_idx[k] = ia;
+                }
+            }
+        }
+    }
+
+    barrier();
+    if (tid < p.n_top_k) {
+        dst[(p.first_row + iq_local)*p.dst_nb1 + tid] = b_idx[tid];
+    }
+}
+#endif
+
+void main() {
+    const uint iq_local = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+#ifdef BITONIC
+    if (p.n_kv <= MAX_BITONIC) {
+        select_bitonic(iq_local, tid);
+        return;
+    }
+#endif
+    select_tournament(iq_local, tid);
 }

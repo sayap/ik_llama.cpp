@@ -21,6 +21,13 @@ ik_llama.cpp, what has been fixed, how to get good performance, and what is stil
   `mul_mat_vec` / `MUL_MAT_ID` / `GET_ROWS` plus the flat-dequant-to-F16 prompt path; see
   "MXFP4" below). The `*_R4` repack variants and `IQ1_BN`, `IQ2_BN` are still not
   supported and fall back to the CPU backend.
+- **DeepSeek-V4-Flash now runs end-to-end on Vulkan** at short *and* long context (the
+  CSA top-k path that activates past N_KV 2048 included): PP ~135-175 tok/s and TG
+  ~8-13 tok/s on 3× RTX PRO 4000 vs CUDA's ~328/~25 on the same hybrid `-ncmoe` config
+  (see "DSV4 long-context decode"). The single biggest trap found on the way: the MoE
+  streaming-offload heuristic keyed on the wrong tensor dimension and uploaded ~147 GB of
+  expert weights **per decode token** once the top-k path turned on (10 s/token, GPU idle);
+  see "16b" for the fix.
 
 ## What we fixed
 
@@ -520,10 +527,14 @@ All 8 sparse-attention ops are now implemented — the 7-op DSA family shared by
 OpenPangu, plus the DeepSeek-V4 `DS4_COMP` extra (`src/graphs/build_deepseek4.cpp`):
 
 - `INDEXER_TOPK` — two-kernel implementation (a score kernel `indexer_topk_score.comp`
-  with F32/F16 `k` variants, plus `indexer_topk_select.comp` for the per-row top-k). Query
-  rows are tiled so the score scratch buffer is bounded; the select kernel reads the score
-  buffer and does a threshold-rescan tournament (no big register arrays, which avoided a
-  driver crash on Blackwell).
+  with F32/F16 `k` **and mask** variants — the real DSV4 flash-attention configuration
+  uses an F16 `csa_kq_mask` — plus `indexer_topk_select.comp` for the per-row top-k). Query
+  rows are tiled so the score scratch buffer is bounded; the select kernel sorts the row
+  in shared memory with a bitonic network when `n_kv <= 4096` (the fast path for real
+  checkpoints; values + indices in 32 KiB, ties preferring the smaller index) and falls
+  back to the threshold-rescan tournament beyond that (no big register arrays, which
+  avoided a driver crash on Blackwell). There is no small-k gate anymore: DSV4-Flash's
+  top_k=512 works.
 - `MASK_TOPK` / `MASK_TO_IDX` — F32/F16 variants; `mask_to_idx` preserves increasing
   source-position order like the CPU reference.
 - `SINKHORN` / `HC_PRE` / `HC_POST` — one thread per token / one thread per output element.
@@ -532,10 +543,24 @@ OpenPangu, plus the DeepSeek-V4 `DS4_COMP` extra (`src/graphs/build_deepseek4.cp
   per query row with online softmax.
 
 `tests/test-dsa.cpp` validates every op against the CPU reference (all S sizes, both DS4
-compression types, F32/F16/Q8_0 latent caches, F32/F16 indexer/mask types); 50/50 pass on
-`Vulkan0` and `CPU`. `INDEXER_TOPK` is compared as a *set* per row because the CPU
-reference's `iqk_bucket_topk` (used when `n_rows < n_threads`) returns most buckets in
-original order rather than sorted.
+compression types, F32/F16/Q8_0 latent caches, F32/F16 indexer/mask types — including
+the F16-mask combinations the real DSV4 flash-attention configuration produces — and
+real big-k shapes: Dk=128, n_kv 1536-5120, top_k 511/512); 50/50 pass on `Vulkan0` and
+`CPU`. `INDEXER_TOPK` is compared as a *set* per row because the CPU reference's
+`iqk_bucket_topk` (used when `n_rows < n_threads`) returns most buckets in original order
+rather than sorted; the big-k cases use `n_rows >= 4` (the CPU `partial_sort` path) with a
+small boundary-slack (`max_misses`), because the CPU (AVX2) and GPU (subgroup) dot orders
+place a handful of near-tied scores on opposite sides of the k-of-n_kv boundary.
+
+### 12a. DSV4 misc ops (`tests/test-dsv4-misc.cpp`)
+
+The remaining DSV4 ops that had no Vulkan shader are covered by the new
+`tests/test-dsv4-misc.cpp` (run as `test-dsv4-misc CPU|Vulkan0`):
+`MUL_MULTI_ADD` (hyper-connection mixing and the fused MoE weighted sum, with and
+without the optional src2/src3 expert scales/ids), `HADAMARD` (f32/f16, all four block
+sizes), `FILL` (f32/f16, `-inf` and 0), `SQRT_SOFTPLUS`, and the dim0 `GET_ROWS`
+element gather (f32/f16, single and multiple rows). All pass on `Vulkan0` and `CPU`;
+the dim0 test is what caught the CPU dispatch bug (see 16b).
 
 ### 13. SET_ROWS is enabled (KV-cache scatter)
 
@@ -603,42 +628,138 @@ stay on the same backend as the view source.
   `ggml_vk_op_f32` turns any future cross-backend miss into a clear error instead of
   a segfault.
 
-### 16a. DSV4 prompt processing: op coverage ≠ GPU residency at real shapes
+### 16a. DSV4 prompt processing: op coverage ≠ GPU residency at real shapes — fixed
 
 A brief full-offload test (no `-cmoe`, `-ub 2048`) showed slow PP with high CPU usage:
 the op set is complete (sections above), but at real model shapes several nodes still
-fail `supports_op` and fall back to the CPU backend — each one splitting the graph per
-layer per ubatch with GPU→CPU→GPU copies, the same failure mode as the original
+failed `supports_op` and fell back to the CPU backend — each one splitting the graph
+per layer per ubatch with GPU→CPU→GPU copies, the same failure mode as the original
 FUSED_UP_GATE/IQK fallback (see "Fixed: large IQK/KT models were slow on Vulkan").
-Note the end-to-end DSV4 validation ran `-sm layer -cmoe` (MoE FFN on CPU), so it never
-exercised full-GPU PP throughput. Three culprits:
+All of the culprits are now fixed; at real shapes the decode graph keeps only the
+intentional CPU nodes (the `-ncmoe` MoE experts and the token-embedding lookup):
 
-- **`INDEXER_TOPK` is gated to `n_top_k <= 64`** (`supports_op` rejects
+- **`INDEXER_TOPK` was gated to `n_top_k <= 64`** (`supports_op` rejected
   `op->ne[0] > 64`). DSA-family checkpoints configure `attention.indexer.top_k` in
-  the thousands (2048 is the value the `--dsa-top-k` tuning comment in
-  `build_deepseek2.cpp` cites), so the per-layer indexer top-k — the default path,
-  `fused_idx_topk` defaults to true — runs on the CPU. The tournament-select shader
-  (`indexer_topk_select.comp`) needs tiling for large k. The unfused alternative
-  (`ggml_top_k` → `GGML_OP_TOP_K`) has no Vulkan implementation either, so `-no-fidx`
-  does not help. `tests/test-dsa.cpp` only exercises `n_top_k` 6/8, which is why it
-  passes while real models fall back.
-- **`HADAMARD` has no Vulkan shader** (CUDA has `hadamard.cu`). DSV4 inserts one per
-  layer on the indexer q (`dsv4_build_lid_top_k_shared`), on the compressed latent
-  state (`HC_PRE`/`HC_POST` neighborhood), and on q/kv when `k_cache_hadamard` is on —
-  which is **forced** on for checkpoints with Hadamard-folded `wv_b`/`wk_b_pp`
-  (llama.cpp logs "model has Hadamard-folded wv_b/wk_b_pp; forcing
-  k_cache_hadamard=true").
-- **MoE `MUL_MAT_ID`** is covered for DSV4's MXFP4 fused experts on coopmat2: the
-  native `matmul_id_mxfp4_f16` was added precisely because the flat dequant
-  materialized the whole 256×4096×4096 expert matrix (~8 GiB) and OOM'd. Residual
-  gaps: coopmat1/scalar devices still take the flat dequant for MXFP4 `MUL_MAT_ID`,
-  and any expert tensor in an IQK/KT or legacy-K type does too, even on coopmat2
-  (priority item 2 below).
+  the hundreds to thousands (DSV4-Flash uses 512), so the per-layer indexer top-k ran
+  on the CPU. The gate is gone: `indexer_topk_select.comp` now has a shared-memory
+  **bitonic sort** fast path (`pipeline_indexer_topk_select_bitonic`, created on
+  devices with ≥ 36 KiB shared memory; n_kv ≤ 4096, one workgroup per row, values +
+  indices in 32 KiB of shared memory) with the exact threshold-rescan **tournament**
+  path as the fallback for any n_kv/k. Note the CPU reference's own big-k path
+  (`iqk_bucket_topk`, used when `n_rows < n_threads`) is an *approximate* selection
+  ("it doesn't matter which we pick" for near-uniform scores), so `tests/test-dsa.cpp`
+  compares the big-k cases with `n_rows >= 4` (the exact `partial_sort` path) and
+  allows a few boundary swaps (see 16b).
+- **`HADAMARD` had no Vulkan shader** (CUDA has `hadamard.cu`). DSV4 inserts one per
+  layer on the indexer q, on the compressed latent state, and on q/kv when
+  `k_cache_hadamard` is on (forced for checkpoints with Hadamard-folded
+  `wv_b`/`wk_b_pp`). A `hadamard.comp` shader (f32/f16, block sizes 64/128/256/512
+  via spec constants, one workgroup per row) now covers it.
+- The remaining DSV4 misc ops that had no shader and silently fell back:
+  **`MUL_MULTI_ADD`** (hyper-connection mixing `hc_attn_pre`/`hc_ffn_pre` and the
+  fused MoE weighted sum), **`FILL`** (the `-inf` mask padding rows) and
+  **`SQRT_SOFTPLUS`** (the DeepSeek-V4 MoE gate). All three now have dedicated
+  shaders and are exercised by the new `tests/test-dsv4-misc.cpp`.
+- **The indexed FA kernel left the GPU idle at single-token decode**: the original
+  `flash_attn_indexed.comp` ran one thread per (token, head) — a serial ~topk·Dk FMA
+  loop per thread, so 64 threads did all the work while the SMs sat idle. It is now
+  subgroup-parallel: one workgroup (128 threads) per (token, head), subgroups process
+  disjoint key subsets with online-softmax partial states (the value accumulator is
+  distributed across the subgroup lanes), and the partials are merged in shared memory
+  including the attention sink (an extra virtual logit that participates in the
+  max/denominator only).
+- **MoE `MUL_MAT_ID`** was already covered for DSV4's MXFP4 fused experts on coopmat2
+  (`matmul_id_mxfp4_f16`); the IQK/KT expert types and coopmat1 remain on the flat
+  dequant path (priority item 2).
 
-Fix directions: tile `indexer_topk_select.comp` for k in the thousands (a bucketed
-pre-pass like the CPU `iqk_bucket_topk`, or a multi-round threshold-rescan), port
-`hadamard.cu` (block sizes 64/128/256/512), and the priority-2 matmul_id work for
-non-MXFP4 expert types.
+With those in place, the DSV4-Flash hybrid run (`-dev Vulkan0,Vulkan1,Vulkan2 -ngl 99
+-ncmoe 40`, 3× RTX PRO 4000 Blackwell) went from PP ~19.6 / TG ~1.03 tok/s (at
+N_KV 1536) to PP ~134 / TG ~11.0 tok/s — ~6.9×/~10.7× — with the decode graph at
+117 splits and no unintended CPU fallbacks.
+
+### 16b. DSV4 long-context decode (N_KV > 2048): the CSA top-k path
+
+Past N_KV 2048 the indexer's compressed attention switches to its top-k path: the
+per-layer `INDEXER_TOPK` over the lid (indexer) key/value stream selects 512 of the
+n_kv positions, the CSA mask is gathered per selected index, and the raw attention
+runs dense-with-sinks over the selected keys. Three separate problems surfaced once
+this path activated — the last one looked like a "slow kernel" for a long time but
+was the most interesting bug of the batch.
+
+- **`INDEXER_TOPK` rejected F16 masks.** The real DSV4 flash-attention configuration
+  stores the `csa_kq_mask` as **F16**, but `supports_op` only accepted F32 masks (and
+  the score shader only had F32-mask variants). At prompt batches the MoE-batch
+  offload heuristic still placed the op on the GPU, but at decode (`n_tokens == 1`)
+  nothing forced it there and the scheduler pushed it (and the graph around it) onto
+  the CPU — the CPU big-k top-k over n_kv rows is *glacial*, ~10 s/token. The score
+  shader gained F16-mask variants (`MASK_F16` define, `m_val()` unpacking; pipelines
+  `indexer_topk_score_*_m16`) and `supports_op` accepts F16 masks now, with mask
+  strides computed through `ggml_type_size(mask->type)`. `tests/test-dsa.cpp` covers
+  all four k×mask type combinations at small and real (Dk=128, n_kv 1536-5120,
+  top_k 511/512) shapes.
+- **The dim0 `GET_ROWS` gather** (`ggml_get_rows_ext(..., dim0=true)`, the
+  `csa_mask = get_rows_ext(mask, top_k, same_type, /*dim0*/ true)` the DSV4 builder
+  uses for single-token batches) is a per-*element* gather along dim 0 —
+  `dst[j, i1..] = src[ids[j, i1..], i1..]` — not the row gather the generic
+  `get_rows.comp` implements. It now has a dedicated `get_rows_dim0.comp` shader
+  (f32/f16, strided over all four dims) and `supports_op` validates its shape
+  contract (same trailing dims, `ne[0] >= ids->ne[0]`). This removes ~43 scheduler
+  splits per decode token (one per layer) that the previous CPU fallback cost.
+- **CPU dim0 `GET_ROWS` with an F32 destination was an out-of-bounds write** (found
+  by the new test): `ggml_compute_forward_get_rows` routed the dim0 form to the
+  typed row-gather kernels, which copy `ne00` elements per row into an
+  `ne0`-sized destination — a heap smash for any gather narrower than the source
+  row. The dim0 form now always dispatches to `ggml_compute_forward_get_rows_any`
+  (the only implementation of the element gather).
+
+#### The 10 s/token collapse: MoE weights streamed to the GPU per token
+
+With the ops above on the GPU, long-context decode was still ~10 s/token — but with
+the **GPU idle and one CPU core pegged in `poll()` inside the NVIDIA driver**, i.e. a
+stall, not compute. `/proc`-based CPU accounting (utime deltas per thread) plus a
+gdb interrupt during the slow phase pointed at `ggml_backend_vk_buffer_set_tensor` →
+`ggml_vk_buffer_write_2d`; instrumenting the tensor writes showed ~693 writes of
+**1,140,850,688 bytes each** per few tokens — the `blk.N.ffn_{up,gate,down}_exps`
+weight tensors, once per layer per token.
+
+Root cause: `ggml_backend_vk_offload_op` decided streaming-offload eligibility with
+`op->ne[1] >= 32`. For the MoE ops, `ne[1]` is the **expert/row dimension**, not the
+batch size — at decode the all-experts form is `dst=[N, 256, n_tokens]` (`ne[1]` =
+256 experts, `ne[2]` = tokens), so the verdict fired for every single token and the
+scheduler helpfully uploaded 3 × 1.14 GB of expert weights × 43 layers ≈ **147 GB per
+token** across PCIe (~10 s at the driver's effective rate). The prompt form
+(`dst=[N, 6, 512]`) happened to be keyed correctly by accident. The fix keys the MoE
+ops (`MOE_FUSED_UP_GATE`, `MUL_MAT_ID`) on `ne[2]` (the token count); `MOE_FUSED_UP_GATE`
+never streams (as before) and `MUL_MAT_ID` streams on real batches only, restoring
+the pre-fix prompt behaviour exactly.
+
+Numbers (DSV4-Flash, 3× RTX PRO 4000, `-ncmoe 40` hybrid, 2100-token prompt):
+
+| | TG before | TG after | CUDA reference |
+|---|---|---|---|
+| N_KV 2100+ (top-k path active) | **0.10 tok/s** | 1.52 tok/s (`llama-cli` cold) / **7.9 tok/s** (warm `sweep-bench`) | 25.4 tok/s |
+| N_KV ≤ 1536 | 11.2 tok/s | unchanged | ~27 tok/s |
+
+A cold `llama-cli` decode measures ~650 ms/token while the warm sweep-bench measures
+~126 ms/token; the per-op GPU timestamps account for ~128 ms/token (flash attention
+dominates, then the small matmuls), so the cold-run remainder is host-side
+scheduler/split overhead (the decode graph is ~90 splits/token) plus first-use
+pipeline compilation. That host overhead and the FA kernel cost itself are the
+remaining headroom vs CUDA (~3.2× TG at long context, ~1.9× PP).
+
+Two smaller fixes that came out of the same investigation:
+
+- The `GGML_VK_PERF_LOGGER=1` path asserted (`GGML_ASSERT(ctx->compute_ctx.expired())`)
+  on any multi-split graph, i.e. on every real model. It now flushes the pending
+  compute context (submit + fence wait) before starting the timestamped recording.
+- Greedy cross-backend text comparison at long context: word-salad prompts (flat
+  next-token distributions) make f16 numerics flip the argmax early, so they are not
+  a useful signal; a natural-prose prompt keeps the continuations identical through
+  all but near-tie tokens (e.g. an arbitrary "PR number" in a URL). The big-k
+  `INDEXER_TOPK` tests face the same effect at the k-of-n_kv selection boundary —
+  the CPU (AVX2 dot order) and GPU (subgroup dot order) accumulate scores in
+  different orders, so `check_i32_set` gained a `max_misses` boundary-slack mode for
+  those cases.
 
 ### 17. MTP / multi-context device sharing
 
@@ -822,8 +943,10 @@ For large MoE models on the 3090 + Strix Halo, the reference hybrid config is:
 
 `-cmoe` keeps the MoE FFN (`ffn_*_exps`) in host RAM; `offload_op` (dc663fe6) streams those
 FFN tensors into the 3090 when `batch_size * n_active >= min_batch * n_tot`, amortized by the
-large ubatch. TG (`batch=1`) keeps the FFN on the CPU (memory-bound, DDR). So the hybrid is
-"attention resident on 3090 + FFN streamed for PP + FFN on CPU for TG".
+large ubatch. (Note: the Vulkan `offload_op` implementation must key the MoE ops on `ne[2]` —
+the token count — not `ne[1]`, which is the expert dimension; see 16b for the decode-path
+regression that otherwise results.) TG (`batch=1`) keeps the FFN on the CPU (memory-bound,
+DDR). So the hybrid is "attention resident on 3090 + FFN streamed for PP + FFN on CPU for TG".
 
 `-sm graph` does not stream; it statically shards tensors. Two variants matter:
 
@@ -875,10 +998,13 @@ record PP tok/s and TG tok/s for both.
    End-to-end DeepSeek-V4 is now blocked by a separate ggml-core scheduler/gallocr bug for
    in-place view ops at a GPU→CPU boundary (see "Known gap: hybrid CPU/GPU view-allocation").
    **Follow-up finding (real-model PP)**: op-level coverage is complete, but a
-   full-offload prompt run still executes partially on the CPU — `INDEXER_TOPK`'s
-   `supports_op` gate rejects `n_top_k > 64` (real checkpoints use 2048), and
-   `HADAMARD` and `GGML_OP_TOP_K` have no Vulkan implementation at all. See "DSV4
-   prompt processing: op coverage ≠ GPU residency at real shapes" above.
+   full-offload prompt run still executed partially on the CPU — `INDEXER_TOPK`'s
+   `supports_op` gate rejected `n_top_k > 64` (real checkpoints use hundreds to
+   thousands), and `HADAMARD` had no Vulkan implementation. **All fixed** (see
+   "DSV4 prompt processing: op coverage ≠ GPU residency at real shapes" and
+   "DSV4 long-context decode" above); DeepSeek-V4-Flash now runs end-to-end on Vulkan
+   at short and long context. `GGML_OP_TOP_K` (the unfused `-no-fidx` alternative)
+   still has no Vulkan implementation.
 4. **Hybrid CPU/GPU view-allocation (`ROPE_BACK`)** — **fixed**: the scheduler now keeps
    in-place view ops on the view source's backend, so `-sm layer -cmoe` no longer crashes
    on a null device buffer (see "Hybrid CPU/GPU view-allocation" above).
@@ -1354,9 +1480,14 @@ mainline; it now lives in the `fp16` branch). Remaining work, in order:
   backend (all S sizes, F32/F16/Q8_0 latent caches, both DS4 compression types, dense +
   indexed latent attention), plus the DSV4 **indexed flash attention + sinks**
   (`GGML_OP_FLASH_ATTN_EXT` with `src[5]`/`src[4]`: single- and multi-token, F16/Q8_0
-  KV, with/without sinks, trailing `-1` index padding, and the 512/512 head shape). Run
-  as `test-dsa CPU|Vulkan0|CUDA0`. INDEXER_TOPK is compared as a per-row *set* because
-  the CPU reference's bucket top-k is not sorted.
+  KV, with/without sinks, trailing `-1` index padding, and the 512/512 head shape), the
+  F32/F16 mask × k combinations and the real big-k shapes (bitonic and tournament
+  select paths). Run as `test-dsa CPU|Vulkan0|CUDA0`. INDEXER_TOPK is compared as a
+  per-row *set* (with a small boundary slack for the big-k cases — see 16b) because the
+  CPU reference's bucket top-k is not sorted.
+- `tests/test-dsv4-misc.cpp` validates the DSV4 misc ops (`MUL_MULTI_ADD`, `HADAMARD`,
+  `FILL`, `SQRT_SOFTPLUS`, and the dim0 `GET_ROWS` element gather) against the CPU
+  reference on a target backend. Run as `test-dsv4-misc CPU|Vulkan0|CUDA0`.
 - `tests/test-iqk-quants.cpp` validates the 15 IQK/KT types against the scalar dequant
   reference (the format definition): single-token decode, small batches, larger K,
   multi-token (dequant-to-F16 path), MoE (`MUL_MAT_ID`) and `GET_ROWS` (quantized token

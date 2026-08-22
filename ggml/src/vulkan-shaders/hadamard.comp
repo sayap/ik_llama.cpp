@@ -1,0 +1,70 @@
+#version 450
+
+#include "types.comp"
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Normalized Hadamard transform of NH-point blocks along dim 0 (a port of the
+// CUDA hadamard.cu kernel): ne0 must be a multiple of NH; each block gets the
+// radix-2 butterfly network scaled by (1/sqrt(2)) per round. One workgroup of
+// NH/2 threads per (block, row).
+
+#ifndef NH
+#define NH 64
+#endif
+
+layout(local_size_x = NH/2, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint nc;         // ne0 / NH blocks per row
+    uint src_nb1;    // src row stride (A_TYPE elements)
+    uint src_nb2;
+    uint src_nb3;
+    uint dst_nb1;    // dst row stride (floats)
+    uint dst_nb2;
+    uint dst_nb3;
+} p;
+
+#if defined(DATA_A_F16)
+layout(binding = 0) readonly buffer X { float16_t x[]; };
+#else
+layout(binding = 0) readonly buffer X { float x[]; };
+#endif
+layout(binding = 1) buffer D { float dst[]; };
+
+shared float ys[NH];
+
+void main() {
+    const uint ii1 = gl_WorkGroupID.x;  // nc * ne1 blocks
+    const uint i2  = gl_WorkGroupID.y;
+    const uint i3  = gl_WorkGroupID.z;
+    const uint i1  = ii1 / p.nc;
+    const uint ic  = ii1 % p.nc;
+    const uint tid = gl_LocalInvocationIndex;
+
+    const uint xoff = i1*p.src_nb1 + i2*p.src_nb2 + i3*p.src_nb3 + ic*NH;
+    const float a = float(x[xoff + 2*tid]);
+    const float b = float(x[xoff + 2*tid + 1u]);
+    ys[2*tid]     = a + b;
+    ys[2*tid + 1] = a - b;
+    float scale = 0.707106781f;
+
+    for (uint h = 2u; h < NH; h <<= 1u) {
+        barrier();
+        const uint ii = tid/h;
+        const uint jj = tid%h;
+        const uint j  = 2u*h*ii + jj;
+        const float u = ys[j];
+        const float v = ys[j+h];
+        ys[j]     = u + v;
+        ys[j + h] = u - v;
+        scale *= 0.707106781f;
+    }
+
+    barrier();
+    const uint doff = i1*p.dst_nb1 + i2*p.dst_nb2 + i3*p.dst_nb3 + ic*NH;
+    dst[doff + 2*tid]     = ys[2*tid]     * scale;
+    dst[doff + 2*tid + 1] = ys[2*tid + 1] * scale;
+}

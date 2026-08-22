@@ -220,6 +220,9 @@ llama_build_and_test(test-delta-net.cpp LABEL "main" ARGS Vulkan0)
 # DSA / GLM-DSA / DeepSeek-V4 sparse-attention op correctness (CPU vs backend comparison)
 llama_build_and_test(test-dsa.cpp LABEL "main" ARGS Vulkan0)
 
+# DSV4 misc ops that were CPU fallbacks on Vulkan (mul_multi_add, hadamard, fill, sqrt_softplus)
+llama_build_and_test(test-dsv4-misc.cpp LABEL "main" ARGS Vulkan0)
+
 # Vulkan split buffer type + cross-device REDUCE (the -sm graph plumbing).
 # These symbols live in libggml in static Vulkan builds; in GGML_BACKEND_DL builds they
 # are in the dynamically loaded ggml-vulkan module, which this test does not link.
