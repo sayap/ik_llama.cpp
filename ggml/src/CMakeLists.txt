@@ -1354,6 +1354,16 @@ if (GGML_BACKEND_DL)
     # the core ggml library is backend-agnostic
     set(GGML_SOURCES_BACKENDS "")
     set(GGML_CDEF_PUBLIC "")
+
+    # The Vulkan FA kernels require a 64-element KQ mask padding. In a
+    # monolithic build GGML_USE_VULKAN is propagated to the core library via
+    # GGML_CDEF_PUBLIC, but in a backend-DL build the Vulkan backend is a
+    # separate shared library while the core remains backend-agnostic.
+    # Propagate only the padding requirement to the core (and its consumers)
+    # so both sides agree on GGML_KQ_MASK_PAD.
+    if (GGML_VULKAN)
+        list(APPEND GGML_CDEF_PUBLIC GGML_KQ_MASK_PAD_VULKAN)
+    endif()
 else()
     set(GGML_SOURCES_BACKENDS
         ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}

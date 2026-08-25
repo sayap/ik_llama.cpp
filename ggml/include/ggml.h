@@ -2483,7 +2483,7 @@ extern "C" {
             int                   nk,
             int                   topk_experts);
 
-#if GGML_USE_VULKAN
+#if GGML_USE_VULKAN || GGML_KQ_MASK_PAD_VULKAN
 #define GGML_KQ_MASK_PAD 64
 #else
 #define GGML_KQ_MASK_PAD 16
