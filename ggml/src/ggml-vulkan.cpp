@@ -6385,9 +6385,14 @@ static void ggml_vk_matmul_id(
 }
 
 static bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
+    // a row that is not a whole number of blocks is not contiguous, and ggml_row_size()
+    // asserts on it
+    if (tensor->ne[0] % ggml_blck_size(tensor->type) != 0) {
+        return false;
+    }
     return
         tensor->nb[0] == ggml_type_size(tensor->type) &&
-        tensor->nb[1] == (tensor->nb[0]*tensor->ne[0])/ggml_blck_size(tensor->type) + ggml_internal_get_type_traits(tensor->type).row_meta_size &&
+        tensor->nb[1] == ggml_row_size(tensor->type, tensor->ne[0]) &&
         tensor->nb[3] == tensor->nb[2]*tensor->ne[2];
 }
 
@@ -6634,7 +6639,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, pipeline);
 
-    const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
+    const uint64_t qx_sz = ggml_row_size(src0->type, ne00) * ne01;
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
     const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
     const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
@@ -6767,9 +6772,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     // compute
     // The A binding range must cover the full tensor when passing raw quantized
-    // weights (mmq path). x_sz omits the per-row scale header of row-meta types
-    // (e.g. IQ4_KT), which would put the last rows out of range (robustness reads
-    // them as zero). ggml_nbytes() includes the header, so use it for the raw case.
+    // weights (mmq path). ggml_nbytes() covers the tensor's actual size, including
+    // any padding between batches (nb[2]/nb[3]), which x_sz * ne02 * ne03 does not,
+    // so use it for the raw case.
     ggml_vk_matmul(
         ctx, subctx, pipeline,
         { d_X, x_buf_offset, qx_needs_dequant ? (x_sz * ne02 * ne03) : ggml_nbytes(src0) }, { d_Y, y_buf_offset, y_sz * ne12 * ne13 },
@@ -6847,7 +6852,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     const uint64_t y_ne = ne11 * ne10;
     const uint64_t d_ne = ne11 * ne01;
 
-    const uint64_t qx_sz = ggml_vk_align_size(ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type), ctx->device->properties.limits.minStorageBufferOffsetAlignment);
+    const uint64_t qx_sz = ggml_vk_align_size(ggml_row_size(src0->type, ne00) * ne01, ctx->device->properties.limits.minStorageBufferOffsetAlignment);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
     const uint64_t x_sz = x_non_contig ? ggml_vk_align_size(ggml_type_size(src0->type) * x_ne, ctx->device->properties.limits.minStorageBufferOffsetAlignment) : qx_sz;
     const uint64_t y_sz = quantize_y ? (y_ne * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (f16_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
@@ -6963,10 +6968,11 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     // IQK/KT quants carry a per-row scale header: pass the row meta size in
-    // pc.stride_a and the per-batch A stride in bytes.
+    // pc.stride_a and the per-batch A stride in bytes (ggml_row_size includes
+    // the header).
     const uint32_t src0_row_meta = ggml_internal_get_type_traits(src0->type).row_meta_size;
     if (ggml_vk_is_iqk_type(src0->type) && !batch_n) {
-        stride_batch_x = (uint32_t)(ne01 * (src0_row_meta + ggml_type_size(src0->type) * ne00 / ggml_blck_size(src0->type)));
+        stride_batch_x = (uint32_t)(ne01 * ggml_row_size(src0->type, ne00));
     }
 
     const uint32_t max_groups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
@@ -7281,7 +7287,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const uint64_t y_ne = padded_n * ne10;
     const uint64_t d_ne = ne21 * ne20;
 
-    const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
+    const uint64_t qx_sz = ggml_row_size(src0->type, ne00) * ne01;
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
     const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
     const uint64_t y_sz = y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne;
@@ -7475,7 +7481,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     const uint64_t y_ne = ne11 * ne10;
     const uint64_t d_ne = ne21 * ne20;
 
-    const uint64_t qx_sz = ggml_vk_align_size(ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type), ctx->device->properties.limits.minStorageBufferOffsetAlignment);
+    const uint64_t qx_sz = ggml_vk_align_size(ggml_row_size(src0->type, ne00) * ne01, ctx->device->properties.limits.minStorageBufferOffsetAlignment);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
     const uint64_t x_sz = x_non_contig ? ggml_vk_align_size(ggml_type_size(src0->type) * x_ne, ctx->device->properties.limits.minStorageBufferOffsetAlignment) : qx_sz;
     const uint64_t y_sz = f16_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne;
@@ -7590,7 +7596,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     // pc.stride_a and the per-expert A stride in bytes.
     const uint32_t src0_row_meta = ggml_internal_get_type_traits(src0->type).row_meta_size;
     const uint32_t src0_batch_stride = ggml_vk_is_iqk_type(src0->type)
-        ? (uint32_t)(ne01 * (src0_row_meta + ggml_type_size(src0->type) * ne00 / ggml_blck_size(src0->type)))
+        ? (uint32_t)(ne01 * ggml_row_size(src0->type, ne00))
         : (uint32_t)x_ne;
     const vk_mat_vec_id_push_constants pc = {
         (uint32_t)ne00, (uint32_t)(ggml_vk_is_iqk_type(src0->type) ? src0_row_meta : ne10), (uint32_t)ne10, (uint32_t)ne01,
