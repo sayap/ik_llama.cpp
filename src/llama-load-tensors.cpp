@@ -259,7 +259,7 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
         buft_layer_count[model.buft_layer[i].buft_matrix]++;
     }
 
-    default_cpu_buft = llama_default_buffer_type_cpu(true);
+    default_cpu_buft = llama_default_buffer_type_host(model);
 
     if (ml.tensor_buft_overrides) {
         for (const auto * o = ml.tensor_buft_overrides; o->pattern != nullptr; ++o) {
@@ -270,7 +270,7 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
     }
 
     if (ml.ncmoe > 0) {
-        auto buft = llama_default_buffer_type_cpu(true);
+        auto buft = llama_default_buffer_type_host(model);
         if (model.split_mode == LLAMA_SPLIT_MODE_ATTN || model.split_mode == LLAMA_SPLIT_MODE_GRAPH || ml.ncmoe >= n_layer || model.devices.size() < 2) {
             const auto tn = LLM_TN(model.arch);
             int last_layer = n_layer - model.hparams.nextn_predict_layers;

@@ -4612,7 +4612,7 @@ GGML_CALL ggml_backend_t ggml_backend_reg_metal_init(const char * params, void *
 }
 
 GGML_CALL int ggml_backend_metal_reg_devices(void) {
-    ggml_backend_register("Metal", ggml_backend_reg_metal_init, ggml_backend_metal_buffer_type(), NULL);
+    ggml_backend_register("Metal", ggml_backend_reg_metal_init, ggml_backend_metal_buffer_type(), NULL, NULL);
     return 1;
 }
 

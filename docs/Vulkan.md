@@ -877,6 +877,76 @@ used a 301-token prompt — a single ubatch — which is why it slipped through.
 keeping the `embd` discovery alive when `n_outputs == 0 && has_mtp` (the logits side
 still runs `res = nullptr` as before; only hidden-state rows are extracted).
 
+### 19. Host-buffer pinning (backend-DL + Vulkan)
+
+Vulkan has the same "normal" pinned host-buffer mechanism as CUDA. The
+`ggml_backend_vk_host_buffer_type()` allocator (`ggml_vk_host_malloc`) creates
+host-visible, host-coherent (and host-cached when available) Vulkan memory — the
+Vulkan equivalent of `cudaHostRegister`/`cudaMallocHost`. When
+`VK_EXT_external_memory_host` is available (default), the memory is our own
+`mmap`'d allocation imported into Vulkan (see below); otherwise it is
+`vkAllocateMemory`-allocated:
+
+```cpp
+ggml_vk_create_buffer(device, size,
+    eHostVisible | eHostCoherent | eHostCached,   // preferred
+    eHostVisible | eHostCoherent);                // fallback
+// ... or, with VK_EXT_external_memory_host:
+host = mmap(size);  // our memory, released by the process instantly
+ggml_vk_create_buffer(device, size, eHostVisible | eHostCoherent | eHostCached,
+                      eHostVisible | eHostCoherent, /*import_host_ptr=*/ host);
+```
+
+**Why the import path exists (NVIDIA system-memory pools).** Since the 560 series
+the NVIDIA driver serves host-visible `vkAllocateMemory` allocations from persistent
+kernel-side *system memory pools* (`NVreg_EnableSystemMemoryPools`, default on; see
+`/proc/driver/nvidia/params`). Those pools are only returned to the OS by the shrinker
+— i.e. `echo 3 > /proc/sys/vm/drop_caches` — long after process exit. A
+`llama-server` with `-cmoe --no-mmap` of a ~94 GB model leaves ~60-90 GB of RAM
+"used" with no process accounting for it. Verified with a raw Vulkan repro (no
+ggml): driver-allocated cached/wc/dedicated/exported host memory all retain the full
+allocation after exit; `MADV_DONTNEED` on the live mapping does nothing. Importing
+our own memory via `VkImportMemoryHostPointerInfoEXT`
+(`VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT`) releases everything
+immediately on free/exit and has identical H2D/D2H bandwidth (~6 GB/s each way on
+the RTX 3090). `GGML_VK_DISABLE_HOST_IMPORT=1` forces the old driver-allocated path
+(if the import fails at runtime we also fall back to it automatically, with a
+warning). The memory type is validated with `vkGetMemoryHostPointerPropertiesEXT`
+(intersected with the buffer's `memoryTypeBits`), and sizes/pointers are rounded to
+`minImportedHostPointerAlignment`.
+
+If the allocation throws `vk::SystemError`, the buffer-type allocator logs
+`ggml_vulkan: Failed to allocate pinned memory (...)` and falls back to a plain CPU
+buffer.
+
+Status:
+
+- Static Vulkan builds have always used this for CPU-side host buffers (through the
+  old `#ifdef GGML_USE_VULKAN` branch in `llama_default_buffer_type_cpu`).
+- `GGML_BACKEND_DL` builds now do too: `ggml_backend_vk_reg_devices()` registers
+  `ggml_backend_vk_host_buffer_type()` in the ggml backend registry, and
+  `llama_default_buffer_type_host(model)` picks it from `model.devices` at runtime.
+  The same change fixes the backend-DL pinning regression for CUDA and SYCL.
+
+Known gaps:
+
+- **Device-0 singleton.** The host buffer type always allocates on
+  `vk_instance.devices[0]`, so on multi-GPU Vulkan every host buffer is pinned on
+  device 0. Making it device-specific needs the registry's `host_buffer_type` to
+  become a getter callback (or a per-device buffer type).
+- **`GGML_VULKAN_NO_PINNED=1`** now exists and makes the host buffer type fall back
+  to plain CPU buffers (the CUDA-style force-disable knob).
+- **Null-pointer non-fallback.** If `ggml_vk_host_malloc` ever returns `nullptr` from
+  its non-`eHostVisible` branch, `ggml_backend_vk_host_buffer_type_alloc_buffer` does
+  not fall back — it would build a CPU buffer with a null base (crash/corruption).
+  Today that branch is unreachable because both the preferred and fallback memory flags
+  include `eHostVisible` and `find_properties` only returns memory types containing all
+  requested bits; a defensive `ptr == nullptr` check should still be added.
+- **No mmap pinning.** `ggml_backend_*_register_host_buffer`/`unregister`
+  (`GGML_CUDA_REGISTER_HOST`) is CUDA-only; Vulkan has no equivalent for pinning
+  mmap'd weight pages yet (the import mechanism above could likely serve as one:
+  `mmap` the weights read-only-shared and import the mapping).
+
 ## Benchmarks (RTX 3090, Vulkan0)
 
 Qwen2.5-Coder-0.5B-Instruct-Q8_0 (dense, `-c 2048`, single token batch):

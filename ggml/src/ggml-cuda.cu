@@ -5622,7 +5622,7 @@ GGML_CALL int ggml_backend_cuda_reg_devices() {
     for (int i = 0; i < device_count; i++) {
         char name[128];
         snprintf(name, sizeof(name), "%s%d", GGML_CUDA_NAME, i);
-        ggml_backend_register(name, ggml_backend_reg_cuda_init, ggml_backend_cuda_buffer_type(i), ggml_backend_cuda_get_device_memory, (void *) (intptr_t) i);
+        ggml_backend_register(name, ggml_backend_reg_cuda_init, ggml_backend_cuda_buffer_type(i), ggml_backend_cuda_host_buffer_type(), ggml_backend_cuda_get_device_memory, (void *) (intptr_t) i);
     }
     return device_count;
 }

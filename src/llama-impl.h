@@ -223,7 +223,8 @@ struct no_init {
 struct gguf_context;
 std::string gguf_kv_to_str(const gguf_context * ctx_gguf, int i);
 
-ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer);
+ggml_backend_buffer_type_t llama_default_buffer_type_cpu(void);
+ggml_backend_buffer_type_t llama_default_buffer_type_host(const struct llama_model & model);
 
 struct llama_split_tensor {
     std::vector<ggml_tensor *> tensor_splits;

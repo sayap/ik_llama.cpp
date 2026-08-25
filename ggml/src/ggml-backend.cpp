@@ -458,6 +458,7 @@ struct ggml_backend_reg {
     char name[128];
     ggml_backend_init_fn init_fn;
     ggml_backend_buffer_type_t default_buffer_type;
+    ggml_backend_buffer_type_t host_buffer_type;
     ggml_backend_get_device_memory_fn get_device_memory_fn;
     void * user_data;
 };
@@ -496,7 +497,7 @@ GGML_CALL static void ggml_backend_registry_init(void) {
 
     initialized = true;
 
-    ggml_backend_register("CPU", ggml_backend_reg_cpu_init, ggml_backend_cpu_buffer_type(), NULL, NULL);
+    ggml_backend_register("CPU", ggml_backend_reg_cpu_init, ggml_backend_cpu_buffer_type(), NULL, NULL, NULL);
 
     // add forward decls here to avoid including the backend headers
 #ifdef GGML_USE_CUDA
@@ -508,7 +509,7 @@ GGML_CALL static void ggml_backend_registry_init(void) {
 #endif
 
 #ifdef GGML_USE_METAL
-    ggml_backend_register("Metal", ggml_backend_reg_metal_init, ggml_backend_metal_buffer_type(), NULL, NULL);
+    ggml_backend_register("Metal", ggml_backend_reg_metal_init, ggml_backend_metal_buffer_type(), NULL, NULL, NULL);
 #endif
 
 #ifdef GGML_USE_VULKAN
@@ -524,7 +525,8 @@ GGML_CALL static void ggml_backend_registry_init(void) {
 }
 
 GGML_CALL void ggml_backend_register(const char * name, ggml_backend_init_fn init_fn,
-        ggml_backend_buffer_type_t default_buffer_type, ggml_backend_get_device_memory_fn get_device_memory_fn, void * user_data) {
+        ggml_backend_buffer_type_t default_buffer_type, ggml_backend_buffer_type_t host_buffer_type,
+        ggml_backend_get_device_memory_fn get_device_memory_fn, void * user_data) {
     GGML_ASSERT(ggml_backend_registry_count < GGML_REG_MAX_BACKENDS);
 
     size_t id = ggml_backend_registry_count;
@@ -533,6 +535,7 @@ GGML_CALL void ggml_backend_register(const char * name, ggml_backend_init_fn ini
         /* .name                 = */ {0},
         /* .init_fn              = */ init_fn,
         /* .default_buffer_type  = */ default_buffer_type,
+        /* .host_buffer_type     = */ host_buffer_type,
         /* .get_device_memory_fn = */ get_device_memory_fn,
         /* .user_data            = */ user_data
     };
@@ -619,6 +622,13 @@ ggml_backend_buffer_type_t ggml_backend_reg_get_default_buffer_type(size_t i) {
 
     GGML_ASSERT(i < ggml_backend_registry_count);
     return ggml_backend_registry[i].default_buffer_type;
+}
+
+ggml_backend_buffer_type_t ggml_backend_reg_get_host_buffer_type(size_t i) {
+    ggml_backend_registry_init();
+
+    GGML_ASSERT(i < ggml_backend_registry_count);
+    return ggml_backend_registry[i].host_buffer_type;
 }
 
 ggml_backend_buffer_t ggml_backend_reg_alloc_buffer(size_t i, size_t size) {

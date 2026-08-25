@@ -353,32 +353,26 @@ std::string gguf_kv_to_str(const gguf_context * ctx_gguf, int i) {
 // llama helpers
 //
 
-ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer) {
-    ggml_backend_buffer_type_t buft = nullptr;
-
-#if defined(GGML_USE_CUDA)
-    // host buffers should only be used when data is expected to be copied to/from the GPU
-    if (host_buffer) {
-        buft = ggml_backend_cuda_host_buffer_type();
-    }
-#elif defined(GGML_USE_SYCL)
-    if (host_buffer) {
-        buft = ggml_backend_sycl_host_buffer_type();
-    }
-#elif defined(GGML_USE_CPU_HBM)
-    buft = ggml_backend_cpu_hbm_buffer_type();
-#elif defined(GGML_USE_VULKAN)
-    if (host_buffer) {
-        buft = ggml_backend_vk_host_buffer_type();
-    }
+ggml_backend_buffer_type_t llama_default_buffer_type_cpu(void) {
+#if defined(GGML_USE_CPU_HBM)
+    return ggml_backend_cpu_hbm_buffer_type();
+#else
+    return ggml_backend_cpu_buffer_type();
 #endif
+}
 
-    if (buft == nullptr) {
-        buft = ggml_backend_cpu_buffer_type();
+ggml_backend_buffer_type_t llama_default_buffer_type_host(const llama_model & model) {
+    // host buffers should only be used when data is expected to be copied to/from the GPU
+    for (int dev : model.devices) {
+        if (dev >= 0 && dev < (int) ggml_backend_reg_get_count()) {
+            ggml_backend_buffer_type_t buft = ggml_backend_reg_get_host_buffer_type(dev);
+            if (buft != nullptr) {
+                return buft;
+            }
+        }
     }
-    return buft;
 
-    GGML_UNUSED(host_buffer);
+    return llama_default_buffer_type_cpu();
 }
 
 //
@@ -550,7 +544,7 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_offload(const llama_
     }
 
     if (buft == nullptr) {
-        buft = llama_default_buffer_type_cpu(true);
+        buft = llama_default_buffer_type_host(model);
     }
     return buft;
     GGML_UNUSED(gpu);
@@ -1357,7 +1351,7 @@ static bool llama_kv_cache_init(
             }
         }
     } else {
-        buft_layer_count[llama_default_buffer_type_cpu(true)] = n_layer;
+        buft_layer_count[llama_default_buffer_type_host(model)] = n_layer;
     }
 
     // create a context for each buffer type
@@ -4402,13 +4396,13 @@ static bool llm_load_tensors(
     bool use_mmap_buffer = true;
 
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    model.buft_input = llama_default_buffer_type_cpu(true);
+    model.buft_input = llama_default_buffer_type_host(model);
 
     model.buft_layer.resize(n_layer);
 
     // assign cpu layers
     for (int i = 0; i < i_gpu_start; ++i) {
-        model.buft_layer[i] = llama_default_buffer_type_cpu(true);
+        model.buft_layer[i] = llama_default_buffer_type_host(model);
     }
 
     std::vector<size_t> device_mem(model.devices.size());
@@ -4687,7 +4681,7 @@ static bool llm_load_tensors(
                 }
                 for (int il = 0; il < i_gpu_start; ++il) {
                     model.default_layer_device[il] = -1;
-                    model.buft_layer[il] = llama_default_buffer_type_cpu(true);
+                    model.buft_layer[il] = llama_default_buffer_type_host(model);
                 }
             }
         }
@@ -4715,7 +4709,7 @@ static bool llm_load_tensors(
         if (n_gpu_layers > n_layer) {
             model.buft_output = llama_default_buffer_type_offload(model, model.devices[model.default_layer_device[n_layer]]);
         } else {
-            model.buft_output = llama_default_buffer_type_cpu(true);
+            model.buft_output = llama_default_buffer_type_host(model);
         }
     } else {
         ggml_backend_buffer_type_t split_buft;
@@ -4754,7 +4748,7 @@ static bool llm_load_tensors(
                     ? 0 : std::max(0, model.default_layer_device[last_gpu_layer]);
             model.buft_output = llama_default_buffer_type_offload(model, dev);
         } else {
-            model.buft_output = llama_default_buffer_type_cpu(true);
+            model.buft_output = llama_default_buffer_type_host(model);
         }
     }
 
@@ -4815,7 +4809,7 @@ static bool llm_load_tensors(
         // only the mmap region containing the tensors in the model is mapped to the backend buffer
         // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer, then we could just use metal for all layers
         // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
-        if (ml.use_mmap && use_mmap_buffer && (buft == llama_default_buffer_type_cpu(true) || buft == ggml_backend_cpu_buffer_type())) {
+        if (ml.use_mmap && use_mmap_buffer && (buft == llama_default_buffer_type_host(model) || buft == ggml_backend_cpu_buffer_type())) {
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 void * addr = nullptr;
                 size_t first, last;
@@ -6077,7 +6071,7 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
             lctx.embd = nullptr;
         }
 
-        lctx.buf_output = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), new_size);
+        lctx.buf_output = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_host(lctx.model), new_size);
         if (lctx.buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
             return 0;
@@ -8806,7 +8800,7 @@ struct llama_context * llama_init_from_model(
             for (auto * backend : ctx->backends) {
                 if (ggml_backend_is_cpu(backend)) {
                     // use host buffers for the CPU backend compute buffer
-                    backend_buft.push_back(llama_default_buffer_type_cpu(true));
+                    backend_buft.push_back(llama_default_buffer_type_host(*model));
                 } else {
                     backend_buft.push_back(ggml_backend_get_default_buffer_type(backend));
                 }
@@ -8942,7 +8936,7 @@ struct llama_context * llama_init_from_model(
                 ctx->embd = nullptr;
             }
 
-            ctx->buf_output = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), new_size);
+            ctx->buf_output = ggml_backend_buft_alloc_buffer(llama_default_buffer_type_host(*model), new_size);
             if (ctx->buf_output == nullptr) {
                 LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
             }

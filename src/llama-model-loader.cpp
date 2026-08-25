@@ -1125,7 +1125,7 @@ bool llama_model_loader::load_all_data(
         // If the cuda backend is active create pinned memory buffers and events for synchronisation.
         if (cuda_backend) {
             for (size_t idx = 0; idx < (size_t)n_workers; ++idx) {
-                host_buffers.emplace_back(ggml_backend_buft_alloc_buffer(llama_default_buffer_type_cpu(true), buffer_size));
+                host_buffers.emplace_back(ggml_backend_buft_alloc_buffer(llama_default_buffer_type_host(*model), buffer_size));
                 host_ptrs.emplace_back(ggml_backend_buffer_get_base(host_buffers[idx]));
                 events.emplace_back(ggml_backend_event_new(cuda_backend));
             }

@@ -2015,6 +2015,7 @@ GGML_CALL int ggml_backend_cann_reg_devices() {
         snprintf(name, sizeof(name), "CANN%d", i);
         ggml_backend_register(name, ggml_backend_reg_cann_init,
                               ggml_backend_cann_buffer_type(i),
+                              NULL,
                               ggml_backend_cann_get_device_memory,
                               (void*)(intptr_t)i);
     }

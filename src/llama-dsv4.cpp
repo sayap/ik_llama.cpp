@@ -54,7 +54,7 @@ static ggml_backend_buffer_type_t llama_dsv4_layer_buft(const llama_context & lc
         }
     }
 
-    return llama_default_buffer_type_cpu(true);
+    return llama_default_buffer_type_host(lctx.model);
 }
 
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {

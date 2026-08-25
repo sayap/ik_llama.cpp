@@ -126,6 +126,7 @@ extern "C" {
     GGML_API const char *               ggml_backend_reg_get_name(size_t i);
     GGML_API ggml_backend_t             ggml_backend_reg_init_backend(size_t i, const char * params); // params is backend-specific
     GGML_API ggml_backend_buffer_type_t ggml_backend_reg_get_default_buffer_type(size_t i);
+    GGML_API ggml_backend_buffer_type_t ggml_backend_reg_get_host_buffer_type(size_t i);
     GGML_API ggml_backend_buffer_t      ggml_backend_reg_alloc_buffer(size_t i, size_t size);
     GGML_API void                       ggml_backend_reg_get_device_memory(size_t i, size_t * free, size_t * total);
 

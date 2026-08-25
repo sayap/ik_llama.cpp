@@ -25,6 +25,7 @@
 #include <future>
 #include <thread>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <dlfcn.h>
 
 // -------------------------------------------------------------------------
@@ -463,6 +464,13 @@ struct vk_device_struct {
     bool external_memory_fd_support {};
     bool external_dma_buf_support {};
 
+    // VK_EXT_external_memory_host: import our own mmap'd memory as HOST_VISIBLE
+    // device memory instead of letting the driver allocate it (the NVIDIA driver
+    // serves host-visible vkAllocateMemory from persistent system-memory pools,
+    // see ggml_vk_host_malloc).
+    bool external_memory_host_support {};
+    size_t min_imported_host_pointer_alignment = 0;
+
     // CUDA driver-API interop for the NVIDIA cross-device P2P reduce (optional)
     CUcontext cuda_ctx = nullptr;
     CUdevice  cuda_dev = -1;
@@ -745,6 +753,12 @@ struct vk_buffer_struct {
     void * ptr;
     size_t size = 0;
 
+    // Host-imported allocation (VK_EXT_external_memory_host): base and size of the
+    // mmap owned by us, released with munmap when the buffer is destroyed.
+    // nullptr if the memory was allocated by the driver.
+    void * host_import_ptr = nullptr;
+    size_t host_import_size = 0;
+
     // CUDA interop (NVIDIA P2P reduce): mapped base pointer of this buffer. 0 if not
     // imported. The external memory handle is intentionally leaked (process lifetime).
     CUdeviceptr cuda_ptr = 0;
@@ -760,6 +774,9 @@ struct vk_buffer_struct {
 
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
+        if (host_import_ptr != nullptr) {
+            munmap(host_import_ptr, host_import_size);
+        }
     }
 };
 
@@ -2149,10 +2166,19 @@ static uint32_t find_properties(const vk::PhysicalDeviceMemoryProperties* mem_pr
     return UINT32_MAX;
 }
 
-static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, vk::MemoryPropertyFlags req_flags, vk::MemoryPropertyFlags fallback_flags = vk::MemoryPropertyFlags(0)) {
+static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, vk::MemoryPropertyFlags req_flags, vk::MemoryPropertyFlags fallback_flags = vk::MemoryPropertyFlags(0), void * import_host_ptr = nullptr) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags) << ", " << to_string(fallback_flags) << ")");
     if (size > device->max_memory_allocation_size) {
         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device memory allocation limit");
+    }
+
+    // VK_EXT_external_memory_host import: allocateSize must be rounded up to
+    // minImportedHostPointerAlignment and the memory type must support the import
+    // (query the valid bits and intersect with the buffer's memoryTypeBits).
+    vk::ImportMemoryHostPointerInfoEXT import_info{};
+    if (import_host_ptr != nullptr) {
+        import_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+        import_info.pHostPointer = import_host_ptr;
     }
 
     vk_buffer buf = std::make_shared<vk_buffer_struct>();
@@ -2182,6 +2208,26 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, vk::Memor
 
     vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
 
+    if (import_host_ptr != nullptr) {
+        const size_t align = device->min_imported_host_pointer_alignment > 0 ? device->min_imported_host_pointer_alignment : 1;
+        mem_req.size = (mem_req.size + align - 1) & ~(uint64_t)(align - 1);
+        PFN_vkGetMemoryHostPointerPropertiesEXT pfn_props =
+            (PFN_vkGetMemoryHostPointerPropertiesEXT) device->device.getProcAddr("vkGetMemoryHostPointerPropertiesEXT");
+        if (pfn_props == nullptr) {
+            pfn_props = (PFN_vkGetMemoryHostPointerPropertiesEXT) vk_instance.instance.getProcAddr("vkGetMemoryHostPointerPropertiesEXT");
+        }
+        if (pfn_props == nullptr) {
+            throw vk::SystemError(vk::Result::eErrorExtensionNotPresent, "VK_EXT_external_memory_host not available");
+        }
+        VkMemoryHostPointerPropertiesEXT host_props{};
+        VkResult pres = pfn_props((VkDevice) device->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                   import_host_ptr, &host_props);
+        if (pres != VK_SUCCESS || host_props.memoryTypeBits == 0) {
+            throw vk::SystemError(vk::Result::eErrorInvalidExternalHandle, "host pointer cannot be imported");
+        }
+        mem_req.memoryTypeBits &= host_props.memoryTypeBits;
+    }
+
     vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
 
     uint32_t memory_type_index = UINT32_MAX;
@@ -2202,13 +2248,22 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, vk::Memor
     vk::ExportMemoryAllocateInfo export_alloc_info{};
     export_alloc_info.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
     const bool exportable = device->external_memory_fd_support && (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal);
+    // Imported host memory is never exported (and vice versa: exports are
+    // device-local, imports are host-visible).
+    const bool importable = import_host_ptr != nullptr;
 
-    try {
+    auto alloc_memory = [&](uint32_t memory_type_index) {
         vk::MemoryAllocateInfo alloc_info{ mem_req.size, memory_type_index };
-        if (exportable) {
+        if (importable) {
+            alloc_info.setPNext(&import_info);
+        } else if (exportable) {
             alloc_info.setPNext(&export_alloc_info);
         }
         buf->device_memory = device->device.allocateMemory(alloc_info);
+    };
+
+    try {
+        alloc_memory(memory_type_index);
     } catch (const vk::SystemError& e) {
         if (buf->memory_property_flags != fallback_flags) {
             // Try again with fallback flags
@@ -2216,11 +2271,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, vk::Memor
             buf->memory_property_flags = fallback_flags;
 
             try {
-                vk::MemoryAllocateInfo alloc_info{ mem_req.size, memory_type_index };
-                if (exportable) {
-                    alloc_info.setPNext(&export_alloc_info);
-                }
-                buf->device_memory = device->device.allocateMemory(alloc_info);
+                alloc_memory(memory_type_index);
             }
             catch (const vk::SystemError& e) {
                 device->device.destroyBuffer(buf->buffer);
@@ -4600,8 +4651,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
             if (has_ext("VK_KHR_external_memory_fd"))          device_extensions.push_back("VK_KHR_external_memory_fd");
             if (has_ext("VK_KHR_external_semaphore_fd"))       device_extensions.push_back("VK_KHR_external_semaphore_fd");
             if (has_ext("VK_EXT_external_memory_dma_buf"))     device_extensions.push_back("VK_EXT_external_memory_dma_buf");
+            if (has_ext("VK_EXT_external_memory_host"))        device_extensions.push_back("VK_EXT_external_memory_host");
             device->external_memory_fd_support = has_ext("VK_KHR_external_memory_fd");
             device->external_dma_buf_support    = has_ext("VK_EXT_external_memory_dma_buf");
+            device->external_memory_host_support = has_ext("VK_EXT_external_memory_host");
+            if (device->external_memory_host_support) {
+                vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host_props;
+                vk::PhysicalDeviceProperties2 props2;
+                props2.pNext = &host_props;
+                device->physical_device.getProperties2(&props2);
+                device->min_imported_host_pointer_alignment = host_props.minImportedHostPointerAlignment;
+            }
         }
 
 #ifdef GGML_VULKAN_VALIDATE
@@ -5703,6 +5763,40 @@ static vk_buffer ggml_vk_create_buffer_temp(ggml_backend_vk_context * ctx, size_
 
 static void * ggml_vk_host_malloc(vk_device& device, size_t size) {
     VK_LOG_MEMORY("ggml_vk_host_malloc(" << size << ")");
+
+    static const bool no_import = getenv("GGML_VK_DISABLE_HOST_IMPORT") != nullptr;
+    // Prefer importing our own mmap'd memory via VK_EXT_external_memory_host.
+    // The NVIDIA driver serves host-visible vkAllocateMemory allocations from
+    // persistent system-memory pools (NVreg_EnableSystemMemoryPools, default on
+    // since the 560 series) whose pages are only returned to the OS by the
+    // shrinker (echo 3 > /proc/sys/vm/drop_caches) after process exit -- tens of
+    // GiB of "used" RAM with no process to account for it. Imported memory is
+    // regular anonymous memory owned by the process: it is released immediately
+    // on free/exit, with identical H2D/D2H bandwidth.
+    if (device->external_memory_host_support && !no_import) {
+        const size_t align = device->min_imported_host_pointer_alignment > 0 ? device->min_imported_host_pointer_alignment : 1;
+        const size_t size_aligned = (size + align - 1) & ~(size_t)(align - 1);
+        void * host = mmap(nullptr, size_aligned, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (host != MAP_FAILED) {
+            try {
+                vk_buffer buf = ggml_vk_create_buffer(device, size_aligned,
+                    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                    host);
+                buf->host_import_ptr = host;
+                buf->host_import_size = size_aligned;
+
+                std::lock_guard<std::recursive_mutex> guard(device->mutex);
+                device->pinned_memory.push_back(std::make_tuple(buf->ptr, size, buf));
+
+                return buf->ptr;
+            } catch (const vk::SystemError& e) {
+                GGML_LOG_WARN("ggml_vulkan: failed to import %zu bytes of host memory (%s), using driver allocation\n", size, e.what());
+                munmap(host, size_aligned);
+            }
+        }
+    }
+
     vk_buffer buf = ggml_vk_create_buffer(device, size,
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
@@ -13403,6 +13497,11 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer
 static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_alloc_buffer(" << size << ")");
 
+    static const bool no_pinned = getenv("GGML_VULKAN_NO_PINNED") != nullptr;
+    if (no_pinned) {
+        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    }
+
     size += 32;  // Behave like the CPU buffer type
     void * ptr = nullptr;
     try {
@@ -14776,7 +14875,7 @@ GGML_CALL int ggml_backend_vk_reg_devices() {
     for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
         char name[128];
         snprintf(name, sizeof(name), "%s%ld", GGML_VK_NAME, i);
-        ggml_backend_register(name, ggml_backend_reg_vk_init, ggml_backend_vk_buffer_type(i), ggml_backend_vk_get_device_memory, (void *) (intptr_t) i);  // NOLINT
+        ggml_backend_register(name, ggml_backend_reg_vk_init, ggml_backend_vk_buffer_type(i), ggml_backend_vk_host_buffer_type(), ggml_backend_vk_get_device_memory, (void *) (intptr_t) i);  // NOLINT
     }
     return vk_instance.device_indices.size();
 }
