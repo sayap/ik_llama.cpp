@@ -27,7 +27,12 @@ ik_llama.cpp, what has been fixed, how to get good performance, and what is stil
   (see "DSV4 long-context decode"). The single biggest trap found on the way: the MoE
   streaming-offload heuristic keyed on the wrong tensor dimension and uploaded ~147 GB of
   expert weights **per decode token** once the top-k path turned on (10 s/token, GPU idle);
-  see "16b" for the fix.
+  see "16b" for the fix. **On a single GPU with `-cmoe` at the default `-ub 512`, Vulkan is
+  slower at PP than CUDA — root-caused and fixed (see "DSV4-Flash `-cmoe` on a single
+  GPU"): the streaming rule now matches CUDA's expert-aware one and requires a native
+  matmul_id pipeline, and the IQK/KT families gained native coopmat2 `MUL_MAT_ID`.
+  Single-GPU `-cmoe -ub 512` went from ~75/~17.9 to ~175-189 PP / ~20.2-20.5 TG
+  (CUDA: ~233/~24.7 on this PCIe x4 eGPU box).**
 
 ## What we fixed
 
@@ -909,9 +914,9 @@ allocation after exit; `MADV_DONTNEED` on the live mapping does nothing. Importi
 our own memory via `VkImportMemoryHostPointerInfoEXT`
 (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT`) releases everything
 immediately on free/exit and has identical H2D/D2H bandwidth (~6 GB/s each way on
-the RTX 3090). `GGML_VK_DISABLE_HOST_IMPORT=1` forces the old driver-allocated path
-(if the import fails at runtime we also fall back to it automatically, with a
-warning). The memory type is validated with `vkGetMemoryHostPointerPropertiesEXT`
+the RTX 3090). If the import fails at runtime we fall back to the driver-allocated
+path automatically, with a warning. The memory type is validated with
+`vkGetMemoryHostPointerPropertiesEXT`
 (intersected with the buffer's `memoryTypeBits`), and sizes/pointers are rounded to
 `minImportedHostPointerAlignment`.
 
@@ -1045,22 +1050,16 @@ record PP tok/s and TG tok/s for both.
 ### Priority (highest first)
 
 1. **`MXFP4`** — the micro-scaling 4-bit format (now supported, see "MXFP4 quant").
-2. **Native coopmat2 `MUL_MAT_ID` for the IQK/KT families (or a tiled dequant fallback).**
-   `MUL_MAT_ID` for `IQ2_K`..`IQ6_K`, `IQ*_KS`, `IQ2_KL` and `IQ1_KT`..`IQ4_KT` returns
-   `nullptr` from `ggml_vk_get_mul_mat_mat_id_pipeline`, so `ggml_vk_mul_mat_id_q_f16`
-   takes the dequant-to-F16 fallback and materializes the **entire** expert matrix in
-   `ctx->prealloc_x` (`x_sz * ne02`, where `x_sz = sizeof(f16) * ne01 * ne00`; for a
-   fused `-muge` gate+up MoE tensor that is `2 * ne01 * ne00 * n_expert` bytes),
-   discovered in the dryrun and allocated lazily at the first prompt `graph_compute`.
-   On large MoE models this can OOM where CUDA's native quantized mmq fits. Fix
-   direction: a coopmat2 inline-dequant matmul_id, matching MXFP4's
-   `matmul_id_mxfp4_f16` (the blocker is the per-4-element `coordInBlock` matmul_id
-   decode invocation vs the byte-addressed IQK decode, see the NOTE in
-   `ggml-vulkan.cpp`), or a bounded/tiled dequant fallback as a stopgap — the latter
-   would also harden the dense path against `--all-logits`-style runs, where
-   `n_outputs == n_tokens` legitimately feeds the full ubatch width into a quantized
-   lm_head. Workaround: `-no-fmoe` splits the fused gate+up matmul into two
-   `MUL_MAT_ID`s of half size, halving `prealloc_x`.
+2. **Native coopmat2 `MUL_MAT_ID` for the IQK/KT families — implemented on coopmat2.**
+   All 15 types now have `matmul_id_<type>_f16` coopmat2 pipelines with the
+   byte-addressed inline-dequant decoders (the decoders were already expert-aware via
+   `iqk_cm2_batch_idx()`); `ggml_vk_get_mul_mat_mat_id_pipeline` returns them on
+   coopmat2 devices, so the huge `prealloc_x` F16 materialization is gone there
+   (streamed DSV4 down-proj: 16.2 -> 14.6 ms/layer; inline decode is ALU-bound, so
+   streaming still needs the batch heuristics to pay off). Remaining: a matmul_id
+   variant for coopmat1 devices (the flat dequant-to-F16 fallback is still taken
+   there), and a bounded/tiled dequant fallback to harden the dense path against
+   `--all-logits`-style runs where the full ubatch width hits a quantized lm_head.
 
 3. **Indexer / DSA / CSA / HCA / GLM-DSA**: `INDEXER_TOPK`, `MASK_TOPK`, `MASK_TO_IDX`,
    `SINKHORN`, `HC_PRE`, `HC_POST`, `LATENT_ATTN`, `DS4_COMP` — **now implemented** (see
@@ -1705,6 +1704,92 @@ Remaining performance notes:
   `[5120, 152064]` alone is ~0.7 ms/token.
 - The scheduler no longer copies the IQ4_KT FFN weights per split; the remaining
   device→host traffic is limited to the logits.
+
+### DSV4-Flash `-cmoe` on a single GPU: diagnosis and fixes
+
+`DeepSeek-V4-Flash-0731-IQ2_KL-imatrix` (101 GB, 41 MoE layers, separate IQ2_KL
+`ffn_{gate,up,down}_exps` [2048/4096, 4096/2048, 256], 6 of 256 experts active), RTX 3090,
+`-ngl 99 -cmoe -ub 512` (the default): CUDA ~204 PP / ~24.6 TG vs Vulkan ~75 PP / ~17.9 TG.
+Root causes found and fixed (all validated: `test-iqk-quants`, `test-dsa`,
+`test-fused-up-gate`, `test-delta-net`, `test-dsv4-misc` pass; greedy output is
+byte-identical to CUDA at both `-ub 512` and streamed `-ub 2048`):
+
+| config | PP tok/s | TG tok/s |
+|---|---|---|
+| CUDA0 (GGML_CUDA_NO_PINNED=1) | 233 | 25.0 |
+| Vulkan0 before | 90.5 | 18.8 |
+| Vulkan0 after (default flags) | **175-189** | **20.2-20.5** |
+| Vulkan0 after, `-ub 2048` no streaming (`-op -1,0`) | **224-227** | 20.5 |
+
+**PP fix 1: the MoE streaming-offload heuristic.** At ubatch 512 the old
+`ggml_backend_vk_offload_op` (`ne[2] >= 32`) streamed the `ffn_moe_down`
+`MUL_MAT_ID` to the GPU while CUDA's expert-aware rule (dc663fe6:
+`batch * n_active >= 32 * n_total`, i.e. batch >= 1366 for 6-of-256) kept it on the
+CPU. Streaming cost ~2.4 s of synchronous staging uploads per 512-token ubatch
+(~28 GB at ~12 GB/s) plus 16.2 ms of GPU dequant-to-F16 `MUL_MAT_ID` per layer, while
+the gate/up `MOE_FUSED_UP_GATE` still ran on the CPU. The Vulkan rule now matches
+CUDA's (including the expert ratio) and additionally requires a *native* quantized
+matmul_id pipeline for the weight type, so a device without one never streams into
+the dequant-to-F16 fallback (that fallback materializes the whole expert tensor as
+F16 in `prealloc_x` and can OOM).
+
+**PP fix 2: native coopmat2 `MUL_MAT_ID` for the IQK/KT families.** All 15 types now
+have `matmul_id_<type>_f16` coopmat2 pipelines (only `l`/`a_l` variants, the Qi_K tile
+shape; created when >= 40 KiB shared memory). The byte-addressed decoders were already
+expert-aware: `iqk_cm2_batch_idx()` is `gl_GlobalInvocationID.z` = the expert index
+under `MUL_MAT_ID`, so the decode addresses the streamed expert weights absolutely.
+The old NOTE ("the driver invokes the decode once per 4-element group") no longer
+reproduces on driver 610.57.04 — the per-element decode receives correct coordinates,
+`test-iqk-quants` passes all 15 types' multi-token `MUL_MAT_ID` cases through the
+native path. On this model the streamed down-proj takes ~14.6 ms/layer (vs 16.2 ms
+dequant-to-F16) — the inline decode of ~250 experts is ALU-bound, so streaming still
+loses to the CPU on a PCIe x4 eGPU (PP 134 streamed vs 224 unstreamed at `-ub 2048`);
+on a full-bandwidth machine the CUDA-parity threshold should be closer.
+
+**TG fix 1: `HC_PRE` Sinkhorn (3.8 -> 0.35 ms/token).** The shader ran one thread per
+token with runtime-`S` loops and a `float m[64]` local array (register spills); at
+decode (T=1) a single thread executed the 20 Sinkhorn iterations serially (~45 us x86
+calls/token). `S` is now a spec constant with one pipeline per S in 1..8 (the
+`S`-indexed loops unroll and `m` stays in registers): ~4.1 us/call.
+
+**TG fix 2: split-K `mul_mat_vec` for small-m decode GEMVs.** The DSV4 layers have
+many small projections per layer; at one warp per row, `m <= 4096` GEMVs ran at
+140-300 GB/s (vs ~870 GB/s for the 546 MB lm_head; measured with the new
+`tests/test-vec-time.cpp` harness). When `n == 1`, batch == 1, `m <= 4096` and the
+type has an sk pipeline (F32/F16/Q8_0/Q4_0/Q6_0), K is split across up to 64 warps
+per row (>= 8 iterations per chunk so the reduction overhead stays amortized) and the
+partials are summed in chunk order by the existing `pipeline_matmul_split_k_reduce`
+(deterministic). ~3% end-to-end TG. MXFP4 is
+excluded: its split variant returns zeros for reasons not yet diagnosed (the const
+value table is not the cause); its decode path is unaffected.
+
+Two correctness requirements of this path (both were missing initially and produced
+garbage decode output only in the full server — small single-op tests happened to
+pass):
+
+- `ggml_vk_sync_buffers()` between the split dispatch and the reduce. Storage-buffer
+  writes are not automatically visible to a following dispatch in the same command
+  buffer; without the barrier the reduce can read stale partials (`ggml_vk_matmul`
+  does the same sync for its split-K).
+- The chunk size must be rounded up to the workgroup pass granularity
+  (`K_PER_ITER * BLOCK_SIZE`): every chunk has to start and end on a `k_per_iter *
+  subgroup_size` boundary, because the shader loads B as vec4s at `(iybs+iqs)/4`
+  (an integer division that assumes `col % 4 == 0` — a chunk base that is not a
+  multiple of the granularity reads the wrong B elements), and per-thread
+  `k_per_iter`-element groups must not straddle `k_end` or K elements get counted
+  by two chunks. `n_chunks` is recomputed from the rounded chunk size so no chunk
+  starts at or past `ne00` (its partial slice would never be written but the reduce
+  sums every slice).
+
+**Remaining TG gap (~20.4 vs 24.7 tok/s)** is mostly host-side: ~1300 op dispatches
+re-recorded per token across ~47 splits, each GPU->CPU boundary forcing a drain +
+synchronous staging read (no async `get_tensor`/events; CUDA graphs cover the same
+graph). The GPU-side remainder is the small-tensor launch/tail latency (the split-K
+experiment showed the 4-9 MB GEMVs are not purely warp-starved) and the ~700 tiny
+elementwise kernels that CUDA's `GGML_CUDA_FUSION` peephole-fuses (Vulkan only fuses
+RMS_NORM+MUL). Note also a pre-existing oddity: with `-b 2048` Vulkan decode drops to
+~10 tok/s (stock shows it too; CUDA stays ~24) — the decode graph/split shape changes
+with `-b`; not yet investigated.
 
 ### vs CUDA: the prompt-processing gap and the paths to close it
 

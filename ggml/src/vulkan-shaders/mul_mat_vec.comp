@@ -18,7 +18,11 @@ uint a_offset, b_offset, d_offset, y_offset;
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i, bool lastiter)
 {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#ifdef VEC_SPLIT_K
+        const uint col = sk_k_base + i*BLOCK_SIZE + K_PER_ITER*tid;
+#else
         const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
+#endif
         const uint iqs = (col%QUANT_K)/QUANT_R; // quant index
         const uint iybs = col - col%QUANT_K; // y block start index
 
@@ -98,10 +102,23 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         }
     }
 
-    uint num_iters = p.ncols / (K_PER_ITER * BLOCK_SIZE);
+    uint num_iters = 0;
+#ifdef VEC_SPLIT_K
+    // this workgroup covers K range [sk_k_base, k_end)
+    {
+        const uint k_end = min(p.ncols, sk_k_base + p.k_chunk);
+        const uint len = k_end - sk_k_base;
+        num_iters = len / (K_PER_ITER * BLOCK_SIZE);
+        if (num_iters * K_PER_ITER * BLOCK_SIZE + K_PER_ITER*tid < len) {
+            num_iters++;
+        }
+    }
+#else
+    num_iters = p.ncols / (K_PER_ITER * BLOCK_SIZE);
     if (num_iters * K_PER_ITER * BLOCK_SIZE + K_PER_ITER*tid < p.ncols) {
         num_iters++;
     }
+#endif
     int unroll_count = 4;
     uint unrolled_iters = num_iters & ~(unroll_count - 1);
 
@@ -151,7 +168,16 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 }
 
 void main() {
+#ifdef VEC_SPLIT_K
+    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+    sk_chunk = gl_WorkGroupID.z;
+    sk_k_base = sk_chunk * p.k_chunk;
+    if (sk_k_base >= p.ncols) {
+        return;
+    }
+#else
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+#endif
 
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);

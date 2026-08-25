@@ -474,7 +474,7 @@ void matmul_shaders(bool fp16, bool matmul_id, bool coopmat, bool coopmat2, bool
         }
     }
 
-    if (coopmat2 && !matmul_id) {
+    if (coopmat2) {
         // IQK / KT quant families (QK_K = 256, byte-addressed with per-row META
         // headers): coopmat2 tensor-core matmul with inline dequant. The A side
         // is loaded through decode functions that compute the absolute byte
@@ -482,6 +482,8 @@ void matmul_shaders(bool fp16, bool matmul_id, bool coopmat, bool coopmat2, bool
         // converted by the caller). IQK_USE_DOT4 lets the KT hash byte-sum use
         // one hardware dot4 per element. GGML_VULKAN_COOPMAT2_DECODE_VECTOR
         // selects the V=4 vector decode (one driver invocation per 4 elements).
+        // With matmul_id=true this also emits the MUL_MAT_ID variants (the
+        // decoders are expert-aware through iqk_cm2_batch_idx()).
         std::map<std::string, std::string> iqk_cm2_defines = {
             {"FLOAT_TYPE", FLOAT_TYPE("f16")}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}, {"IQK_USE_DOT4", "1"},
         };
@@ -577,6 +579,13 @@ void process_shaders() {
 
         string_to_spv("mul_mat_vec_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}));
         string_to_spv("mul_mat_vec_" + tname + "_f16_f32", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPE_VEC2", "f16vec2"}, {"B_TYPE_VEC4", "f16vec4"}, {"D_TYPE", "float"}}));
+
+        // split-K vec variant (small-m decode shapes are parallelism-bound:
+        // one warp per row gives only m warps; see ggml-vulkan.cpp dispatch).
+        // MXFP4 is excluded: its split path returns zeros (see docs/Vulkan.md).
+        if (tname == "f32" || tname == "f16" || tname == "q8_0" || tname == "q4_0" || tname == "q6_0") {
+            string_to_spv("mul_mat_vec_sk_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{"VEC_SPLIT_K", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}));
+        }
 
         string_to_spv("mul_mat_vec_id_" + tname + "_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPE_VEC2", "vec2"}, {"B_TYPE_VEC4", "vec4"}, {"D_TYPE", "float"}}));
 
@@ -841,6 +850,9 @@ void process_shaders() {
 
     // DSA / GLM-DSA / DeepSeek-V4 sparse-attention ops
     string_to_spv("sinkhorn_f32", "sinkhorn.comp", {});
+    // hc_pre: S is a spec constant (overridden per pipeline; see hc_pre.comp
+    // and the CREATE_HC_PRE loop in ggml-vulkan.cpp) so the S*S sinkhorn matrix
+    // stays in registers. sinkhorn/hc_post are fine as-is.
     string_to_spv("hc_pre_f32", "hc_pre.comp", {});
     string_to_spv("hc_post_f32", "hc_post.comp", {});
     string_to_spv("ds4_comp_f32", "ds4_comp.comp", {});

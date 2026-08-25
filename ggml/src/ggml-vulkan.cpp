@@ -551,6 +551,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+    vk_pipeline pipeline_dequant_mul_mat_vec_sk_f32_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[GGML_TYPE_COUNT];
@@ -596,7 +597,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_final_state_f32;
     vk_pipeline pipeline_delta_net[4];
     vk_pipeline pipeline_sinkhorn_f32;
-    vk_pipeline pipeline_hc_pre_f32;
+    vk_pipeline pipeline_hc_pre_f32[8];   // one per S (spec constant)
     vk_pipeline pipeline_hc_post_f32;
     vk_pipeline pipeline_ds4_comp_f32;
     vk_pipeline pipeline_mask_topk[2];
@@ -815,6 +816,12 @@ struct vk_mat_vec_push_constants {
     uint32_t ncols; uint32_t stride_a; uint32_t stride_b; uint32_t stride_d;
     uint32_t batch_stride_a; uint32_t batch_stride_b; uint32_t batch_stride_d;
     uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
+};
+
+struct vk_mat_vec_sk_push_constants {
+    vk_mat_vec_push_constants base;
+    uint32_t ne_total;
+    uint32_t k_chunk;
 };
 
 struct vk_mat_mat_id_push_constants {
@@ -1451,6 +1458,8 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k;
+    size_t prealloc_size_vec_sk = 0;
+    vk_buffer prealloc_vec_sk;
     vk::Fence fence, almost_ready_fence;
     bool almost_ready_fence_pending {};
     // true when compute work has been submitted but not yet synchronized
@@ -3115,12 +3124,41 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_MM(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_XS].f16acc,  matmul_id_iq4_xs_f16,  , mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 4)
         CREATE_MM(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_NL].f16acc,  matmul_id_iq4_nl_f16,  , mmqid_wg_denoms, warptile_mmqid, vk_mat_mat_id_push_constants, 4)
 
-        // NOTE: the IQK/KT types are intentionally not wired into the coopmat2
-        // matmul_id path: on NV_coopmat2 the driver invokes the decode function
-        // once per 4-element group (coordInBlock[1] = col/4, no per-element
-        // offset), so a per-element byte-addressed decode cannot work. They keep
-        // the dequant-to-F16 fallback (ggml_vk_get_mul_mat_mat_id_pipeline
-        // returns nullptr for them).
+        // IQK/KT native coopmat2 matmul_id: same byte-addressed inline-dequant
+        // decoders as the dense path, expert-aware via iqk_cm2_batch_idx()
+        // (== gl_GlobalInvocationID.z, the expert index, under MUL_MAT_ID).
+        // Only the large tile config is created (the driver only hands
+        // per-element coordinates to the decode for the large config; see the
+        // dense IQK note above), with the Qi_K tile shape. Shared memory:
+        // row_ids[4096] (32 KiB) + the IQK value tables; skip on devices with
+        // < 40 KiB of shared memory.
+        if (device->properties.limits.maxComputeSharedMemorySize >= 40 * 1024) {
+#define CREATE_MMID_L(PIPELINE_NAME, NAMELC, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT) \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->l, #NAMELC "_l", NAMELC ## _cm2_len, NAMELC ## _cm2_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, 1);   \
+            ggml_vk_create_pipeline(device, device-> PIPELINE_NAME ->a_l, #NAMELC "_aligned_l", NAMELC ## _aligned ## _cm2_len, NAMELC ## _aligned ## _cm2_data, "main", PARAMCOUNT, sizeof(PUSHCONST), l_ ## WG_DENOMS, l_ ## WARPTILE, l_align);   \
+
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_K].f16acc,   matmul_id_iq2_k_f16,   mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_K].f16acc,   matmul_id_iq3_k_f16,   mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_K].f16acc,   matmul_id_iq4_k_f16,   mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ5_K].f16acc,   matmul_id_iq5_k_f16,   mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ6_K].f16acc,   matmul_id_iq6_k_f16,   mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_KS].f16acc,  matmul_id_iq2_ks_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_KS].f16acc,  matmul_id_iq3_ks_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_KS].f16acc,  matmul_id_iq4_ks_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_KSS].f16acc, matmul_id_iq4_kss_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ5_KS].f16acc,  matmul_id_iq5_ks_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_KL].f16acc,  matmul_id_iq2_kl_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ1_KT].f16acc,  matmul_id_iq1_kt_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ2_KT].f16acc,  matmul_id_iq2_kt_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ3_KT].f16acc,  matmul_id_iq3_kt_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+            CREATE_MMID_L(pipeline_dequant_mul_mat_mat_id[GGML_TYPE_IQ4_KT].f16acc,  matmul_id_iq4_kt_f16,  mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_id_push_constants, 4)
+#undef CREATE_MMID_L
+        }
+
+        // NOTE: the IQK/KT types are wired into the coopmat2 matmul_id path
+        // above (CREATE_MMID_L): the decoders address the expert weights
+        // absolutely through iqk_cm2_batch_idx() (gl_GlobalInvocationID.z under
+        // MUL_MAT_ID).
 #undef CREATE_MM
 #undef CREATE_MM2
     } else
@@ -3552,6 +3590,18 @@ static void ggml_vk_load_shaders(vk_device& device) {
         rm_stdq = 2;
     uint32_t rm_iq = 2 * rm_kq;
 
+    // split-K vec: one warp per (row, k-chunk); deterministic two-phase reduce
+    // via pipeline_matmul_split_k_reduce. Only the single-column (decode) shape.
+    {
+#define CREATE_MMV_SK(TYPE, NAMELC) ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_sk_f32_f32[TYPE], "mul_mat_vec_sk_" #NAMELC "_f32_f32", mul_mat_vec_sk_##NAMELC##_f32_f32_len, mul_mat_vec_sk_##NAMELC##_f32_f32_data, "main", 3, sizeof(vk_mat_vec_sk_push_constants), {1, 1, 1}, {device->subgroup_size, 1, 1}, 1, true);
+        CREATE_MMV_SK(GGML_TYPE_F32,  f32)
+        CREATE_MMV_SK(GGML_TYPE_F16,  f16)
+        CREATE_MMV_SK(GGML_TYPE_Q8_0, q8_0)
+        CREATE_MMV_SK(GGML_TYPE_Q4_0, q4_0)
+        CREATE_MMV_SK(GGML_TYPE_Q6_0, q6_0)
+#undef CREATE_MMV_SK
+    }
+
     for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32_"+std::to_string(i+1),  mul_mat_vec_f32_f32_f32_len,  mul_mat_vec_f32_f32_f32_data,  "main", 3, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {device->subgroup_size, 2, i+1}, 1);
         ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32_"+std::to_string(i+1),  mul_mat_vec_f16_f32_f32_len,  mul_mat_vec_f16_f32_f32_data,  "main", 3, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {device->subgroup_size, 2, i+1}, 1);
@@ -3890,7 +3940,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_sinkhorn_f32, "sinkhorn_f32", sinkhorn_f32_len, sinkhorn_f32_data, "main", 2, sizeof(vk_op_sinkhorn_push_constants), {256, 1, 1}, {}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_hc_pre_f32, "hc_pre_f32", hc_pre_f32_len, hc_pre_f32_data, "main", 4, sizeof(vk_op_hc_pre_push_constants), {256, 1, 1}, {}, 1);
+    // hc_pre: one pipeline per S value; SC_S is spec constant 0 in the shader
+#define CREATE_HC_PRE(SV) ggml_vk_create_pipeline(device, device->pipeline_hc_pre_f32[SV-1], "hc_pre_f32_s" #SV, hc_pre_f32_len, hc_pre_f32_data, "main", 4, sizeof(vk_op_hc_pre_push_constants), {256, 1, 1}, {SV}, 1);
+    CREATE_HC_PRE(1) CREATE_HC_PRE(2) CREATE_HC_PRE(3) CREATE_HC_PRE(4)
+    CREATE_HC_PRE(5) CREATE_HC_PRE(6) CREATE_HC_PRE(7) CREATE_HC_PRE(8)
+#undef CREATE_HC_PRE
     ggml_vk_create_pipeline(device, device->pipeline_hc_post_f32, "hc_post_f32", hc_post_f32_len, hc_post_f32_data, "main", 5, sizeof(vk_op_hc_post_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ds4_comp_f32, "ds4_comp_f32", ds4_comp_f32_len, ds4_comp_f32_data, "main", 4, sizeof(vk_op_ds4_comp_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_mask_topk[0], "mask_topk_f32", mask_topk_f32_len, mask_topk_f32_data, "main", 3, sizeof(vk_op_mask_topk_push_constants), {256, 1, 1}, {}, 1);
@@ -5268,6 +5322,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
+    ctx->prealloc_size_vec_sk = 0;
 
     ctx->fence = ctx->device->device.createFence({});
     ctx->almost_ready_fence = ctx->device->device.createFence({});
@@ -5628,6 +5683,13 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
         case GGML_TYPE_IQ4_NL:
             break;
         default:
+            // The IQK/KT families only have a native matmul_id pipeline on
+            // coopmat2 (the byte-addressed inline-dequant decoders); on other
+            // devices keep the dequant-to-F16 fallback == nullptr (there is no
+            // fallback pipeline for them either).
+            if (ctx->device->coopmat2 && ggml_vk_is_iqk_type(src0_type)) {
+                break;
+            }
             return nullptr;
     }
 
@@ -5764,7 +5826,6 @@ static vk_buffer ggml_vk_create_buffer_temp(ggml_backend_vk_context * ctx, size_
 static void * ggml_vk_host_malloc(vk_device& device, size_t size) {
     VK_LOG_MEMORY("ggml_vk_host_malloc(" << size << ")");
 
-    static const bool no_import = getenv("GGML_VK_DISABLE_HOST_IMPORT") != nullptr;
     // Prefer importing our own mmap'd memory via VK_EXT_external_memory_host.
     // The NVIDIA driver serves host-visible vkAllocateMemory allocations from
     // persistent system-memory pools (NVreg_EnableSystemMemoryPools, default on
@@ -5773,7 +5834,7 @@ static void * ggml_vk_host_malloc(vk_device& device, size_t size) {
     // GiB of "used" RAM with no process to account for it. Imported memory is
     // regular anonymous memory owned by the process: it is released immediately
     // on free/exit, with identical H2D/D2H bandwidth.
-    if (device->external_memory_host_support && !no_import) {
+    if (device->external_memory_host_support) {
         const size_t align = device->min_imported_host_pointer_alignment > 0 ? device->min_imported_host_pointer_alignment : 1;
         const size_t size_aligned = (size + align - 1) & ~(size_t)(align - 1);
         void * host = mmap(nullptr, size_aligned, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -6434,6 +6495,12 @@ static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ct
     VK_LOG_DEBUG("ggml_vk_guess_matmul_id_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ")");
 
     if (ctx->device->coopmat2) {
+        // IQK/KT inline dequant: only the large tile config receives
+        // per-element coordinates from the NV_coopmat2 driver; force the
+        // large pipeline (only l/a_l variants are created).
+        if (ggml_vk_is_iqk_type(src0_type)) {
+            return aligned ? mmp->a_l : mmp->l;
+        }
         // Use large shader when the N dimension is greater than the medium shader's tile size
         uint32_t crossover_large = mmp->m->wg_denoms[1];
         if ((ctx->device->mul_mat_id_l[src0_type] && (n > crossover_large)) || (!ctx->device->mul_mat_id_m[src0_type] && !ctx->device->mul_mat_id_s[src0_type])) {
@@ -6879,6 +6946,56 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     );  // NOLINT
 }
 
+// Decide whether the decode (n==1, single batch) mul_mat_vec should split K
+// across multiple warps per row (small-m shapes are parallelism-bound: one
+// warp per row gives only ne01 warps). Returns the pipeline and fills
+// n_chunks / k_chunk; see docs/Vulkan.md.
+static vk_pipeline ggml_vk_get_mul_mat_vec_split_k(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        bool qy_needs_dequant, bool quantize_y, uint64_t ne11, uint64_t ne12_x_13, uint32_t * n_chunks_out, uint32_t * k_chunk_out) {
+    if (src1->type != GGML_TYPE_F32 || qy_needs_dequant || quantize_y || ne11 != 1 || ne12_x_13 != 1) {
+        return nullptr;
+    }
+    vk_pipeline dmmv_sk = ctx->device->pipeline_dequant_mul_mat_vec_sk_f32_f32[src0->type];
+    if (dmmv_sk == nullptr || ggml_vk_is_iqk_type(src0->type)) {
+        return nullptr;
+    }
+    const uint64_t ne00 = src0->ne[0];
+    const uint64_t ne01 = src0->ne[1];
+    const uint32_t max_groups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+    if (ne01 > max_groups_x || ne01 > 4096) {
+        return nullptr;
+    }
+    const uint32_t k_per_iter = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) ? 2 : 8;
+    // Keep enough work per chunk: at least 8 iterations per warp, else the
+    // shared-memory reduction overhead dominates (measured: Q8_0 [4096,1024]
+    // with 16 one-iteration chunks ran 180 -> 103 GB/s).
+    const uint32_t min_chunk  = 8 * k_per_iter * ctx->device->subgroup_size;
+    uint32_t n_chunks = 32768 / std::max<uint64_t>(ne01, 1);
+    n_chunks = std::min<uint32_t>(n_chunks, 64u);
+    n_chunks = std::min<uint64_t>(n_chunks, ne00 / min_chunk);
+    if (n_chunks < 2) {
+        return nullptr;
+    }
+    // Round the chunk size up to the workgroup pass granularity (K_PER_ITER *
+    // BLOCK_SIZE elements). Every chunk must start and end on a k_per_iter times
+    // subgroup_size boundary: the shader loads B as vec4s at (iybs+iqs)/4 (an
+    // integer division that assumes col%4==0, so a chunk base that is not a
+    // multiple of k_per_iter reads the wrong B elements), and the per-thread
+    // k_per_iter element groups must not straddle k_end, or K elements get
+    // accumulated by two chunks (double count).
+    const uint32_t granularity = k_per_iter * ctx->device->subgroup_size;
+    uint32_t k_chunk = CEIL_DIV(CEIL_DIV(ne00, n_chunks), granularity) * granularity;
+    // Drop chunks that would start at or past ne00 (their partial slice is
+    // never written but pipeline_matmul_split_k_reduce sums every slice).
+    n_chunks = (uint32_t) std::min<uint64_t>(n_chunks, CEIL_DIV(ne00, k_chunk));
+    if (n_chunks < 2) {
+        return nullptr;
+    }
+    *n_chunks_out = n_chunks;
+    *k_chunk_out = k_chunk;
+    return dmmv_sk;
+}
+
 static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool dryrun = false) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_vec_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -6998,6 +7115,15 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
         }
         ggml_pipeline_request_descriptor_sets(ctx, dmmv, 1);
+        uint32_t sk_chunks = 0, sk_k_chunk = 0;
+        if (ggml_vk_get_mul_mat_vec_split_k(ctx, src0, src1, qy_needs_dequant, quantize_y, ne11, ne12 * ne13, &sk_chunks, &sk_k_chunk) != nullptr) {
+            const uint64_t sk_sz = sizeof(float) * ne20 * ne21 * ne22 * ne23 * sk_chunks;
+            if (ctx->prealloc_size_vec_sk < sk_sz) {
+                ctx->prealloc_size_vec_sk = sk_sz;
+            }
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_dequant_mul_mat_vec_sk_f32_f32[src0->type], 1);
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_matmul_split_k_reduce, 1);
+        }
         return;
     }
 
@@ -7070,6 +7196,35 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     const uint32_t max_groups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+
+    // Split-K decode path (see ggml_vk_get_mul_mat_vec_split_k)
+    uint32_t n_chunks = 0, k_chunk = 0;
+    vk_pipeline dmmv_sk = ggml_vk_get_mul_mat_vec_split_k(ctx, src0, src1, qy_needs_dequant, quantize_y, ne11, ne12 * ne13, &n_chunks, &k_chunk);
+    if (dmmv_sk != nullptr) {
+        const uint64_t d_ne_sk = ne20 * ne21 * ne22 * ne23;
+        const uint64_t sk_sz = sizeof(float) * d_ne_sk * n_chunks;
+        GGML_ASSERT(ctx->prealloc_vec_sk != nullptr && ctx->prealloc_vec_sk->size >= sk_sz);
+        const vk_mat_vec_sk_push_constants pc_sk = {
+            (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
+            stride_batch_x, stride_batch_y, stride_batch_d,
+            (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
+            (uint32_t)d_ne_sk, k_chunk,
+        };
+        ggml_vk_sync_buffers(subctx);
+        ggml_vk_dispatch_pipeline(ctx, subctx, dmmv_sk,
+                                  { vk_subbuffer{ d_X, x_buf_offset, qx_needs_dequant ? (x_sz * ne02 * ne03) : ggml_nbytes(src0) }, vk_subbuffer{ d_Y, y_buf_offset, y_sz * ne12 * ne13 }, vk_subbuffer{ ctx->prealloc_vec_sk, 0, sk_sz } },
+                                  pc_sk, { (uint32_t)ne01, 1, n_chunks });
+        // The reduce reads what the split dispatch wrote: without this barrier the
+        // second dispatch can read the partials before the first one's storage
+        // writes are visible (same reason ggml_vk_matmul syncs between split k
+        // and the reduce).
+        ggml_vk_sync_buffers(subctx);
+        const std::array<uint32_t, 2> pc_red = { (uint32_t)d_ne_sk, n_chunks };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_matmul_split_k_reduce,
+                                  { vk_subbuffer{ ctx->prealloc_vec_sk, 0, sk_sz }, vk_subbuffer{ d_D, d_buf_offset, d_sz * ne22 * ne23 } },
+                                  pc_red, { (uint32_t)d_ne_sk, 1, 1 });
+        return;
+    }
 
     uint32_t groups_x = ne01;
     uint32_t groups_z = 1;
@@ -10015,7 +10170,8 @@ static void ggml_vk_hc_pre(ggml_backend_vk_context * ctx, vk_context& subctx, gg
     memcpy(&eps, &dst->op_params[2], sizeof(float));
     const uint32_t T = (uint32_t)src0->ne[1];
 
-    vk_pipeline pipeline = ctx->device->pipeline_hc_pre_f32;
+    GGML_ASSERT(S >= 1 && S <= 8);
+    vk_pipeline pipeline = ctx->device->pipeline_hc_pre_f32[S-1];
     if (dryrun) {
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
         return;
@@ -11737,6 +11893,13 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx) {
         }
         ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k);
     }
+    if (ctx->prealloc_vec_sk == nullptr || (ctx->prealloc_size_vec_sk > 0 && ctx->prealloc_vec_sk->size < ctx->prealloc_size_vec_sk)) {
+        VK_LOG_MEMORY("ggml_vk_preallocate_buffers(vec_sk_size: " << ctx->prealloc_size_vec_sk << ")");
+        if (ctx->prealloc_vec_sk != nullptr) {
+            ggml_vk_destroy_buffer(ctx->prealloc_vec_sk);
+        }
+        ctx->prealloc_vec_sk = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_vec_sk);
+    }
 }
 
 static bool ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool use_fence, bool almost_ready);
@@ -13273,6 +13436,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_x);
     ggml_vk_destroy_buffer(ctx->prealloc_y);
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
+    ggml_vk_destroy_buffer(ctx->prealloc_vec_sk);
 
     for (auto& buffer : ctx->buffer_pool) {
         ggml_vk_destroy_buffer(buffer);
@@ -14772,18 +14936,28 @@ static bool ggml_backend_vk_offload_op(ggml_backend_t backend, const ggml_tensor
     const int min_batch_size = 32;
 
     if (op->op == GGML_OP_MOE_FUSED_UP_GATE || op->op == GGML_OP_MUL_MAT_ID) {
-        // For the MoE ops ne[1] is the expert/row dimension (e.g. all-experts
-        // decode form dst=[N, 256, n_tokens]), not the batch size. Keying the
-        // streaming-offload decision on ne[1] would upload the multi-GB expert
-        // weight tensors to the GPU once per decode token. MOE_FUSED_UP_GATE
-        // never streams (as before); MUL_MAT_ID streams on real batches only
-        // (token count in ne[2], dst=[ne0, n_ids, n_tokens]).
-        return op->op == GGML_OP_MUL_MAT_ID && op->ne[2] >= min_batch_size;
+        // Same rule as ggml_backend_cuda_offload_op (dc663fe6): stream when
+        // batch_size * n_active >= min_batch_size * n_total, token count in ne[2].
+        if (op->op == GGML_OP_MOE_FUSED_UP_GATE) {
+            return false;
+        }
+        const ggml_tensor * ids = op->src[2];
+        const int64_t batch_size = op->ne[2];
+        if (batch_size < min_batch_size) return false;
+        const int64_t n_experts_tot    = op->src[0]->ne[2];
+        const int64_t n_experts_active = ids ? ids->ne[0] : 1;
+        if (batch_size * n_experts_active < (int64_t)min_batch_size * n_experts_tot) {
+            return false;
+        }
+        // Also require a native quantized matmul_id pipeline, else the fallback
+        // dequantizes the whole expert tensor to F16 on the GPU (slow, OOM risk).
+        auto * ctx = (ggml_backend_vk_context *) backend->context;
+        return ggml_vk_get_mul_mat_mat_id_pipeline(ctx, op->src[0]->type,
+                ctx->device->coopmat2 ? GGML_TYPE_F16 : GGML_TYPE_F32,
+                GGML_PREC_DEFAULT) != nullptr;
     }
 
     return op->ne[1] >= min_batch_size && op->op != GGML_OP_GET_ROWS;
-
-    UNUSED(backend);
 }
 
 // TODO: enable async and synchronize

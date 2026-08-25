@@ -4,9 +4,16 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+// S is a specialization constant so the S*S sinkhorn matrix stays in
+// registers (the runtime-S variant spills `m' to local memory and the
+// loops do not unroll; at decode (T=1) that was ~45 us of serial spilled
+// work per call). The dispatch picks the variant from op_params[0].
+layout (constant_id = 0) const uint SC_S = 4;
+const uint S = SC_S;
+
 layout(push_constant) uniform PC {
     uint T;
-    uint S;
+    uint S;   // unused (S is a spec constant); kept for layout compatibility
     uint iters;
     float eps;
     uint src0_nb1;   // in floats
@@ -23,8 +30,7 @@ void main() {
         return;
     }
 
-    const uint S = p.S;
-    float m[64];
+    float m[S*S];
 
     const uint base = t * p.src0_nb1;
 

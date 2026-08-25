@@ -40,7 +40,20 @@ layout (push_constant) uniform parameter
     uint broadcast2;
     uint broadcast3;
 #endif
+#ifdef VEC_SPLIT_K
+    uint ne_total;   // ne01 * ne12 * ne13 (flat dst elements)
+    uint k_chunk;    // K elements per chunk
+#endif
 } p;
+
+#ifdef VEC_SPLIT_K
+// split-K state: this workgroup covers K range [sk_k_base, sk_k_base+len)
+// for row gl_WorkGroupID.x, chunk gl_WorkGroupID.z; the partial goes to
+// data_d[chunk * ne_total + flat_dst_idx] and pipeline_matmul_split_k_reduce
+// sums the chunks in a fixed order (deterministic).
+uint sk_k_base = 0;
+uint sk_chunk = 0;
+#endif
 
 void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #ifdef MUL_MAT_ID
@@ -111,7 +124,11 @@ void reduce_result(const in FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+#ifdef VEC_SPLIT_K
+                data_d[sk_chunk * p.ne_total + j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+#else
                 data_d[j*p.batch_stride_d + d_offset + first_row + n] = D_TYPE(tmpsh[j][n][0]);
+#endif
             }
         }
     }
