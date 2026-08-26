@@ -65,6 +65,22 @@ static void init_ids(ggml_tensor * ids, int n_mats) {
 }
 
 static int n_failures = 0;
+static int n_skips = 0;
+
+// The test computes graphs directly on the target backend (no scheduler), so ops
+// the backend does not claim in supports_op must be skipped explicitly instead of
+// aborting inside the backend (e.g. CUDA GET_ROWS for the IQK/KT families).
+static bool backend_supports_graph(ggml_backend_t backend, ggml_cgraph * gf, const char * name) {
+    for (int i = 0; i < gf->n_nodes; i++) {
+        if (!ggml_backend_supports_op(backend, gf->nodes[i])) {
+            printf("SKIP %s: %s does not support op %s\n", name,
+                    ggml_backend_name(backend), ggml_op_name(gf->nodes[i]->op));
+            n_skips++;
+            return false;
+        }
+    }
+    return true;
+}
 
 // Reference: out = A^T x where A is the F32 dequant of the quantized weights.
 // A has shape [k, m] (row r of the tensor = weight column r), x has shape [k, n].
@@ -139,6 +155,10 @@ static void check_mul_mat(ggml_backend_t backend_tgt, ggml_type type_a,
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
+    if (!backend_supports_graph(backend_tgt, gf, name)) {
+        ggml_free(ctx);
+        return;
+    }
     if (ggml_backend_graph_compute(backend_tgt, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "FAIL %s: backend compute failed\n", name);
         n_failures++;
@@ -211,6 +231,10 @@ static void check_get_rows(ggml_backend_t backend_tgt, ggml_type type_a, int64_t
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
+    if (!backend_supports_graph(backend_tgt, gf, name)) {
+        ggml_free(ctx);
+        return;
+    }
     if (ggml_backend_graph_compute(backend_tgt, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "FAIL %s: backend compute failed\n", name);
         n_failures++;
@@ -296,6 +320,10 @@ static void check_mul_mat_id(ggml_backend_t backend_tgt, ggml_type type_a,
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
+    if (!backend_supports_graph(backend_tgt, gf, name)) {
+        ggml_free(ctx);
+        return;
+    }
     if (ggml_backend_graph_compute(backend_tgt, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "FAIL %s: backend compute failed\n", name);
         n_failures++;
@@ -387,6 +415,6 @@ int main(int argc, char ** argv) {
     check_mul_mat_id(backend_tgt, GGML_TYPE_MXFP4, 4, 2, 2048, 4096, 4);
     check_mul_mat_id(backend_tgt, GGML_TYPE_MXFP4, 4, 2, 4096, 4096, 4);
 
-    printf("%s: %d failures\n", tgt_name, n_failures);
+    printf("%s: %d failures, %d skipped (unsupported ops)\n", tgt_name, n_failures, n_skips);
     return n_failures == 0 ? 0 : 1;
 }
